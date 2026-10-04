@@ -139,6 +139,12 @@ routing:
   # Devin daily/weekly). Credentials without that data rank after those with it; when no
   # credential has it, selection is round-robin. Cooling-down or disabled credentials are
   # never chosen. Combine with session-affinity so a conversation stays on its credential.
+  # Usage is a percentage of each plan's own weekly limit, so set "weight" to the relative
+  # weekly allowance when plans differ (for example 5 on a ChatGPT Pro $100 Codex account
+  # next to weight-1 Plus accounts). Weights only compare credentials of the same provider.
+  # Plan names are not reliable ratios: Claude Max 5x/20x describe the 5h session allowance,
+  # and Anthropic does not publish weekly ratios. A weight of 0 makes the credential a last
+  # resort under quota-aware.
   # Enable universal session-sticky routing for all clients.
   # Explicit Claude Code, Codex, OpenCode, and pi session headers are preferred,
   # followed by prompt_cache_key, Responses conversation IDs, legacy body IDs,
@@ -490,7 +496,7 @@ upstream:
 #         - "*flash*"            # wildcard matching substring (e.g. gemini-2.5-flash-lite)
 #       keys:
 #         - api-key: "AIzaSy...01"
-#           weight: 5 # optional: weighted-round-robin share; omitted defaults to 1; maximum 1,000,000
+#           weight: 5 # optional: weighted-round-robin share / quota-aware plan size; omitted defaults to 1; maximum 1,000,000
 #         # A second key shares this group's endpoint, headers, and models.
 #         - api-key: "replace-with-second-gemini-key"
 #           weight: 2
@@ -540,7 +546,7 @@ upstream:
 #         - "gemini-2.5-pro"
 #       keys:
 #         - api-key: "AIzaSy...03"
-#           weight: 5 # optional: weighted-round-robin share; omitted defaults to 1; maximum 1,000,000
+#           weight: 5 # optional: weighted-round-robin share / quota-aware plan size; omitted defaults to 1; maximum 1,000,000
 #
 #   # Vertex API keys (Vertex-compatible endpoints, base-url is optional)
 #
@@ -570,7 +576,7 @@ upstream:
 #         - "imagen-*"
 #       keys:
 #         - api-key: "vk-123..."                        # x-goog-api-key header
-#           weight: 5                                    # optional: weighted-round-robin share; omitted defaults to 1; maximum 1,000,000
+#           weight: 5                                    # optional: weighted-round-robin share / quota-aware plan size; omitted defaults to 1; maximum 1,000,000
 #
 #   # Codex API keys
 #
@@ -612,7 +618,7 @@ upstream:
 #         - "*codex*"         # wildcard matching substring (e.g. gpt-5-codex-low)
 #       keys:
 #         - api-key: "sk-atSM..."
-#           weight: 5 # optional: weighted-round-robin share; omitted defaults to 1; maximum 1,000,000
+#           weight: 5 # optional: weighted-round-robin share / quota-aware plan size; omitted defaults to 1; maximum 1,000,000
 #           disable-codex-cloaking: false # optional: true disables cloaking; OAuth provider settings do not apply here
 #           alpha-search: false # optional: allow this key to serve /v1/alpha/search via base-url + /alpha/search
 #           websockets: false # optional: use the Codex upstream WebSocket transport
@@ -656,7 +662,7 @@ upstream:
 #         - "*haiku*"                  # wildcard matching substring (e.g. claude-3-5-haiku-20241022)
 #       keys:
 #         - api-key: "sk-atSM..."
-#           weight: 5 # optional: weighted-round-robin share; omitted defaults to 1; maximum 1,000,000
+#           weight: 5 # optional: weighted-round-robin share / quota-aware plan size; omitted defaults to 1; maximum 1,000,000
 #           rebuild-mid-system-message: false # optional: default is false; when true, move messages with role "system" into the top-level Claude system field
 #           cloak:                         # optional: explicitly enable request cloaking for non-Claude-Code clients
 #             mode: "auto"                 # "auto" (default inside this block): cloak only when client is not Claude Code
@@ -769,7 +775,7 @@ upstream:
 #         - "grok-3-*"             # wildcard matching prefix
 #       keys:
 #         - api-key: "xai-..."
-#           weight: 5 # optional: weighted-round-robin share; omitted defaults to 1; maximum 1,000,000
+#           weight: 5 # optional: weighted-round-robin share / quota-aware plan size; omitted defaults to 1; maximum 1,000,000
 #           websockets: true # optional: use the xAI upstream websocket transport for downstream websocket requests
 #
 #   # Meta API keys (Muse Code)
@@ -789,7 +795,7 @@ upstream:
 #         - "muse-spark-1.1"
 #       keys:
 #         - api-key: "..."
-#           weight: 5 # optional: weighted-round-robin share; omitted defaults to 1; maximum 1,000,000
+#           weight: 5 # optional: weighted-round-robin share / quota-aware plan size; omitted defaults to 1; maximum 1,000,000
 #
 #   # OpenAI compatibility providers
 #
@@ -817,7 +823,7 @@ upstream:
 #         # X-Claude-Code-Session-Id: "$ABC" # copies client's "ABC" header
 #       keys:
 #         - api-key: "sk-or-v1-...b780"
-#           weight: 5 # optional: weighted-round-robin share; omitted defaults to 1; maximum 1,000,000
+#           weight: 5 # optional: weighted-round-robin share / quota-aware plan size; omitted defaults to 1; maximum 1,000,000
 #           proxy-url: "socks5://proxy.example.com:1080" # optional: per-key proxy override
 #           # proxy-url: "direct" # optional: explicit direct connect for this credential
 #         - api-key: "sk-or-v1-...b781" # without proxy-url

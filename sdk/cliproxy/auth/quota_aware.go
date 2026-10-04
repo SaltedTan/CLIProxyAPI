@@ -24,7 +24,7 @@ const (
 	quotaAwareShortSaturation = 0.85
 	// quotaAwareShortResetGrace keeps a saturated short window eligible when it resets soon.
 	quotaAwareShortResetGrace = 15 * time.Minute
-	// quotaAwareNearTieRatio treats credentials whose required pace is within this ratio of
+	// quotaAwareNearTieRatio treats credentials whose score is within this ratio of
 	// the most urgent one as equally urgent, so bursts of new sessions are spread across them.
 	quotaAwareNearTieRatio = 0.8
 	// quotaAwareMinHorizon bounds the required pace for resets that are moments away.
@@ -36,14 +36,20 @@ const (
 // long-lived (weekly) quota must be used to avoid losing it at the reset:
 //
 //	required pace = remaining weekly fraction / time until the weekly reset
+//	score         = required pace * credential weight
+//
+// Usage is reported as a percentage of each subscription's own limit, so the credential
+// weight (default 1) expresses relative plan size: a weight-4 credential's remaining
+// percent is worth four times a weight-1 credential's. A weight of zero leaves the
+// credential with no quota to protect, so it is only used as a last resort.
 //
 // Selection, applied only to credentials the shared eligibility checks consider available:
 //  1. Credentials whose short window (5h, or Devin's daily quota) is at least 85% used and
 //     does not reset within 15 minutes are skipped, unless every candidate is in that state.
-//  2. Credentials with weekly data and quota left rank first, by highest required pace.
-//     Credentials within 80% of the highest pace are rotated by the fallback selector.
+//  2. Credentials with weekly data, quota left, and a positive weight rank first, by highest
+//     score. Credentials within 80% of the highest score are rotated by the fallback selector.
 //  3. Credentials without usable weekly data come next, then credentials whose weekly quota
-//     is used up; each of these groups is rotated by the fallback selector.
+//     is used up or whose weight is zero; each group is rotated by the fallback selector.
 //
 // The selector is stateless with respect to sessions. When session affinity is enabled it
 // runs only for unbound sessions and failover rebinding; established bindings never reach it.
@@ -105,7 +111,7 @@ func (u quotaUsage) shortSaturated(now time.Time) bool {
 type quotaAwareCandidate struct {
 	auth  *Auth
 	usage quotaUsage
-	pace  float64
+	score float64 // required pace scaled by the credential weight
 }
 
 // quotaAwareDecision describes which candidates remain after ranking.
@@ -123,7 +129,7 @@ func rankQuotaAware(auths []*Auth, now time.Time) quotaAwareDecision {
 	for _, auth := range auths {
 		candidate := quotaAwareCandidate{auth: auth, usage: authQuotaUsage(auth, now)}
 		if candidate.usage.hasLong {
-			candidate.pace = candidate.usage.requiredPace(now)
+			candidate.score = candidate.usage.requiredPace(now) * float64(authWeight(auth))
 		}
 		all = append(all, candidate)
 	}
@@ -144,19 +150,19 @@ func rankQuotaAware(auths []*Auth, now time.Time) quotaAwareDecision {
 	}
 
 	var withQuota, unknown, usedUp []quotaAwareCandidate
-	bestPace := 0.0
+	bestScore := 0.0
 	for _, candidate := range candidates {
 		switch {
 		case !candidate.usage.hasLong:
 			unknown = append(unknown, candidate)
-		case candidate.pace <= 0:
+		case candidate.score <= 0:
 			decision.withWeekly++
 			usedUp = append(usedUp, candidate)
 		default:
 			decision.withWeekly++
 			withQuota = append(withQuota, candidate)
-			if candidate.pace > bestPace {
-				bestPace = candidate.pace
+			if candidate.score > bestScore {
+				bestScore = candidate.score
 			}
 		}
 	}
@@ -164,7 +170,7 @@ func rankQuotaAware(auths []*Auth, now time.Time) quotaAwareDecision {
 	switch {
 	case len(withQuota) > 0:
 		for _, candidate := range withQuota {
-			if candidate.pace >= bestPace*quotaAwareNearTieRatio {
+			if candidate.score >= bestScore*quotaAwareNearTieRatio {
 				decision.chosen = append(decision.chosen, candidate)
 			}
 		}
@@ -174,7 +180,7 @@ func rankQuotaAware(auths []*Auth, now time.Time) quotaAwareDecision {
 		decision.reason = "no_weekly_data"
 	default:
 		decision.chosen = usedUp
-		decision.reason = "weekly_used_up"
+		decision.reason = "no_weekly_quota_left"
 	}
 	if allSaturated && len(auths) > 0 {
 		decision.reason += ",all_short_saturated"
@@ -239,7 +245,8 @@ func (s *QuotaAwareSelector) Pick(ctx context.Context, provider, model string, o
 		fields["weekly_window"] = picked.usage.long.label
 		fields["weekly_used_pct"] = roundPercent(picked.usage.long.used)
 		fields["weekly_reset_at"] = picked.usage.long.resetAt.UTC().Format(time.RFC3339)
-		fields["required_pct_per_hour"] = math.Round(picked.pace*10000) / 100
+		fields["required_pct_per_hour"] = math.Round(picked.usage.requiredPace(now)*10000) / 100
+		fields["weight"] = authWeight(picked.auth)
 	}
 	if picked.usage.hasShort {
 		fields["short_window"] = picked.usage.short.label

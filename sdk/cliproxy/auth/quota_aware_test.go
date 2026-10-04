@@ -245,6 +245,37 @@ func TestQuotaAwareSelector_WeeklyUsedUpRanksAfterMissingData(t *testing.T) {
 	assertPickSequence(t, newTestQuotaAwareSelector(now, nil), cliproxyexecutor.Options{}, auths[:1], "a")
 }
 
+func TestQuotaAwareSelector_WeightScalesByPlanSize(t *testing.T) {
+	t.Parallel()
+	now := quotaAwareTestBase()
+	// Unweighted, b needs 6%/h and a 2%/h. a is a four-times-larger plan set through the
+	// auth JSON "weight" field, so its remaining quota is worth 8 units/h against b's 6.
+	large := codexQuotaAuth("a", now, 40, 30*time.Hour)
+	large.Metadata = map[string]any{AttributeWeight: float64(4)}
+	auths := []*Auth{large, codexQuotaAuth("b", now, 40, 10*time.Hour)}
+	assertPickSequence(t, newTestQuotaAwareSelector(now, nil), cliproxyexecutor.Options{}, auths, "a", "a", "a")
+
+	// The same pool without the weight follows unweighted pace.
+	unweighted := []*Auth{codexQuotaAuth("a", now, 40, 30*time.Hour), codexQuotaAuth("b", now, 40, 10*time.Hour)}
+	assertPickSequence(t, newTestQuotaAwareSelector(now, nil), cliproxyexecutor.Options{}, unweighted, "b", "b")
+
+	// Configured API-key credentials carry the weight as an attribute.
+	attributed := codexQuotaAuth("c", now, 40, 30*time.Hour)
+	attributed.Attributes = map[string]string{AttributeWeight: "4"}
+	assertPickSequence(t, newTestQuotaAwareSelector(now, nil), cliproxyexecutor.Options{}, []*Auth{attributed, codexQuotaAuth("d", now, 40, 10*time.Hour)}, "c", "c")
+}
+
+func TestQuotaAwareSelector_ZeroWeightIsLastResort(t *testing.T) {
+	t.Parallel()
+	now := quotaAwareTestBase()
+	zero := codexQuotaAuth("a", now, 10, time.Hour)
+	zero.Attributes = map[string]string{AttributeWeight: "0"}
+	auths := []*Auth{zero, {ID: "b", Provider: "codex", Status: StatusActive}}
+	assertPickSequence(t, newTestQuotaAwareSelector(now, nil), cliproxyexecutor.Options{}, auths, "b", "b")
+	// It is still used when nothing else is available.
+	assertPickSequence(t, newTestQuotaAwareSelector(now, nil), cliproxyexecutor.Options{}, auths[:1], "a")
+}
+
 func TestQuotaAwareSelector_SessionAffinityKeepsExistingBinding(t *testing.T) {
 	t.Parallel()
 	now := quotaAwareTestBase()
