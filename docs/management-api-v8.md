@@ -98,6 +98,7 @@ retain the corresponding business operation's fields.
 | `/observability/logs/requests/<id>` | GET | Get a request log. |
 | `/observability/usage/api-keys` | GET | Get API-key usage. |
 | `/observability/usage/queue` | GET | Get queued usage events. |
+| `/observability/routing` | GET | Get live routing state and recent credential selections. |
 | `/credentials` | GET, POST, DELETE | List, upload, or delete credential files. |
 | `/credentials/models` | GET | Get credential models. |
 | `/credentials/download` | GET | Download a credential file. |
@@ -114,6 +115,65 @@ retain the corresponding business operation's fields.
 | `/plugins/store` | GET | List the plugin store. |
 | `/plugins/store/<id>/install` | POST | Install or update a plugin. |
 | `/plugins/<id>/quota` | GET, POST, DELETE | Read, fetch, or reset plugin quota. |
+
+## Routing observability
+
+`GET /observability/routing` reports what the running selector is doing on this
+node. State is in memory only and resets when the process restarts.
+
+```json
+{
+  "observed_at": "2026-10-04T10:00:00Z",
+  "since": "2026-10-04T08:00:00Z",
+  "mode": "local",
+  "strategy": "round-robin",
+  "plugin_scheduler": false,
+  "session_affinity": {
+    "enabled": true,
+    "ttl_seconds": 3600,
+    "subagents": true,
+    "active_sessions": 4,
+    "sessions_by_auth_index": { "a1b2c3d4e5f6a7b8": 3, "0f1e2d3c4b5a6978": 1 }
+  },
+  "counters": {
+    "selections": 120, "retries": 1, "failovers": 3,
+    "affinity_hits": 90, "affinity_new": 25, "affinity_rebinds": 2,
+    "transport_websocket": 40, "transport_http": 10
+  },
+  "recent": [
+    {
+      "time": "2026-10-04T09:59:58Z",
+      "provider": "codex",
+      "model": "gpt-5",
+      "auth_index": "a1b2c3d4e5f6a7b8",
+      "selection": "affinity_rebind",
+      "candidates": 2,
+      "attempt": 1,
+      "attempt_kind": "initial",
+      "previous_auth_index": "0f1e2d3c4b5a6978",
+      "session": "9c1e44d0",
+      "transport": "websocket"
+    }
+  ]
+}
+```
+
+- `mode` is `home` when selection is delegated to CLIProxyAPIHome; local
+  decisions and counters are then not recorded.
+- `strategy` is the effective strategy of the running selector (`round-robin`,
+  `weighted-round-robin`, `fill-first`, `quota-aware`, or `custom`), after
+  aliases and unknown values are normalized.
+- `selection` is `strategy`, `affinity_hit`, `affinity_new`, `affinity_rebind`
+  (the bound credential was unavailable and the session moved), `pinned`, or
+  `plugin`. `strategy_reason` carries the quota-aware decision reason.
+- `candidates` is the number of ready credentials the selector chose among,
+  after cooldown, priority, and per-request exclusions.
+- `attempt_kind` is `initial`, `retry` (same credential picked again in a
+  later retry round), or `failover` (a different credential after a failed
+  attempt in the same request).
+- `session` is a short hash for correlating decisions; raw session IDs are not
+  exposed. `transport` is set for Codex attempts (`websocket` or `http`).
+- `recent` holds the latest 100 selections, newest first.
 
 ## OAuth
 

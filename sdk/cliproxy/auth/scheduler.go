@@ -423,6 +423,11 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 	}
 	predicate := scheduledAuthPredicate(eligibility, tried, pinnedAuthID, strategy == schedulerStrategyWeightedRoundRobin)
 	if picked := shard.pickReadyLocked(preferWebsocket, strategy, predicate); picked != nil {
+		if note := routingPickNoteFromContext(ctx); note != nil {
+			if priority, ok := shard.highestReadyPriorityLocked(preferWebsocket, predicate); ok {
+				note.setCandidates(shard.readyCountAtPriorityLocked(preferWebsocket, priority, predicate))
+			}
+		}
 		return picked, nil
 	}
 	return nil, shard.unavailableErrorLocked(provider, model, predicate)
@@ -484,6 +489,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		shard := providerState.ensureModelLocked(modelKey, time.Now())
 		predicate := scheduledAuthPredicate(eligibility, tried, pinnedAuthID, strategy == schedulerStrategyWeightedRoundRobin)
 		if picked := shard.pickReadyLocked(false, strategy, predicate); picked != nil {
+			routingPickNoteFromContext(ctx).setCandidates(1)
 			return picked, providerKey, nil
 		}
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
@@ -515,6 +521,13 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 	}
 	if !hasCandidate {
 		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
+	}
+	if note := routingPickNoteFromContext(ctx); note != nil {
+		ready := 0
+		for _, shard := range candidateShards {
+			ready += shard.readyCountAtPriorityLocked(false, bestPriority, predicate)
+		}
+		note.setCandidates(ready)
 	}
 
 	if strategy == schedulerStrategyFillFirst {

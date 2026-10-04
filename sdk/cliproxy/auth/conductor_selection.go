@@ -2117,12 +2117,17 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	}
 	m.mu.RUnlock()
 
+	note := routingPickNoteFromContext(ctx)
 	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, available)
 	if errPick != nil {
 		m.warnLogAuthUnavailable(ctx, providers, model, opts, tried, errPick)
 		return nil, nil, "", errPick
 	}
-	if !handled {
+	if handled {
+		note.setSelection(RoutingSelectionPlugin)
+		note.setCandidates(len(available))
+	} else {
+		note.setCandidates(len(selectorAuths))
 		selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
 		selected, errPick = selector.Pick(selectorCtx, "mixed", selectionArgForSelector(selector, model), opts, selectorAuths)
 		if errPick != nil {
@@ -2158,6 +2163,16 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	if m.HomeEnabled() {
 		return m.pickNextViaHome(ctx, model, opts, tried)
 	}
+	note := &routingPickNote{candidates: -1}
+	auth, executor, provider, errPick := m.pickNextMixedLocal(withRoutingPickNote(ctx, note), providers, model, opts, tried)
+	if errPick == nil {
+		m.recordRoutingPick(ctx, note, auth, provider, model, opts)
+	}
+	return auth, executor, provider, errPick
+}
+
+// pickNextMixedLocal selects a credential with local scheduling state.
+func (m *Manager) pickNextMixedLocal(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = "mixed"
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
 

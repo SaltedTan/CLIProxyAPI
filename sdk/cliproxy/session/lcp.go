@@ -1017,6 +1017,28 @@ func (m *MerklePrefixMatcher) InvalidateAuth(authID string) {
 	}
 }
 
+// ActiveBindingsByAuth counts unexpired prefix-matched sessions per bound auth ID.
+func (m *MerklePrefixMatcher) ActiveBindingsByAuth() map[string]int {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := m.now()
+	out := make(map[string]int)
+	for _, ns := range m.groups {
+		if ns == nil {
+			continue
+		}
+		for _, group := range ns.groups {
+			if group != nil && group.authID != "" && now.Before(group.expiresAt) {
+				out[group.authID]++
+			}
+		}
+	}
+	return out
+}
+
 // Clear removes all remembered prefix bindings.
 func (m *MerklePrefixMatcher) Clear() {
 	if m == nil {

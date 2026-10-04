@@ -69,11 +69,13 @@ func (e *CodexAutoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 		return cliproxyexecutor.Response{}, fmt.Errorf("codex auto executor: executor is nil")
 	}
 	if cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketsEnabled(auth) {
+		cliproxyauth.NoteRoutingTransport(ctx, cliproxyauth.RoutingTransportWebsocket)
 		return e.wsExec.Execute(ctx, auth, req, opts)
 	}
 	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
 		return cliproxyexecutor.Response{}, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 	}
+	cliproxyauth.NoteRoutingTransport(ctx, cliproxyauth.RoutingTransportHTTP)
 	return e.httpExec.Execute(ctx, auth, req, opts)
 }
 
@@ -82,11 +84,13 @@ func (e *CodexAutoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 		return nil, fmt.Errorf("codex auto executor: executor is nil")
 	}
 	if cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketsEnabled(auth) {
+		cliproxyauth.NoteRoutingTransport(ctx, cliproxyauth.RoutingTransportWebsocket)
 		return e.wsExec.ExecuteStream(ctx, auth, req, opts)
 	}
 	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
 		return nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 	}
+	cliproxyauth.NoteRoutingTransport(ctx, cliproxyauth.RoutingTransportHTTP)
 	return e.httpExec.ExecuteStream(ctx, auth, req, opts)
 }
 

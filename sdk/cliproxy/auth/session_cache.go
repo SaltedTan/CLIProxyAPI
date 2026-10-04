@@ -434,6 +434,22 @@ func (c *SessionCache) Len() int {
 	return len(c.entries)
 }
 
+// ActiveBindingsByAuth counts unexpired logical sessions per bound auth ID.
+func (c *SessionCache) ActiveBindingsByAuth(now time.Time) map[string]int {
+	if c == nil {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[string]int)
+	for _, group := range c.groups {
+		if group.authID != "" && now.Before(group.expiresAt) {
+			out[group.authID]++
+		}
+	}
+	return out
+}
+
 func (c *SessionCache) cleanup() {
 	now := time.Now()
 	c.mu.Lock()

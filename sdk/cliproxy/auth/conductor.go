@@ -175,6 +175,9 @@ type Manager struct {
 	homeDispatchBundle          atomic.Pointer[HomeDispatchBundle]
 	homeInFlightPublisherConfig atomic.Pointer[HomeInFlightPublisherConfig]
 
+	// routingObs records recent local credential selections for management observability.
+	routingObs routingObserver
+
 	// Retry controls request retry behavior.
 	requestRetry        atomic.Int32
 	maxRetryCredentials atomic.Int32
@@ -239,6 +242,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		manager.ApplyHomeInFlightPublisherConfig(defaultInFlightConfig)
 	}
 	manager.scheduler = newAuthScheduler(selector)
+	manager.routingObs.since = time.Now()
 	return manager
 }
 

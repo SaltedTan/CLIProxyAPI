@@ -277,6 +277,9 @@ func (s *QuotaAwareSelector) Pick(ctx context.Context, provider, model string, o
 		fields["short_reset_at"] = picked.usage.short.resetAt.UTC().Format(time.RFC3339)
 	}
 	selectorLogEntry(ctx).WithFields(fields).Debug("quota-aware: selected credential")
+	note := routingPickNoteFromContext(ctx)
+	note.setStrategyReason(decision.reason)
+	note.setCandidates(len(available))
 	return picked.auth, nil
 }
 
