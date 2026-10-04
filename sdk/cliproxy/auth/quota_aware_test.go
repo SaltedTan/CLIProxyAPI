@@ -109,6 +109,28 @@ func TestQuotaAwareSelector_PaceBeatsEarlierReset(t *testing.T) {
 	assertPickSequence(t, selector, cliproxyexecutor.Options{}, auths, "b", "b", "b")
 }
 
+// An account with less quota left but an imminent weekly reset must be drained before an
+// account with more quota left that resets days later.
+func TestQuotaAwareSelector_ClaudeSoonResetBeatsLargerLaterReset(t *testing.T) {
+	t.Parallel()
+	now := quotaAwareTestBase()
+	claudeAuth := func(id, weeklyUsed string, weeklyResetIn time.Duration) *Auth {
+		return &Auth{ID: id, Provider: "claude", Status: StatusActive, Quota: QuotaState{ObservedAt: now, Signals: map[string]string{
+			"Anthropic-Ratelimit-Unified-7d-Utilization": weeklyUsed,
+			"Anthropic-Ratelimit-Unified-7d-Reset":       strconv.FormatInt(now.Add(weeklyResetIn).Unix(), 10),
+			"Anthropic-Ratelimit-Unified-5h-Utilization": "0.1",
+			"Anthropic-Ratelimit-Unified-5h-Reset":       strconv.FormatInt(now.Add(4*time.Hour).Unix(), 10),
+		}}}
+	}
+	// 88% left over 6 days needs ~0.61%/h; 32% left over 10 hours needs 3.2%/h.
+	later := claudeAuth("a-later", "0.12", 6*24*time.Hour)
+	sooner := claudeAuth("b-sooner", "0.68", 10*time.Hour)
+	for _, order := range [][]*Auth{{later, sooner}, {sooner, later}} {
+		selector := newTestQuotaAwareSelector(now, nil)
+		assertPickSequence(t, selector, cliproxyexecutor.Options{}, order, "b-sooner", "b-sooner", "b-sooner")
+	}
+}
+
 func TestQuotaAwareSelector_CandidateOrderDoesNotAffectResult(t *testing.T) {
 	t.Parallel()
 	now := quotaAwareTestBase()
