@@ -46,6 +46,8 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 		state.strategy = "weighted-round-robin"
 	case "fill-first", "fillfirst", "ff":
 		state.strategy = "fill-first"
+	case "quota-aware", "quotaaware", "qa", "reset-priority":
+		state.strategy = "quota-aware"
 	}
 	state.sessionAffinity = cfg.Routing.SessionAffinity
 	if ttl := strings.TrimSpace(cfg.Routing.SessionAffinityTTL); ttl != "" {
@@ -69,6 +71,9 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 		selector = &coreauth.WeightedRoundRobinSelector{}
 	case "fill-first":
 		selector = &coreauth.FillFirstSelector{}
+	case "quota-aware":
+		// Round-robin rotates equally urgent credentials and pools without quota data.
+		selector = coreauth.NewQuotaAwareSelector(&coreauth.RoundRobinSelector{})
 	default:
 		selector = &coreauth.RoundRobinSelector{}
 	}

@@ -756,3 +756,37 @@ plugins:
 		request(http.MethodDelete, path, http.StatusNotFound, "")
 	}
 }
+
+func TestConfigV8RoutingStrategyQuotaAwareRoundTrip(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("routing: {strategy: round-robin, session-affinity: true}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &Handler{cfg: cfg, configFilePath: path}
+	router := gin.New()
+	router.PUT("/v8/management/config/*path", h.ConfigV8)
+	router.GET("/v8/management/config/*path", h.ConfigV8)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPut, "/v8/management/config/routing/strategy", strings.NewReader(`"quota-aware"`)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("put strategy: status=%d body=%s", w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v8/management/config/routing/strategy", nil))
+	if w.Code != http.StatusOK || strings.TrimSpace(w.Body.String()) != `"quota-aware"` {
+		t.Fatalf("get strategy: status=%d body=%s", w.Code, w.Body.String())
+	}
+	loaded, err := config.LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Routing.Strategy != "quota-aware" || !loaded.Routing.SessionAffinity {
+		t.Fatalf("routing = %+v, want quota-aware with session affinity preserved", loaded.Routing)
+	}
+}

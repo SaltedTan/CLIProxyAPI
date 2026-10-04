@@ -351,7 +351,10 @@ type QuotaExceeded struct {
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
-	// Supported values: "round-robin" (default), "weighted-round-robin", "fill-first".
+	// Supported values: "round-robin" (default), "weighted-round-robin", "fill-first",
+	// "quota-aware". quota-aware sends new work to the credential whose remaining weekly
+	// quota most needs using before its reset (remaining fraction / time until reset),
+	// skips credentials near their 5h cap, and falls back to round-robin without quota data.
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
 
 	// SessionAffinity enables universal session-sticky routing for all clients.
