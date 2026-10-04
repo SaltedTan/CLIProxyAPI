@@ -139,12 +139,78 @@ func TestQuotaAwareSelector_MissingDataRanksAfterWeeklyData(t *testing.T) {
 	t.Parallel()
 	now := quotaAwareTestBase()
 	selector := newTestQuotaAwareSelector(now, nil)
-	// "a" sorts first, so a plain round-robin fallback would have chosen it.
 	auths := []*Auth{
 		{ID: "a", Provider: "codex", Status: StatusActive},
 		codexQuotaAuth("b", now, 40, 10*time.Hour),
 	}
-	assertPickSequence(t, selector, cliproxyexecutor.Options{}, auths, "b", "b", "b")
+	// "a" is probed once, then ranks after "b" until the probe interval passes.
+	assertPickSequence(t, selector, cliproxyexecutor.Options{}, auths, "a", "b", "b")
+
+	selector.nowFunc = func() time.Time { return now.Add(quotaAwareProbeInterval - time.Second) }
+	assertPickSequence(t, selector, cliproxyexecutor.Options{}, auths, "b")
+	selector.nowFunc = func() time.Time { return now.Add(quotaAwareProbeInterval) }
+	assertPickSequence(t, selector, cliproxyexecutor.Options{}, auths, "a", "b")
+}
+
+// A restart clears every snapshot. The first pick lands on one credential, whose response
+// reports heavy use; the other must still be probed rather than starved behind it.
+func TestQuotaAwareSelector_ProbesCredentialWithoutDataAfterColdStart(t *testing.T) {
+	t.Parallel()
+	now := quotaAwareTestBase()
+	selector := newTestQuotaAwareSelector(now, nil)
+	pldi := &Auth{ID: "claude-pldi", Provider: "claude", Status: StatusActive}
+	team := &Auth{ID: "claude-team", Provider: "claude", Status: StatusActive}
+	auths := []*Auth{team, pldi}
+
+	if got := mustPick(t, selector, cliproxyexecutor.Options{}, auths); got != pldi {
+		t.Fatalf("cold pick = %s, want %s (round-robin over credentials without data)", got.ID, pldi.ID)
+	}
+	pldi.Quota = QuotaState{ObservedAt: now, Signals: map[string]string{
+		"Anthropic-Ratelimit-Unified-7d-Utilization": "0.95",
+		"Anthropic-Ratelimit-Unified-7d-Reset":       strconv.FormatInt(now.Add(6*24*time.Hour).Unix(), 10),
+		"Anthropic-Ratelimit-Unified-5h-Utilization": "0.5",
+		"Anthropic-Ratelimit-Unified-5h-Reset":       strconv.FormatInt(now.Add(4*time.Hour).Unix(), 10),
+	}}
+	assertPickSequence(t, selector, cliproxyexecutor.Options{}, auths, "claude-team")
+
+	team.Quota = QuotaState{ObservedAt: now, Signals: map[string]string{
+		"Anthropic-Ratelimit-Unified-7d-Utilization": "0.1",
+		"Anthropic-Ratelimit-Unified-7d-Reset":       strconv.FormatInt(now.Add(5*24*time.Hour).Unix(), 10),
+		"Anthropic-Ratelimit-Unified-5h-Utilization": "0",
+		"Anthropic-Ratelimit-Unified-5h-Reset":       strconv.FormatInt(now.Add(5*time.Hour).Unix(), 10),
+	}}
+	assertPickSequence(t, selector, cliproxyexecutor.Options{}, auths, "claude-team", "claude-team")
+}
+
+func TestQuotaAwareSelector_DoesNotProbeZeroWeightOrSaturatedCredentials(t *testing.T) {
+	t.Parallel()
+	now := quotaAwareTestBase()
+	selector := newTestQuotaAwareSelector(now, nil)
+	zeroWeight := &Auth{ID: "a", Provider: "claude", Status: StatusActive, Attributes: map[string]string{AttributeWeight: "0"}}
+	// Only a 5h window, nearly used up: no weekly data, but skipped as short-saturated.
+	saturated := &Auth{ID: "b", Provider: "claude", Status: StatusActive, Quota: QuotaState{ObservedAt: now, Signals: map[string]string{
+		"Anthropic-Ratelimit-Unified-5h-Utilization": "0.9",
+		"Anthropic-Ratelimit-Unified-5h-Reset":       strconv.FormatInt(now.Add(2*time.Hour).Unix(), 10),
+	}}}
+	withData := &Auth{ID: "c", Provider: "claude", Status: StatusActive, Quota: QuotaState{ObservedAt: now, Signals: map[string]string{
+		"Anthropic-Ratelimit-Unified-7d-Utilization": "0.5",
+		"Anthropic-Ratelimit-Unified-7d-Reset":       strconv.FormatInt(now.Add(3*24*time.Hour).Unix(), 10),
+	}}}
+	assertPickSequence(t, selector, cliproxyexecutor.Options{}, []*Auth{zeroWeight, saturated, withData}, "c", "c")
+}
+
+func TestQuotaAwareSelector_NoProbesWithoutWeeklyData(t *testing.T) {
+	t.Parallel()
+	now := quotaAwareTestBase()
+	selector := newTestQuotaAwareSelector(now, nil)
+	auths := []*Auth{
+		{ID: "a", Provider: "codex", Status: StatusActive},
+		{ID: "b", Provider: "codex", Status: StatusActive},
+	}
+	assertPickSequence(t, selector, cliproxyexecutor.Options{}, auths, "a", "b", "a", "b")
+	if len(selector.probedAt) != 0 {
+		t.Fatalf("probedAt = %v, want no probes when no credential has weekly data", selector.probedAt)
+	}
 }
 
 type recordingSelector struct {
@@ -514,12 +580,15 @@ func TestManagerQuotaAwareSessionAffinityCooldownFailover(t *testing.T) {
 	now := quotaAwareTestBase()
 	const model = "quota-aware-model"
 
-	selector := NewSessionAffinitySelector(newTestQuotaAwareSelector(now, nil))
+	urgentID, relaxedID, unknownID := "qa-urgent-"+t.Name(), "qa-relaxed-"+t.Name(), "qa-unknown-"+t.Name()
+	quotaSelector := newTestQuotaAwareSelector(now, nil)
+	// Already probed, so the credential without data ranks after those with it.
+	quotaSelector.recordProbe(unknownID, now)
+	selector := NewSessionAffinitySelector(quotaSelector)
 	t.Cleanup(selector.Stop)
 	manager := NewManager(nil, selector, nil)
 	manager.SetRetryConfig(3, 30*time.Second, 0)
 
-	urgentID, relaxedID, unknownID := "qa-urgent-"+t.Name(), "qa-relaxed-"+t.Name(), "qa-unknown-"+t.Name()
 	for _, candidate := range []*Auth{
 		{ID: unknownID, Provider: "codex", Status: StatusActive},
 		codexQuotaAuth(relaxedID, now, 40, 90*time.Hour),

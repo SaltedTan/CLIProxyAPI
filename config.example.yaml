@@ -136,9 +136,11 @@ routing:
   # Credentials whose 5h window is at least 85% used (and not resetting within 15 minutes)
   # get no new work unless every credential is in that state. Usage comes from the quota
   # headers of each credential's last upstream response (Claude 5h/7d, Codex 5h/weekly,
-  # Devin daily/weekly). Credentials without that data rank after those with it; when no
-  # credential has it, selection is round-robin. Cooling-down or disabled credentials are
-  # never chosen. Combine with session-affinity so a conversation stays on its credential.
+  # Devin daily/weekly). Credentials without that data rank after those with it, but each
+  # still gets one new session every 30 minutes so its quota is observed (for example after
+  # a restart); when no credential has it, selection is round-robin. Cooling-down or
+  # disabled credentials are never chosen. Combine with session-affinity so a conversation
+  # stays on its credential.
   # Usage is a percentage of each plan's own weekly limit, so set "weight" to the relative
   # weekly allowance when plans differ (for example 5 on a ChatGPT Pro $100 Codex account
   # next to weight-1 Plus accounts). Weights only compare credentials of the same provider.

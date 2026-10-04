@@ -5,6 +5,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -29,6 +30,10 @@ const (
 	quotaAwareNearTieRatio = 0.8
 	// quotaAwareMinHorizon bounds the required pace for resets that are moments away.
 	quotaAwareMinHorizon = time.Minute
+	// quotaAwareProbeInterval is how often a credential without usable weekly data is sent a
+	// new session while others have data. Quota is only observed from responses, so without
+	// probes such a credential would never be chosen and never report its quota.
+	quotaAwareProbeInterval = 30 * time.Minute
 )
 
 // QuotaAwareSelector routes new work by subscription pace. For each eligible credential it
@@ -51,11 +56,19 @@ const (
 //  3. Credentials without usable weekly data come next, then credentials whose weekly quota
 //     is used up or whose weight is zero; each group is rotated by the fallback selector.
 //
+// Because quota is only observed from responses, rule 2 alone would starve a credential that
+// has no data yet (for example after a restart, or once its weekly window rolled over). So
+// while some candidates have weekly data, a positive-weight credential without it is probed:
+// it takes precedence over the ranking for one new session per quotaAwareProbeInterval.
+//
 // The selector is stateless with respect to sessions. When session affinity is enabled it
 // runs only for unbound sessions and failover rebinding; established bindings never reach it.
 type QuotaAwareSelector struct {
 	fallback Selector
 	nowFunc  func() time.Time
+
+	mu       sync.Mutex
+	probedAt map[string]time.Time // last probe time by auth ID
 }
 
 // NewQuotaAwareSelector creates a quota-aware selector. A nil fallback defaults to round-robin.
@@ -117,6 +130,7 @@ type quotaAwareCandidate struct {
 // quotaAwareDecision describes which candidates remain after ranking.
 type quotaAwareDecision struct {
 	chosen         []quotaAwareCandidate
+	unknown        []quotaAwareCandidate // candidates without usable weekly data
 	reason         string
 	shortSaturated int
 	withWeekly     int
@@ -185,6 +199,7 @@ func rankQuotaAware(auths []*Auth, now time.Time) quotaAwareDecision {
 	if allSaturated && len(auths) > 0 {
 		decision.reason += ",all_short_saturated"
 	}
+	decision.unknown = unknown
 	return decision
 }
 
@@ -199,6 +214,11 @@ func (s *QuotaAwareSelector) Pick(ctx context.Context, provider, model string, o
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 
 	decision := rankQuotaAware(available, now)
+	probes := s.dueProbes(decision, now)
+	if len(probes) > 0 {
+		decision.chosen = probes
+		decision.reason = "probe_no_weekly_data"
+	}
 	if len(decision.chosen) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
@@ -229,6 +249,9 @@ func (s *QuotaAwareSelector) Pick(ctx context.Context, provider, model string, o
 			}
 		}
 	}
+	if len(probes) > 0 {
+		s.recordProbe(picked.auth.ID, now)
+	}
 
 	fields := log.Fields{
 		"provider":        provider,
@@ -255,6 +278,47 @@ func (s *QuotaAwareSelector) Pick(ctx context.Context, provider, model string, o
 	}
 	selectorLogEntry(ctx).WithFields(fields).Debug("quota-aware: selected credential")
 	return picked.auth, nil
+}
+
+// dueProbes returns the candidates without usable weekly data that are due a probe. Probes
+// are only needed while other candidates have weekly data; otherwise the unknown group is
+// already the one rotated. Zero-weight credentials are last resorts and are never probed.
+func (s *QuotaAwareSelector) dueProbes(decision quotaAwareDecision, now time.Time) []quotaAwareCandidate {
+	if s == nil || decision.withWeekly == 0 || len(decision.unknown) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var due []quotaAwareCandidate
+	for _, candidate := range decision.unknown {
+		if authWeight(candidate.auth) <= 0 {
+			continue
+		}
+		if last, ok := s.probedAt[candidate.auth.ID]; ok && now.Sub(last) < quotaAwareProbeInterval {
+			continue
+		}
+		due = append(due, candidate)
+	}
+	return due
+}
+
+// recordProbe marks a credential as probed and drops expired probe entries. Concurrent picks
+// may probe the same credential twice before either records it, which is harmless.
+func (s *QuotaAwareSelector) recordProbe(authID string, now time.Time) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.probedAt == nil {
+		s.probedAt = make(map[string]time.Time)
+	}
+	for id, last := range s.probedAt {
+		if now.Sub(last) >= quotaAwareProbeInterval {
+			delete(s.probedAt, id)
+		}
+	}
+	s.probedAt[authID] = now
 }
 
 func roundPercent(fraction float64) float64 {

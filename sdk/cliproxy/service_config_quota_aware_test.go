@@ -42,19 +42,20 @@ func TestQuotaAwareRoutingSelectorWrappedBySessionAffinity(t *testing.T) {
 	}
 	defer selector.Stop()
 
-	// "a" sorts first, so only quota-aware ranking (not the round-robin fallback) picks "b".
+	// "a" sorts first, so only quota-aware ranking (not the round-robin fallback) picks "b",
+	// whose weekly quota resets much sooner.
 	now := time.Now()
-	auths := []*coreauth.Auth{
-		{ID: "a", Provider: "codex", Status: coreauth.StatusActive},
-		{ID: "b", Provider: "codex", Status: coreauth.StatusActive, Quota: coreauth.QuotaState{
+	weeklyAuth := func(id string, resetIn time.Duration) *coreauth.Auth {
+		return &coreauth.Auth{ID: id, Provider: "codex", Status: coreauth.StatusActive, Quota: coreauth.QuotaState{
 			ObservedAt: now,
 			Signals: map[string]string{
 				"X-Codex-Primary-Used-Percent":   "20",
 				"X-Codex-Primary-Window-Minutes": "10080",
-				"X-Codex-Primary-Reset-At":       strconv.FormatInt(now.Add(2*time.Hour).Unix(), 10),
+				"X-Codex-Primary-Reset-At":       strconv.FormatInt(now.Add(resetIn).Unix(), 10),
 			},
-		}},
+		}}
 	}
+	auths := []*coreauth.Auth{weeklyAuth("a", 100*time.Hour), weeklyAuth("b", 2*time.Hour)}
 	opts := cliproxyexecutor.Options{Headers: http.Header{"X-Session-Id": []string{"wrapped"}}}
 	picked, errPick := selector.Pick(context.Background(), "codex", "gpt-5", opts, auths)
 	if errPick != nil || picked == nil || picked.ID != "b" {
