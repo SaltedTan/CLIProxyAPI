@@ -304,8 +304,13 @@ client:
 # Shared upstream behavior applies to OAuth and API-key credentials.
 upstream:
   codex:
+    # The upstream Codex WebSocket transport is used only when the client connects to
+    # /v1/responses over WebSocket AND the selected credential enables it: `websockets: true`
+    # on an api-keys.codex key, or `"websockets": true` in a Codex OAuth auth file.
+    # Every other request uses HTTP/SSE.
     # Experimental full-duplex Codex Responses WebSocket steering (default: false).
-    # Keeps one upstream account/model per socket; accepted input is never replayed.
+    # Requires the WebSocket transport above. Keeps one upstream account/model per socket;
+    # accepted input is never replayed.
     response-steering: false
     # Disable forcing the official Codex User-Agent and Originator headers on HTTP/SSE and WebSocket requests.
     disable-codex-cloaking: false
