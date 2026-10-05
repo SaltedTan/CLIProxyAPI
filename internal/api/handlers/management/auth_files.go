@@ -427,6 +427,9 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, pagination authFilesPagi
 			if projectID := strings.TrimSpace(gjson.GetBytes(data, "project_id").String()); projectID != "" {
 				fileData["project_id"] = projectID
 			}
+			if organizationName := strings.TrimSpace(gjson.GetBytes(data, "organization_name").String()); organizationName != "" {
+				fileData["organization_name"] = organizationName
+			}
 			if pv := gjson.GetBytes(data, "priority"); pv.Exists() {
 				switch pv.Type {
 				case gjson.Number:
@@ -704,6 +707,9 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quotaSupported .
 	if projectID := authProjectID(auth); projectID != "" {
 		entry["project_id"] = projectID
 	}
+	if organizationName := authOrganizationName(auth); organizationName != "" {
+		entry["organization_name"] = organizationName
+	}
 	if accountType, account := auth.AccountInfo(); accountType != "" || account != "" {
 		if accountType != "" {
 			entry["account_type"] = accountType
@@ -900,6 +906,19 @@ func authProjectID(auth *coreauth.Auth) string {
 		if projectID := strings.TrimSpace(auth.Attributes["project_id"]); projectID != "" {
 			return projectID
 		}
+	}
+	return ""
+}
+
+// authOrganizationName returns the organization (team) a credential belongs to.
+// One email can join several organizations, so this is what tells such
+// credentials apart. Claude keeps it current from the account profile.
+func authOrganizationName(auth *coreauth.Auth) string {
+	if auth == nil || auth.Metadata == nil {
+		return ""
+	}
+	if v, ok := auth.Metadata["organization_name"].(string); ok {
+		return strings.TrimSpace(v)
 	}
 	return ""
 }
