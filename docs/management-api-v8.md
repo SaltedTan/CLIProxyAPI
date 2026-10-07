@@ -323,7 +323,10 @@ effect on every configuration reload (file changes and management writes)
 without a restart. Negative, NaN or infinite values and duplicated entries are
 rejected: the file fails to load and management writes return
 `400 invalid_config`; error messages mask the key (keys of four characters or
-fewer are masked completely, in errors and in the report's `key` field).
+fewer are masked completely, in errors and in the report's `key` field). An
+entry counts as duplicated within one mapping, also when the map is reached
+through a YAML merge key (`<<`) or an alias, and in a nested `PATCH` body; an
+entry set directly still overrides the same entry from a merged mapping.
 
 When a key's `current_pro_units` reaches its limit, the proxy refuses that key's
 requests to every Claude credential, OAuth and API-key alike, before any
@@ -346,7 +349,17 @@ the Claude messages endpoint Anthropic's native envelope
 
 and Gemini-style endpoints their usual shape with the same status and message.
 The message never contains the raw key. Streaming requests receive the same
-JSON body before any stream opens, never an SSE error event. Refused requests
+JSON body before any stream opens, never an SSE error event. On the
+`/v1/responses` WebSocket the HTTP upgrade has already happened, so a refused
+`response.create` is answered with an `error` event carrying the same status,
+headers and envelope, after which the proxy closes the socket; reconnect after
+`Retry-After`:
+
+```json
+{"type":"error","status":429,"headers":{"Content-Type":"application/json","Retry-After":"5400"},"error":{"message":"client API key Claude allowance reached: 1.52 of 1.5 Pro units used this week; resets in 1h30m","type":"rate_limit_error","code":"rate_limit_exceeded"}}
+```
+
+Refused requests
 increment `blocked` only: they are not counted as `requests` or `failed`,
 publish no usage record and do not cool down any credential. A request that is
 refused on Claude but served by another provider is not blocked and is not

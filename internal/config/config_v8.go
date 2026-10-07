@@ -154,23 +154,119 @@ func buildV8Paths() []configPath {
 var clientKeyMapPaths = []string{"access.api-key-limits", "api-key-limits", "access.api-key-names", "api-key-names"}
 
 // checkClientKeyMapDuplicates rejects a duplicated entry in a client key map with
-// the key masked.
+// the key masked. The maps are located through YAML aliases and merge keys, and
+// every merged mapping is checked on its own: yaml.v3 decodes each of them as a
+// mapping of its own and would name the duplicated key in its error.
 func checkClientKeyMapDuplicates(root *yaml.Node) error {
 	for _, path := range clientKeyMapPaths {
-		mapping := yamlPath(root, path)
-		if mapping == nil || mapping.Kind != yaml.MappingNode {
+		mapping := root
+		for _, key := range strings.Split(path, ".") {
+			if mapping = mergedMapValue(mapping, key, make(map[*yaml.Node]struct{})); mapping == nil {
+				break
+			}
+		}
+		if mapping == nil {
 			continue
 		}
-		seen := make(map[string]struct{}, len(mapping.Content)/2)
-		for i := 0; i+1 < len(mapping.Content); i += 2 {
-			key := mapping.Content[i].Value
-			if _, duplicate := seen[key]; duplicate {
-				return fmt.Errorf("%s: entry %s is defined more than once (line %d)", path, maskClientKey(key), mapping.Content[i].Line)
+		for _, node := range mergedMappings(mapping, nil, make(map[*yaml.Node]struct{})) {
+			seen := make(map[string]struct{}, len(node.Content)/2)
+			for i := 0; i+1 < len(node.Content); i += 2 {
+				if isMergeKey(node.Content[i]) {
+					continue
+				}
+				key := node.Content[i].Value
+				if _, duplicate := seen[key]; duplicate {
+					return fmt.Errorf("%s: entry %s is defined more than once (line %d)", path, maskClientKey(key), node.Content[i].Line)
+				}
+				seen[key] = struct{}{}
 			}
-			seen[key] = struct{}{}
 		}
 	}
 	return nil
+}
+
+// isMergeKey reports whether key is a YAML merge key (<<).
+func isMergeKey(key *yaml.Node) bool {
+	return key != nil && key.Kind == yaml.ScalarNode && key.Value == "<<" && (key.Tag == "" || key.Tag == "!" || key.Tag == "!!merge")
+}
+
+// resolveAliasNode follows aliases to the anchored node. It returns nil for a
+// node already seen, which only happens when an anchor contains its own alias.
+func resolveAliasNode(node *yaml.Node, seen map[*yaml.Node]struct{}) *yaml.Node {
+	for node != nil && node.Kind == yaml.AliasNode {
+		if _, cyclic := seen[node]; cyclic {
+			return nil
+		}
+		seen[node] = struct{}{}
+		node = node.Alias
+	}
+	return node
+}
+
+// mergeSources lists the mappings merged into node by its merge keys, in the
+// order yaml.v3 applies them: earlier sources win over later ones.
+func mergeSources(node *yaml.Node, seen map[*yaml.Node]struct{}) []*yaml.Node {
+	var sources []*yaml.Node
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if !isMergeKey(node.Content[i]) {
+			continue
+		}
+		merge := resolveAliasNode(node.Content[i+1], seen)
+		if merge == nil {
+			continue
+		}
+		candidates := []*yaml.Node{merge}
+		if merge.Kind == yaml.SequenceNode {
+			candidates = merge.Content
+		}
+		for _, candidate := range candidates {
+			if source := resolveAliasNode(candidate, seen); source != nil && source.Kind == yaml.MappingNode {
+				sources = append(sources, source)
+			}
+		}
+	}
+	return sources
+}
+
+// mergedMapValue returns the value for key in the mapping node with YAML merge
+// semantics: a direct entry wins, then merged mappings in order, recursively.
+func mergedMapValue(node *yaml.Node, key string, seen map[*yaml.Node]struct{}) *yaml.Node {
+	node = resolveAliasNode(node, seen)
+	if node == nil || node.Kind != yaml.MappingNode {
+		return nil
+	}
+	if _, visited := seen[node]; visited {
+		return nil
+	}
+	seen[node] = struct{}{}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if !isMergeKey(node.Content[i]) && node.Content[i].Value == key {
+			return node.Content[i+1]
+		}
+	}
+	for _, source := range mergeSources(node, seen) {
+		if value := mergedMapValue(source, key, seen); value != nil {
+			return value
+		}
+	}
+	return nil
+}
+
+// mergedMappings returns node and every mapping merged into it, recursively.
+func mergedMappings(node *yaml.Node, out []*yaml.Node, seen map[*yaml.Node]struct{}) []*yaml.Node {
+	node = resolveAliasNode(node, seen)
+	if node == nil || node.Kind != yaml.MappingNode {
+		return out
+	}
+	if _, visited := seen[node]; visited {
+		return out
+	}
+	seen[node] = struct{}{}
+	out = append(out, node)
+	for _, source := range mergeSources(node, seen) {
+		out = mergedMappings(source, out, seen)
+	}
+	return out
 }
 
 func yamlPath(root *yaml.Node, path string) *yaml.Node {

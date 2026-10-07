@@ -108,6 +108,10 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_config", "message": err.Error()})
 				return
 			}
+		} else if err = config.CheckClientKeyMapWrite(parts, update.Content[0]); err != nil {
+			// A nested patch merges duplicates away before the merged tree is checked.
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_config", "message": err.Error()})
+			return
 		}
 		// Paths identify YAML keys, never array indexes. Lists are replaced whole.
 		dst := root

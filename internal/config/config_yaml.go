@@ -392,6 +392,12 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 		return false
 	}
 
+	// Client key allowances are explicit per entry: a full-key 0 lifts an id
+	// limit, so neither a 0 entry nor a map holding only zeros is a default.
+	if isClientKeyLimitsPath(path) && node != nil && (node.Kind == yaml.ScalarNode || (node.Kind == yaml.MappingNode && len(node.Content) > 0)) {
+		return false
+	}
+
 	// First check if it's a zero value
 	if isZeroValueNode(node) {
 		return true
@@ -464,6 +470,19 @@ func pruneKnownDefaultsInNewNode(path []string, node *yaml.Node) {
 		for _, child := range node.Content {
 			pruneKnownDefaultsInNewNode(path, child)
 		}
+	}
+}
+
+// isClientKeyLimitsPath reports whether path is the api-key-limits map or one of
+// its entries, in either layout.
+func isClientKeyLimitsPath(path []string) bool {
+	switch len(path) {
+	case 0:
+		return false
+	case 1:
+		return path[0] == "api-key-limits"
+	default:
+		return path[len(path)-1] == "api-key-limits" || path[len(path)-2] == "api-key-limits"
 	}
 }
 

@@ -33,6 +33,23 @@ func ProjectV8ConfigAliases(root *yaml.Node, path string) {
 	}
 }
 
+// CheckClientKeyMapWrite rejects a management write whose body, placed at the
+// given path, defines a client key more than once. It runs on the incoming
+// document, before a patch merge could collapse the duplicate into one entry.
+func CheckClientKeyMapWrite(parts []string, update *yaml.Node) error {
+	if update == nil {
+		return nil
+	}
+	root := update
+	for i := len(parts) - 1; i >= 0; i-- {
+		root = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map", Content: []*yaml.Node{
+			{Kind: yaml.ScalarNode, Tag: "!!str", Value: parts[i]},
+			root,
+		}}
+	}
+	return checkClientKeyMapDuplicates(root)
+}
+
 // NormalizeV8ConfigAliases accepts historical v8 paths without discarding
 // unknown fields. Callers still validate the canonical document before saving.
 // Normalize request bodies before merging so an alias update can replace a

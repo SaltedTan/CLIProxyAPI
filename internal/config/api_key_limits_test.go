@@ -60,3 +60,100 @@ func TestDuplicateClientKeyEntriesAreReportedMasked(t *testing.T) {
 		}
 	}
 }
+
+// TestDuplicateClientKeyEntriesBehindMergesAndAliasesAreReportedMasked covers
+// client key maps reached through YAML merge keys and aliases. yaml.v3 decodes
+// every merged or aliased mapping on its own and names a duplicated key in its
+// error, so the masked check has to look through them first.
+func TestDuplicateClientKeyEntriesBehindMergesAndAliasesAreReportedMasked(t *testing.T) {
+	const key = "fixture-client-key-1"
+	const masked = "fixt...ey-1"
+	cases := map[string]string{
+		"v8 limits under a merged mapping":     "config-version: 8\naccess:\n  <<: &settings\n    api-key-limits:\n      " + key + ": 1\n      " + key + ": 2\n",
+		"v8 limits behind an alias":            "config-version: 8\nx-limits: &limits\n  " + key + ": 1\n  " + key + ": 2\naccess:\n  api-key-limits: *limits\n",
+		"merge inside the v8 limits map":       "config-version: 8\naccess:\n  api-key-limits:\n    <<:\n      " + key + ": 1\n      " + key + ": 2\n",
+		"merge sequence inside the names map":  "config-version: 8\naccess:\n  api-key-names:\n    <<: [{" + key + ": a, " + key + ": b}]\n",
+		"legacy limits under a merged mapping": "<<: &settings\n  api-key-limits:\n    " + key + ": 1\n    " + key + ": 2\n",
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, errParse := ParseConfigBytes([]byte(raw))
+			if errParse == nil {
+				t.Fatal("ParseConfigBytes accepted a duplicated client key entry")
+			}
+			if strings.Contains(errParse.Error(), key) || !strings.Contains(errParse.Error(), masked) {
+				t.Fatalf("ParseConfigBytes error = %q, want the key masked as %q", errParse, masked)
+			}
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+				t.Fatal(err)
+			}
+			_, errLoad := LoadConfig(path)
+			if errLoad == nil {
+				t.Fatal("LoadConfig accepted a duplicated client key entry")
+			}
+			if strings.Contains(errLoad.Error(), key) || !strings.Contains(errLoad.Error(), masked) {
+				t.Fatalf("LoadConfig error = %q, want the key masked as %q", errLoad, masked)
+			}
+		})
+	}
+}
+
+// TestClientKeyMapMergePrecedenceIsNotADuplicate keeps YAML merge semantics: an
+// entry set directly overrides the same entry from a merged mapping.
+func TestClientKeyMapMergePrecedenceIsNotADuplicate(t *testing.T) {
+	const key = "fixture-client-key-1"
+	raw := "config-version: 8\naccess:\n  api-key-limits:\n    <<:\n      " + key + ": 1\n    " + key + ": 2\n"
+	cfg, err := ParseConfigBytes([]byte(raw))
+	if err != nil {
+		t.Fatalf("ParseConfigBytes() error = %v", err)
+	}
+	if got := cfg.APIKeyLimits[key]; got != 2 {
+		t.Fatalf("limit = %v, want the directly set 2 to win over the merged 1", got)
+	}
+}
+
+// TestSaveKeepsANewZeroLimitEntry guards the config saver: a full-key 0 added at
+// runtime lifts an id limit, so it must survive the save that otherwise drops
+// zero values of new keys.
+func TestSaveKeepsANewZeroLimitEntry(t *testing.T) {
+	const key = "fixture-client-key-1"
+	const id = "3f9a1c2b7d4e5f60"
+	cases := map[string]string{
+		"into an existing map": "config-version: 8\naccess:\n  api-keys: [" + key + "]\n  api-key-limits:\n    \"" + id + "\": 0.125\napi-keys:\n  codex: []\n",
+		"as a new map":         "config-version: 8\naccess:\n  api-keys: [" + key + "]\napi-keys:\n  codex: []\n",
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadConfig(path)
+			if err != nil {
+				t.Fatalf("LoadConfig() error = %v", err)
+			}
+			if cfg.APIKeyLimits == nil {
+				cfg.APIKeyLimits = map[string]float64{}
+			}
+			cfg.APIKeyLimits[key] = 0
+			if err = SaveConfigPreserveComments(path, cfg); err != nil {
+				t.Fatalf("SaveConfigPreserveComments() error = %v", err)
+			}
+			saved, errRead := os.ReadFile(path)
+			if errRead != nil {
+				t.Fatal(errRead)
+			}
+			loaded, errLoad := LoadConfig(path)
+			if errLoad != nil {
+				t.Fatalf("LoadConfig() after save error = %v\n%s", errLoad, saved)
+			}
+			if value, ok := loaded.APIKeyLimits[key]; !ok || value != 0 {
+				t.Fatalf("the new full-key 0 did not survive the save: limits = %v\n%s", loaded.APIKeyLimits, saved)
+			}
+			if strings.Contains(raw, id) && loaded.APIKeyLimits[id] != 0.125 {
+				t.Fatalf("the id limit changed: limits = %v\n%s", loaded.APIKeyLimits, saved)
+			}
+		})
+	}
+}

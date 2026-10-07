@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -258,7 +259,19 @@ func shouldExposeResponsesUpstreamError(errMsg *interfaces.ErrorMessage) bool {
 	if coreauth.IsTerminalAuthError(errMsg.Error) {
 		return true
 	}
+	// The proxy's own allowance refusal is not an upstream 429: no credential
+	// rotation can serve it, and the client needs the Retry-After hint rather
+	// than reconnecting at once.
+	if isClientQuotaRefusal(errMsg.Error) {
+		return true
+	}
 	return clienterror.IsRequestFault(responsesWebsocketErrorStatus(errMsg), errMsg.Error)
+}
+
+// isClientQuotaRefusal reports whether err is the client key allowance refusal.
+func isClientQuotaRefusal(err error) bool {
+	var quota *coreauth.ClientQuotaError
+	return errors.As(err, &quota) && quota != nil
 }
 
 func writeResponsesWebsocketTerminalError(

@@ -938,3 +938,50 @@ func TestConfigV8APIKeyLimitsDuplicateEntryIsMasked(t *testing.T) {
 		t.Fatalf("rejected write reached the file:\n%s", saved)
 	}
 }
+
+// TestConfigV8RejectsDuplicateClientKeysInNestedPatchesAndMergedYAML covers the
+// write shapes where a duplicated client key is otherwise merged away or named
+// raw by the generic decoder: a nested PATCH and a YAML document using a merge key.
+func TestConfigV8RejectsDuplicateClientKeysInNestedPatchesAndMergedYAML(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const key = "fixture-client-key-1"
+	raw := "config-version: 8\naccess:\n  api-keys: [fixture-key-laptop]\napi-keys:\n  codex: []\n"
+	cases := []struct {
+		name, method, url, body string
+	}{
+		{"nested PATCH of the limits map", http.MethodPatch, "/v8/management/config/access/api-key-limits", `{"` + key + `": 0.125, "` + key + `": 0}`},
+		{"PATCH of the access section", http.MethodPatch, "/v8/management/config/access", `{"api-key-names": {"` + key + `": "a", "` + key + `": "b"}}`},
+		{"YAML PUT with a merged duplicate", http.MethodPut, "/v8/management/config.yaml", "config-version: 8\naccess:\n  <<: &settings\n    api-key-limits:\n      " + key + ": 1\n      " + key + ": 2\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.LoadConfig(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := &Handler{cfg: cfg, configFilePath: path}
+			router := gin.New()
+			router.PATCH("/v8/management/config/*path", h.ConfigV8)
+			router.PUT("/v8/management/config.yaml", h.ConfigV8)
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(tc.method, tc.url, strings.NewReader(tc.body)))
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
+			}
+			if strings.Contains(recorder.Body.String(), key) {
+				t.Fatalf("response echoes the raw key: %s", recorder.Body.String())
+			}
+			saved, errRead := os.ReadFile(path)
+			if errRead != nil {
+				t.Fatal(errRead)
+			}
+			if string(saved) != raw {
+				t.Fatalf("rejected write reached the file:\n%s", saved)
+			}
+		})
+	}
+}
