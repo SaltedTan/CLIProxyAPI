@@ -51,10 +51,13 @@ func (t *Tokens) add(other Tokens) {
 
 // Counters accumulates usage for one key, model, or day. Requests counts successful
 // upstream responses, so a request retried on another credential counts once; Failed
-// counts failed upstream attempts, including those later retried.
+// counts failed upstream attempts, including those later retried. Blocked counts
+// requests refused by the key's Claude allowance before any upstream attempt; they
+// are neither Requests nor Failed. Per-model counters never carry Blocked.
 type Counters struct {
 	Requests int64  `json:"requests"`
 	Failed   int64  `json:"failed"`
+	Blocked  int64  `json:"blocked"`
 	Tokens   Tokens `json:"tokens"`
 }
 
@@ -113,14 +116,18 @@ func (k *keyState) dayCounters(day time.Time) *Counters {
 	return counters
 }
 
-// Tracker aggregates usage records by client API key. The zero value is not usable;
+// Tracker aggregates usage records by client API key and, when limits are set,
+// enforces each key's Claude allowance (see Admit). The zero value is not usable;
 // create trackers with NewTracker.
 type Tracker struct {
-	flushMu  sync.Mutex
-	mu       sync.Mutex
-	since    time.Time
-	keys     map[string]*keyState
-	claude   map[string]*claudeCredential
+	flushMu sync.Mutex
+	mu      sync.Mutex
+	since   time.Time
+	keys    map[string]*keyState
+	claude  map[string]*claudeCredential
+	// limits caps Claude usage per client key in Pro units per weekly window, keyed
+	// by full API key or key ID. Entries are positive and finite.
+	limits   map[string]float64
 	dirty    bool
 	path     string
 	resolve  func(authID string) (CredentialInfo, bool)

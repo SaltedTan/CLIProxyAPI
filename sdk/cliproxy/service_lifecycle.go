@@ -60,7 +60,7 @@ func (s *Service) Run(ctx context.Context) error {
 		redisqueue.SetUsageStatisticsEnabled(true)
 	} else {
 		// Home aggregates usage itself and disables the local management API.
-		startClientUsageTracking(ctx, s.configPath, s.coreManager)
+		startClientUsageTracking(ctx, s.configPath, s.coreManager, s.cfg)
 	}
 
 	defer func() {
@@ -377,11 +377,16 @@ func (s *Service) Shutdown(ctx context.Context) error {
 }
 
 // startClientUsageTracking restores persisted per client API key usage and keeps
-// aggregating and saving it until ctx is done.
-func startClientUsageTracking(ctx context.Context, configPath string, manager *coreauth.Manager) {
+// aggregating and saving it until ctx is done. It also installs the tracker as the
+// manager's admission policy so keys with a Claude allowance are refused once they
+// spend it; later config reloads push new limits through SetLimits.
+func startClientUsageTracking(ctx context.Context, configPath string, manager *coreauth.Manager, cfg *config.Config) {
 	tracker := clientusage.Default()
 	if errOpen := tracker.Open(clientusage.ResolveStatePath(configPath)); errOpen != nil {
 		log.Warnf("client usage: %v", errOpen)
+	}
+	if cfg != nil {
+		tracker.SetLimits(cfg.APIKeyLimits)
 	}
 	if manager != nil {
 		tracker.SetCredentialResolver(func(authID string) (clientusage.CredentialInfo, bool) {
@@ -391,6 +396,7 @@ func startClientUsageTracking(ctx context.Context, configPath string, manager *c
 			}
 			return clientusage.CredentialInfoFromAuth(auth), true
 		})
+		manager.SetAdmissionPolicy(tracker)
 	}
 	usage.RegisterNamedPlugin(clientusage.PluginName, tracker)
 	go tracker.Run(ctx)
