@@ -73,6 +73,7 @@ func buildV8Paths() []configPath {
 		{"host", "server.host"}, {"port", "server.port"}, {"trusted-proxies", "server.trusted-proxies"},
 		{"tls", "server.tls"}, {"commercial-mode", "server.commercial-mode"}, {"discovery", "server.discovery"},
 		{"remote-management", "management"}, {"api-keys", "access.api-keys"}, {"api-key-names", "access.api-key-names"},
+		{"api-key-limits", "access.api-key-limits"},
 		{"credential-concurrency", "credentials.concurrency"}, {"credential-in-flight", "credentials.in-flight"},
 		{"force-model-prefix", "routing.force-model-prefix"},
 		{"request-retry", "routing.retry.request-retry"}, {"max-retry-credentials", "routing.retry.max-retry-credentials"},
@@ -907,5 +908,11 @@ func ValidateV8Config(data []byte) error {
 	decoder := yaml.NewDecoder(bytes.NewReader(encoded))
 	decoder.KnownFields(true)
 	var cfg legacyConfig
-	return decoder.Decode(&cfg)
+	if err = decoder.Decode(&cfg); err != nil {
+		return err
+	}
+	// Client key allowances are the only v8 values with a semantic range check
+	// here; ParseConfigBytes runs first in management writes and must not turn
+	// them into a 422 before this layout validation reports 400.
+	return validateAPIKeyLimits(normalizeAPIKeyLimitKeys(cfg.APIKeyLimits))
 }

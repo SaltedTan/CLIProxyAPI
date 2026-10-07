@@ -73,6 +73,9 @@ func TestCloneForRuntimeDeepCopiesConfig(t *testing.T) {
 	if clone.APIKeyNames["client-key"] != "Laptop" {
 		t.Fatalf("clone.APIKeyNames[client-key] = %q, want Laptop", clone.APIKeyNames["client-key"])
 	}
+	if clone.APIKeyLimits["client-key"] != 1.5 {
+		t.Fatalf("clone.APIKeyLimits[client-key] = %v, want 1.5", clone.APIKeyLimits["client-key"])
+	}
 	if clone.OAuthExcludedModels["codex"][0] != "hidden-model" {
 		t.Fatalf("clone.OAuthExcludedModels[codex][0] = %q, want hidden-model", clone.OAuthExcludedModels["codex"][0])
 	}
@@ -91,6 +94,7 @@ func TestCloneForRuntimeDeepCopiesConfig(t *testing.T) {
 
 	clone.APIKeys[0] = "clone-client-key"
 	clone.APIKeyNames["client-key"] = "Clone Laptop"
+	clone.APIKeyLimits["client-key"] = 4
 	clone.OAuthExcludedModels["codex"][0] = "clone-hidden-model"
 	clone.OAuthModelAlias["codex"][0].Alias = "clone-client-model"
 	clone.OpenAICompatibility[0].Models[0].Thinking.Levels[0] = "clone-low"
@@ -104,6 +108,9 @@ func TestCloneForRuntimeDeepCopiesConfig(t *testing.T) {
 	}
 	if cfg.APIKeyNames["client-key"] != "Mutated Laptop" {
 		t.Fatalf("cfg.APIKeyNames[client-key] = %q, want Mutated Laptop", cfg.APIKeyNames["client-key"])
+	}
+	if cfg.APIKeyLimits["client-key"] != 3 {
+		t.Fatalf("cfg.APIKeyLimits[client-key] = %v, want 3", cfg.APIKeyLimits["client-key"])
 	}
 	if cfg.OAuthExcludedModels["codex"][0] != "mutated-hidden-model" {
 		t.Fatalf("cfg.OAuthExcludedModels[codex][0] = %q, want mutated-hidden-model", cfg.OAuthExcludedModels["codex"][0])
@@ -137,8 +144,9 @@ func sampleCloneRuntimeConfig() *Config {
 
 	return &Config{
 		SDKConfig: SDKConfig{
-			APIKeys:     []string{"client-key"},
-			APIKeyNames: map[string]string{"client-key": "Laptop"},
+			APIKeys:      []string{"client-key"},
+			APIKeyNames:  map[string]string{"client-key": "Laptop"},
+			APIKeyLimits: map[string]float64{"client-key": 1.5},
 			Streaming: StreamingConfig{
 				KeepAliveSeconds: 3,
 				BootstrapRetries: 2,
@@ -240,6 +248,7 @@ func mutateOriginalConfig(cfg *Config) {
 	cfg.Home.Host = "mutated-home.local"
 	cfg.APIKeys[0] = "mutated-client-key"
 	cfg.APIKeyNames["client-key"] = "Mutated Laptop"
+	cfg.APIKeyLimits["client-key"] = 3
 	cfg.OAuthExcludedModels["codex"][0] = "mutated-hidden-model"
 	cfg.OAuthModelAlias["codex"][0].Alias = "mutated-client-model"
 	cfg.OpenAICompatibility[0].Models[0].Thinking.Levels[0] = "mutated-low"

@@ -69,8 +69,9 @@ func SaveConfigPreserveComments(configFile string, cfg *Config, migrateV8 ...boo
 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-model-alias")
 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-request-scoped-errors")
 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-settings")
-	// Client key display names follow the runtime map so removed entries do not persist.
+	// Client key display names and allowances follow the runtime maps so removed entries do not persist.
 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "api-key-names")
+	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "api-key-limits")
 	replacePluginConfigsSubtree(original.Content[0], generated.Content[0])
 
 	// Merge generated into original in-place, preserving comments/order of existing nodes.

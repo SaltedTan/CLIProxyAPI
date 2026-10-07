@@ -195,6 +195,12 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	} else if !reflect.DeepEqual(trimStrings(oldCfg.APIKeys), trimStrings(newCfg.APIKeys)) {
 		changes = append(changes, "api-keys: values updated (count unchanged, redacted)")
 	}
+	// Client key allowances are keyed by raw client keys: report counts only.
+	if len(oldCfg.APIKeyLimits) != len(newCfg.APIKeyLimits) {
+		changes = append(changes, fmt.Sprintf("api-key-limits count: %d -> %d", len(oldCfg.APIKeyLimits), len(newCfg.APIKeyLimits)))
+	} else if !equalFloatMap(oldCfg.APIKeyLimits, newCfg.APIKeyLimits) {
+		changes = append(changes, "api-key-limits: values updated (count unchanged)")
+	}
 	if len(oldCfg.GeminiKey) != len(newCfg.GeminiKey) {
 		changes = append(changes, fmt.Sprintf("gemini-api-key count: %d -> %d", len(oldCfg.GeminiKey), len(newCfg.GeminiKey)))
 	} else {
@@ -624,6 +630,18 @@ func equalStringMap(a, b map[string]string) bool {
 	}
 	for k, v := range a {
 		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+func equalFloatMap(a, b map[string]float64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if got, ok := b[k]; !ok || got != v {
 			return false
 		}
 	}

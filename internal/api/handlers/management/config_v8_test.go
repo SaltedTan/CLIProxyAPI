@@ -2,6 +2,7 @@ package management
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -788,5 +789,120 @@ func TestConfigV8RoutingStrategyQuotaAwareRoundTrip(t *testing.T) {
 	}
 	if loaded.Routing.Strategy != "quota-aware" || !loaded.Routing.SessionAffinity {
 		t.Fatalf("routing = %+v, want quota-aware with session affinity preserved", loaded.Routing)
+	}
+}
+
+func TestConfigV8APIKeyLimits(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	raw := "config-version: 8\n# Client access\naccess:\n  api-keys: [fixture-key-laptop]\napi-keys:\n  codex: []\n"
+	if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &Handler{cfg: cfg, configFilePath: path}
+	router := gin.New()
+	router.GET("/v8/management/config/*path", h.ConfigV8)
+	router.PUT("/v8/management/config/*path", h.ConfigV8)
+	router.PATCH("/v8/management/config/*path", h.ConfigV8)
+	router.DELETE("/v8/management/config/*path", h.ConfigV8)
+	request := func(method, body string, status int) *httptest.ResponseRecorder {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(method, "/v8/management/config/access/api-key-limits", strings.NewReader(body)))
+		if recorder.Code != status {
+			t.Fatalf("%s api-key-limits: status=%d body=%s", method, recorder.Code, recorder.Body.String())
+		}
+		return recorder
+	}
+	savedLimits := func() *yaml.Node {
+		t.Helper()
+		saved, errRead := os.ReadFile(path)
+		if errRead != nil {
+			t.Fatal(errRead)
+		}
+		if errValidate := config.ValidateV8Config(saved); errValidate != nil {
+			t.Fatalf("saved config is not valid v8: %v\n%s", errValidate, saved)
+		}
+		if !strings.Contains(string(saved), "# Client access") {
+			t.Fatalf("save lost the access comment:\n%s", saved)
+		}
+		var doc yaml.Node
+		if errUnmarshal := yaml.Unmarshal(saved, &doc); errUnmarshal != nil {
+			t.Fatal(errUnmarshal)
+		}
+		if configV8Node(doc.Content[0], []string{"api-key-limits"}) != nil {
+			t.Fatalf("api-key-limits saved at the root:\n%s", saved)
+		}
+		return configV8Node(doc.Content[0], []string{"access", "api-key-limits"})
+	}
+
+	request(http.MethodGet, "", http.StatusNotFound)
+
+	request(http.MethodPut, `{"fixture-key-laptop": 1.5, "3f9a1c2b7d4e5f60": 0.25}`, http.StatusOK)
+	limits := savedLimits()
+	if limits == nil || configV8Node(limits, []string{"fixture-key-laptop"}).Value != "1.5" || configV8Node(limits, []string{"3f9a1c2b7d4e5f60"}).Value != "0.25" {
+		t.Fatalf("api-key-limits not saved under access: %#v", limits)
+	}
+	want := map[string]float64{"fixture-key-laptop": 1.5, "3f9a1c2b7d4e5f60": 0.25}
+	if !reflect.DeepEqual(h.cfg.APIKeyLimits, want) {
+		t.Fatalf("runtime APIKeyLimits = %#v, want %#v", h.cfg.APIKeyLimits, want)
+	}
+	var got map[string]float64
+	if err = json.Unmarshal(request(http.MethodGet, "", http.StatusOK).Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("GET api-key-limits = %#v, want %#v", got, want)
+	}
+
+	request(http.MethodPatch, `{"fixture-key-phone": 0}`, http.StatusOK)
+	want["fixture-key-phone"] = 0
+	if !reflect.DeepEqual(h.cfg.APIKeyLimits, want) {
+		t.Fatalf("PATCH did not merge: %#v", h.cfg.APIKeyLimits)
+	}
+
+	for _, body := range []string{`{"fixture-key-laptop": -1}`, `{"fixture-key-laptop": 1, "fixture-key-desktop": -0.5}`} {
+		recorder := request(http.MethodPut, body, http.StatusBadRequest)
+		var response map[string]any
+		if err = json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		if response["error"] != "invalid_config" {
+			t.Fatalf("negative limit error = %#v, want invalid_config", response)
+		}
+		message, _ := response["message"].(string)
+		if !strings.Contains(message, "api-key-limits") || strings.Contains(message, "fixture-key-laptop") || strings.Contains(message, "fixture-key-desktop") {
+			t.Fatalf("negative limit message = %q", message)
+		}
+	}
+	if !reflect.DeepEqual(h.cfg.APIKeyLimits, want) {
+		t.Fatalf("rejected write changed runtime limits: %#v", h.cfg.APIKeyLimits)
+	}
+	if limits = savedLimits(); limits == nil || configV8Node(limits, []string{"fixture-key-laptop"}).Value != "1.5" {
+		t.Fatalf("rejected write changed the saved file: %#v", limits)
+	}
+
+	request(http.MethodDelete, "", http.StatusOK)
+	if savedLimits() != nil {
+		t.Fatal("DELETE did not remove access.api-key-limits")
+	}
+	if h.cfg.APIKeyLimits != nil {
+		t.Fatalf("runtime APIKeyLimits after DELETE = %#v, want nil", h.cfg.APIKeyLimits)
+	}
+	request(http.MethodGet, "", http.StatusNotFound)
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc yaml.Node
+	if err = yaml.Unmarshal(saved, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if keys := configV8Node(doc.Content[0], []string{"access", "api-keys"}); keys == nil || len(keys.Content) != 1 {
+		t.Fatalf("DELETE changed access.api-keys:\n%s", saved)
 	}
 }

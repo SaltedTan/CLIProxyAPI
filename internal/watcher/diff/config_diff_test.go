@@ -740,3 +740,45 @@ func TestTrimStrings(t *testing.T) {
 		t.Fatalf("unexpected trimmed strings: %v", out)
 	}
 }
+
+func TestBuildConfigChangeDetails_APIKeyLimits(t *testing.T) {
+	oldCfg := &config.Config{SDKConfig: sdkconfig.SDKConfig{
+		APIKeyLimits: map[string]float64{"fixture-key-laptop": 1},
+	}}
+	newCfg := &config.Config{SDKConfig: sdkconfig.SDKConfig{
+		APIKeyLimits: map[string]float64{"fixture-key-laptop": 1, "fixture-key-phone": 0.5},
+	}}
+	changes := BuildConfigChangeDetails(oldCfg, newCfg)
+	expectContains(t, changes, "api-key-limits count: 1 -> 2")
+	for _, change := range changes {
+		if strings.Contains(change, "fixture-key") {
+			t.Fatalf("api-key-limits change leaks a client key: %q", change)
+		}
+	}
+
+	newCfg.APIKeyLimits = map[string]float64{"fixture-key-laptop": 2}
+	changes = BuildConfigChangeDetails(oldCfg, newCfg)
+	expectContains(t, changes, "api-key-limits: values updated (count unchanged)")
+	for _, change := range changes {
+		if strings.Contains(change, "fixture-key") {
+			t.Fatalf("api-key-limits change leaks a client key: %q", change)
+		}
+	}
+
+	newCfg.APIKeyLimits = map[string]float64{"fixture-key-desktop": 1}
+	changes = BuildConfigChangeDetails(oldCfg, newCfg)
+	expectContains(t, changes, "api-key-limits: values updated (count unchanged)")
+
+	for _, same := range []map[string]float64{nil, {}, {"fixture-key-laptop": 1}} {
+		newCfg.APIKeyLimits = same
+		oldCfg.APIKeyLimits = map[string]float64{"fixture-key-laptop": 1}
+		if len(same) == 0 {
+			oldCfg.APIKeyLimits = nil
+		}
+		for _, change := range BuildConfigChangeDetails(oldCfg, newCfg) {
+			if strings.Contains(change, "api-key-limits") {
+				t.Fatalf("unchanged api-key-limits reported: %q", change)
+			}
+		}
+	}
+}

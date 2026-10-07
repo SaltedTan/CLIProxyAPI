@@ -94,6 +94,12 @@ access:
   # api-key-names:
   #   "your-api-key-1": "MacBook"
   #   "your-api-key-2": "Desktop"
+  # Claude allowance per client key, in Claude Pro units per weekly window.
+  # Keys are full API keys or the key ids from the usage report.
+  # 0 or a missing entry means no limit.
+  # api-key-limits:
+  #   "your-api-key-1": 1.5
+  #   "3f9a1c2b7d4e5f60": 0.25
 
 # Optional credential concurrency and observation contracts.
 

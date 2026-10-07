@@ -47,6 +47,9 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	if errValidate := validateTrustedProxies(cfg.TrustedProxies); errValidate != nil {
 		return nil, errValidate
 	}
+	// Keys are normalized here; invalid allowances are rejected by ValidateV8Config
+	// (management writes) and LoadConfigOptional (files), not by this parser.
+	cfg.APIKeyLimits = normalizeAPIKeyLimitKeys(cfg.APIKeyLimits)
 
 	cfg.CredentialConcurrency = cfg.CredentialConcurrency.WithDefaults()
 	if errValidate := cfg.CredentialInFlight.Validate(); errValidate != nil {
