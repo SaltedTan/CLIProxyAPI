@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -267,6 +268,10 @@ func apiKeyFromContext(ctx context.Context) string {
 	}
 	ginCtx, ok := ctx.Value("gin").(interface{ Get(string) (any, bool) })
 	if !ok || ginCtx == nil {
+		return ""
+	}
+	// A handler context built without a gin context holds a nil *gin.Context.
+	if value := reflect.ValueOf(ginCtx); value.Kind() == reflect.Pointer && value.IsNil() {
 		return ""
 	}
 	raw, ok := ginCtx.Get("userApiKey")

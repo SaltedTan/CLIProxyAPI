@@ -414,3 +414,20 @@ func TestNonStreamKeepAliveFlowsBeforeAdmissionForKeysWithoutALimit(t *testing.T
 		})
 	}
 }
+
+// TestContextWithoutAGinContextUnderAnAllowancePolicy pins that a handler context
+// built without a gin context, which GetContextWithCancel accepts, carries no
+// client key instead of panicking when an allowance policy reads it.
+func TestContextWithoutAGinContextUnderAnAllowancePolicy(t *testing.T) {
+	tracker := newKeepAliveTracker("fixture-client-key-1", "auth-claude-nil-gin", "claude-nil-gin", "0.1")
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetAdmissionPolicy(tracker)
+	ctx, cancel := keepAliveHandler(manager).GetContextWithCancel(nil, nil, context.Background())
+	defer cancel()
+	if manager.MayRefuseAdmission(ctx) {
+		t.Fatal("a context without a client key has no allowance to refuse it")
+	}
+	if err := tracker.Admit(ctx, &coreauth.Auth{ID: "auth-claude-nil-gin", Provider: "claude"}); err != nil {
+		t.Fatalf("admission = %v, want the keyless request admitted", err)
+	}
+}
