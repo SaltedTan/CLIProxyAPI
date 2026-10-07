@@ -323,7 +323,9 @@ effect on every configuration reload (file changes and management writes)
 without a restart. Negative, NaN or infinite values and duplicated entries are
 rejected: the file fails to load and management writes return
 `400 invalid_config`; error messages mask the key (keys of four characters or
-fewer are masked completely, in errors and in the report's `key` field). An
+fewer are masked completely, in errors and in the report's `key` field).
+Values must be plain scalars: a number, or empty for no limit (a quoted or
+tagged value is rejected before the YAML decoder can print it). An
 entry counts as duplicated within one mapping, wherever that mapping appears in
 the document: under a YAML merge key (`<<`), behind an alias, in an anchored
 copy that a direct entry shadows, or in a nested `PATCH` body. An entry set
@@ -332,8 +334,9 @@ counts as the key it resolves to. Entries must be plain scalar keys: compound
 keys and explicitly tagged keys are rejected. Any key, value or anchor name the
 YAML parser or decoder itself reports (a duplicated or non-scalar key, a tagged
 scalar its tag does not fit, an unknown or self-referencing anchor) is masked
-the same way, with line numbers kept. Diagnostics name the map
-(`api-key-limits` or `api-key-names`) and the line, never the keys above it.
+the same way, with line numbers kept, as is the decoder's conversion error for
+an allowance value. Diagnostics name the map (`api-key-limits` or
+`api-key-names`) and the line, never the keys above it.
 
 When a key's `current_pro_units` reaches its limit, the proxy refuses that key's
 requests to every Claude credential, OAuth and API-key alike, before any

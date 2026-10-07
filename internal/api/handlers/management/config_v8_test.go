@@ -960,6 +960,8 @@ func TestConfigV8RejectsDuplicateClientKeysInNestedPatchesAndMergedYAML(t *testi
 		{"YAML PUT with an unknown anchor", http.MethodPut, "/v8/management/config.yaml", "config-version: 8\naccess:\n  api-key-limits:\n    *" + key + ": 1\n"},
 		{"YAML PUT with a limits map anchored under a client key", http.MethodPut, "/v8/management/config.yaml", "config-version: 8\nx: &limits\n  " + key + ":\n    api-key-limits:\n      x: 1\n      x: 2\naccess:\n  api-key-limits: *limits\n"},
 		{"YAML PUT with a tagged key holding a backtick", http.MethodPut, "/v8/management/config.yaml", "config-version: 8\nx-unrelated:\n  !!int \"fixture`" + key + "\": 1\n"},
+		{"YAML PUT with a tagged multiline value", http.MethodPut, "/v8/management/config.yaml", "config-version: 8\naccess:\n  api-key-limits:\n    fixture-key-laptop: !!int \"prefix\\n" + key + "\"\n"},
+		{"YAML PUT with the key aliased as its value", http.MethodPut, "/v8/management/config.yaml", "config-version: 8\naccess:\n  api-keys: [&key " + key + "]\n  api-key-limits: {*key: *key}\n"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

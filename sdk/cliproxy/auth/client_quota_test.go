@@ -664,3 +664,129 @@ func TestAdmissionConsultsThePolicyOncePerProviderOnOneScope(t *testing.T) {
 		t.Fatalf("upstream calls = %d, want 2", got)
 	}
 }
+
+// panickingAdmissionPolicy parks its first Admit call until released, then
+// panics; later calls admit. It counts every call.
+type panickingAdmissionPolicy struct {
+	mu      sync.Mutex
+	calls   int
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (p *panickingAdmissionPolicy) Admit(context.Context, *Auth) error {
+	p.mu.Lock()
+	p.calls++
+	first := p.calls == 1
+	p.mu.Unlock()
+	if first {
+		close(p.entered)
+		<-p.release
+		panic("admission policy failed")
+	}
+	return nil
+}
+
+func (p *panickingAdmissionPolicy) callCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls
+}
+
+// awaitWithin receives from results or fails the test after limit. It bounds a
+// liveness check: the fixed code answers at once, the broken code never does.
+func awaitWithin(t *testing.T, results <-chan error, limit time.Duration, what string) error {
+	t.Helper()
+	select {
+	case err := <-results:
+		return err
+	case <-time.After(limit):
+		t.Fatalf("%s did not return", what)
+		return nil
+	}
+}
+
+// TestAdmissionWaiterStopsWhenItsContextIsCancelled pins that a call waiting for
+// another call's decision on the same scope gives up when its own context is
+// cancelled, instead of waiting for a policy it does not control.
+func TestAdmissionWaiterStopsWhenItsContextIsCancelled(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	manager.SetRetryConfig(0, 0, 0)
+	const model = "admission-scope-cancel"
+	claude := &admissionTestExecutor{identifier: "claude"}
+	manager.RegisterExecutor(claude)
+	registerAdmissionAuth(t, manager, "admission-scope-cancel-claude", "claude", model)
+	policy := &gatedAdmissionPolicy{entered: make(chan struct{}), release: make(chan struct{})}
+	manager.SetAdmissionPolicy(policy)
+	ctx := WithRequestAdmission(context.Background())
+	run := func(ctx context.Context) error {
+		_, err := manager.Execute(ctx, []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+		return err
+	}
+	first := make(chan error, 1)
+	go func() { first <- run(ctx) }()
+	<-policy.entered
+	waiterCtx, cancel := context.WithCancel(ctx)
+	second := make(chan error, 1)
+	go func() { second <- run(waiterCtx) }()
+	for i := 0; i < 1000; i++ {
+		runtime.Gosched()
+	}
+	cancel()
+	if err := awaitWithin(t, second, 5*time.Second, "the cancelled waiter"); err == nil {
+		t.Fatal("the cancelled waiter was admitted")
+	}
+	if got := len(claude.ids("execute")); got != 0 {
+		t.Fatalf("upstream calls = %d before the first decision, want 0", got)
+	}
+	close(policy.release)
+	if err := <-first; err != nil {
+		t.Fatalf("first Execute() error = %v", err)
+	}
+}
+
+// TestAdmissionPolicyPanicDoesNotAdmitOrHangWaiters pins that a policy panic
+// neither admits the calls waiting for that decision nor leaves them waiting,
+// and that the scope recovers: the next call consults the policy again.
+func TestAdmissionPolicyPanicDoesNotAdmitOrHangWaiters(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	manager.SetRetryConfig(0, 0, 0)
+	const model = "admission-scope-panic"
+	claude := &admissionTestExecutor{identifier: "claude"}
+	manager.RegisterExecutor(claude)
+	registerAdmissionAuth(t, manager, "admission-scope-panic-claude", "claude", model)
+	policy := &panickingAdmissionPolicy{entered: make(chan struct{}), release: make(chan struct{})}
+	manager.SetAdmissionPolicy(policy)
+	ctx := WithRequestAdmission(context.Background())
+	run := func() error {
+		_, err := manager.Execute(ctx, []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+		return err
+	}
+	panicked := make(chan any, 1)
+	go func() {
+		defer func() { panicked <- recover() }()
+		_ = run()
+	}()
+	<-policy.entered
+	second := make(chan error, 1)
+	go func() { second <- run() }()
+	for i := 0; i < 1000; i++ {
+		runtime.Gosched()
+	}
+	close(policy.release)
+	if recovered := <-panicked; recovered == nil {
+		t.Fatal("the policy panic did not reach the first caller")
+	}
+	if err := awaitWithin(t, second, 5*time.Second, "the waiter of a panicked decision"); err == nil {
+		t.Fatal("a waiter was admitted on a decision that was never made")
+	}
+	if got := len(claude.ids("execute")); got != 0 {
+		t.Fatalf("upstream calls = %d after the panic, want 0", got)
+	}
+	if err := run(); err != nil {
+		t.Fatalf("the scope did not recover after the panic: %v", err)
+	}
+	if got := policy.callCount(); got != 2 {
+		t.Fatalf("policy consulted %d times, want the panicked call and one fresh consultation", got)
+	}
+}

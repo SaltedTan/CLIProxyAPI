@@ -319,3 +319,49 @@ func TestNestedScalarSaveMasksDuplicateClientKeys(t *testing.T) {
 		t.Fatalf("error = %q, want the key masked", err)
 	}
 }
+
+// TestClientKeyMapValuesAreValidatedBeforeDecoding covers malformed values in a
+// client key map, which the decoder would otherwise print together with the
+// key or the value: a tagged multiline value, a key aliased as its own value,
+// and a mapping as a value.
+func TestClientKeyMapValuesAreValidatedBeforeDecoding(t *testing.T) {
+	const key = "fixture-client-key-1"
+	cases := map[string]string{
+		"tagged value with a newline": "config-version: 8\naccess:\n  api-key-limits:\n    fixture-key-laptop: !!int \"prefix\\n" + key + "\"\n",
+		"key aliased as the value":    "config-version: 8\naccess:\n  api-keys: [&key " + key + "]\n  api-key-limits: {*key: *key}\n",
+		"mapping as the value":        "config-version: 8\naccess:\n  api-key-limits:\n    " + key + ":\n      nested: 1\n",
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, errParse := ParseConfigBytes([]byte(raw))
+			if errParse == nil {
+				t.Fatal("ParseConfigBytes accepted the document")
+			}
+			if strings.Contains(errParse.Error(), key) || !strings.Contains(errParse.Error(), "api-key-limits") {
+				t.Fatalf("ParseConfigBytes error = %q, want a limits rejection without the key", errParse)
+			}
+			if errValidate := ValidateV8Config([]byte(raw)); errValidate == nil || strings.Contains(errValidate.Error(), key) {
+				t.Fatalf("ValidateV8Config error = %v, want a rejection without the key", errValidate)
+			}
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+				t.Fatal(err)
+			}
+			_, errLoad := LoadConfig(path)
+			if errLoad == nil {
+				t.Fatal("LoadConfig accepted the document")
+			}
+			if strings.Contains(errLoad.Error(), key) {
+				t.Fatalf("LoadConfig error echoes the key: %q", errLoad)
+			}
+		})
+	}
+	// Plain numeric and empty values stay accepted.
+	cfg, err := ParseConfigBytes([]byte("config-version: 8\naccess:\n  api-key-limits:\n    fixture-key-laptop: 1.5\n    fixture-key-desktop:\n    fixture-key-zero: 0\n    fixture-key-hex: 0x10\n"))
+	if err != nil {
+		t.Fatalf("ParseConfigBytes() error = %v", err)
+	}
+	if cfg.APIKeyLimits["fixture-key-laptop"] != 1.5 || cfg.APIKeyLimits["fixture-key-desktop"] != 0 || cfg.APIKeyLimits["fixture-key-hex"] != 16 {
+		t.Fatalf("limits = %v", cfg.APIKeyLimits)
+	}
+}

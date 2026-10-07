@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strconv"
 	"sync"
@@ -220,20 +221,49 @@ func (c *admissionCache) admit(ctx context.Context, auth *Auth) error {
 	decision, ok := c.decisions[provider]
 	if ok {
 		c.mu.Unlock()
-		<-decision.done
-		return decision.err
+		select {
+		case <-decision.done:
+			return decision.err
+		case <-ctx.Done():
+			// This caller's request is over; the decision in progress still
+			// completes for the call that is making it.
+			return ctx.Err()
+		}
 	}
 	decision = &admissionDecision{done: make(chan struct{})}
 	c.decisions[provider] = decision
 	c.mu.Unlock()
+	return c.decide(ctx, auth, provider, decision)
+}
+
+// errAdmissionUndecided is what a waiter gets when the call deciding for its
+// provider failed before deciding: it is not admitted, and the next call on the
+// scope consults the policy again.
+var errAdmissionUndecided = errors.New("admission policy failed before deciding")
+
+// decide consults the policy outside the lock and publishes the outcome. A
+// policy that panics leaves no decision behind and the panic propagates.
+func (c *admissionCache) decide(ctx context.Context, auth *Auth, provider string, decision *admissionDecision) error {
+	decided := false
+	defer func() {
+		if !decided {
+			decision.err = errAdmissionUndecided
+			c.mu.Lock()
+			if c.decisions[provider] == decision {
+				delete(c.decisions, provider)
+			}
+			c.mu.Unlock()
+		}
+		close(decision.done)
+	}()
 	// The policy runs outside the lock; it may take the tracker's own locks.
 	decision.err = c.policy.Admit(ctx, auth)
+	decided = true
 	c.mu.Lock()
 	if decision.err != nil && c.refusal == nil {
 		c.refusal = decision.err
 	}
 	c.mu.Unlock()
-	close(decision.done)
 	return decision.err
 }
 

@@ -164,8 +164,11 @@ var (
 	invalidMapKeyPattern       = regexp.MustCompile(`invalid map key: [^\n]*`)
 	selfAnchorPattern          = regexp.MustCompile(`anchor '([^']*)' value contains itself`)
 	unknownAnchorPattern       = regexp.MustCompile(`unknown anchor '([^']*)' referenced`)
-	// The scalar may itself contain backticks: capture up to the last one.
-	taggedScalarPattern = regexp.MustCompile("cannot decode (\\S+) `(.*)` as a")
+	// The scalar may itself contain backticks or newlines: capture up to the last one.
+	taggedScalarPattern = regexp.MustCompile("(?s)cannot decode (\\S+) `(.*)` as a")
+	// A value that does not convert to an allowance is printed by the decoder
+	// (truncated to seven characters); several such lines may follow each other.
+	unmarshalFloatPattern = regexp.MustCompile("(?s)cannot unmarshal (\\S+) `(.*?)` into float64")
 )
 
 // checkClientKeyMapDuplicates rejects a duplicated or non-plain entry in a client
@@ -244,8 +247,10 @@ func mapKeyName(key *yaml.Node) string {
 
 // checkClientKeyMapEntries reports the first entry of the named client key map
 // that is not a plain scalar key (a compound or explicitly tagged key, which the
-// decoder would otherwise print) or is defined twice within one of its mappings.
-// Alias keys are compared by the scalar they resolve to.
+// decoder would otherwise print), is defined twice within one of its mappings,
+// or has a value the decoder would reject, printing it: values must be plain
+// scalars, and allowances numbers or empty. Alias keys are compared by the
+// scalar they resolve to.
 func checkClientKeyMapEntries(mapping *yaml.Node, name string) error {
 	for _, node := range mergedMappings(mapping, nil, make(map[*yaml.Node]struct{})) {
 		seen := make(map[string]struct{}, len(node.Content)/2)
@@ -253,15 +258,23 @@ func checkClientKeyMapEntries(mapping *yaml.Node, name string) error {
 			if isMergeKey(node.Content[i]) {
 				continue
 			}
+			line := node.Content[i].Line
 			resolved := scalarKeyNode(node.Content[i])
 			if resolved == nil || resolved.Style&yaml.TaggedStyle != 0 {
-				return fmt.Errorf("%s: entry at line %d must be a plain key", name, node.Content[i].Line)
+				return fmt.Errorf("%s: entry at line %d must be a plain key", name, line)
 			}
 			key := resolved.Value
 			if _, duplicate := seen[key]; duplicate {
-				return fmt.Errorf("%s: entry %s is defined more than once (line %d)", name, maskClientKey(key), node.Content[i].Line)
+				return fmt.Errorf("%s: entry %s is defined more than once (line %d)", name, maskClientKey(key), line)
 			}
 			seen[key] = struct{}{}
+			value := scalarKeyNode(node.Content[i+1])
+			if value == nil || value.Style&yaml.TaggedStyle != 0 {
+				return fmt.Errorf("%s: entry at line %d must have a plain scalar value", name, line)
+			}
+			if name == "api-key-limits" && value.Tag != "!!int" && value.Tag != "!!float" && value.Tag != "!!null" {
+				return fmt.Errorf("%s: entry at line %d must have a numeric value", name, line)
+			}
 		}
 	}
 	return nil
@@ -296,6 +309,10 @@ func maskDecoderError(err error) error {
 	masked = taggedScalarPattern.ReplaceAllStringFunc(masked, func(match string) string {
 		parts := taggedScalarPattern.FindStringSubmatch(match)
 		return "cannot decode " + parts[1] + " `" + maskClientKey(parts[2]) + "` as a"
+	})
+	masked = unmarshalFloatPattern.ReplaceAllStringFunc(masked, func(match string) string {
+		parts := unmarshalFloatPattern.FindStringSubmatch(match)
+		return "cannot unmarshal " + parts[1] + " `" + maskClientKey(parts[2]) + "` into float64"
 	})
 	if masked == message {
 		return err
@@ -462,7 +479,8 @@ func (cfg *Config) UnmarshalYAML(node *yaml.Node) error {
 	}
 	decoded := legacyConfig(*cfg)
 	if err = root.Decode(&decoded); err != nil {
-		return err
+		// Callers decoding straight into Config see the typed decoder's message.
+		return maskDecoderError(err)
 	}
 	*cfg = Config(decoded)
 	cfg.OAuthOnlyFields = nil
@@ -1128,7 +1146,7 @@ func ValidateV8Config(data []byte) error {
 	decoder.KnownFields(true)
 	var cfg legacyConfig
 	if err = decoder.Decode(&cfg); err != nil {
-		return err
+		return maskDecoderError(err)
 	}
 	// Client key allowances are the only v8 values with a semantic range check
 	// here; ParseConfigBytes runs first in management writes and must not turn
