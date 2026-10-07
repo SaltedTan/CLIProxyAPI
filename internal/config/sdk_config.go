@@ -67,6 +67,12 @@ type SDKConfig struct {
 	// have no display name.
 	APIKeyNames map[string]string `yaml:"api-key-names,omitempty" json:"api-key-names,omitempty"`
 
+	// APIKeyLimits optionally caps the Claude subscription usage of a client API key,
+	// in Claude Pro units per weekly window (1.0 is one full weekly allowance of a
+	// Claude Pro plan). Keys are full client API keys or the key ids shown by the
+	// usage report. Values must be >= 0; 0 or a missing entry means no limit.
+	APIKeyLimits map[string]float64 `yaml:"api-key-limits,omitempty" json:"api-key-limits,omitempty"`
+
 	// PassthroughHeaders controls whether upstream response headers are forwarded to downstream clients.
 	// Default is false (disabled).
 	PassthroughHeaders bool `yaml:"passthrough-headers" json:"passthrough-headers"`
