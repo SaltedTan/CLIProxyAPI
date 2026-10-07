@@ -48,7 +48,7 @@ func CheckClientKeyMapWrite(parts []string, update *yaml.Node) error {
 			root,
 		}}
 	}
-	return checkClientKeyMapDuplicates(root)
+	return validateClientKeyMaps(root)
 }
 
 // NormalizeV8ConfigAliases accepts historical v8 paths without discarding
@@ -59,7 +59,7 @@ func NormalizeV8ConfigAliases(root *yaml.Node) error {
 	// Client key maps are checked first so a duplicated entry is reported masked
 	// rather than named by the generic decoder below.
 	if root.Kind == yaml.MappingNode {
-		if err := checkClientKeyMapDuplicates(root); err != nil {
+		if err := validateClientKeyMaps(root); err != nil {
 			return err
 		}
 	}

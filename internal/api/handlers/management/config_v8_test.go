@@ -998,3 +998,47 @@ func TestConfigV8RejectsDuplicateClientKeysInNestedPatchesAndMergedYAML(t *testi
 		})
 	}
 }
+
+// TestConfigV8AcceptsValidClientKeyMapShapes pins two valid documents a stricter
+// check must keep accepting: an empty allowance in a flow mapping, and a client
+// key whose text is the name of a client key map.
+func TestConfigV8AcceptsValidClientKeyMapShapes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const key = "fixture-client-key-1"
+	raw := "config-version: 8\naccess:\n  api-keys: [fixture-key-laptop]\napi-keys:\n  codex: []\n"
+	cases := []struct {
+		name, method, url, body, entry string
+		limit                          float64
+	}{
+		{"YAML PUT with a flow-style empty allowance", http.MethodPut, "/v8/management/config.yaml", "config-version: 8\naccess:\n  api-keys: [" + key + "]\n  api-key-limits: {" + key + ": }\n", key, 0},
+		{"nested PATCH of a key named like the map", http.MethodPatch, "/v8/management/config/access/api-key-limits", `{"api-key-limits": 1}`, "api-key-limits", 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.LoadConfig(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := &Handler{cfg: cfg, configFilePath: path}
+			router := gin.New()
+			router.PATCH("/v8/management/config/*path", h.ConfigV8)
+			router.PUT("/v8/management/config.yaml", h.ConfigV8)
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(tc.method, tc.url, strings.NewReader(tc.body)))
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
+			}
+			saved, err := config.LoadConfig(path)
+			if err != nil {
+				t.Fatalf("LoadConfig after write: %v", err)
+			}
+			if value, ok := saved.APIKeyLimits[tc.entry]; !ok || value != tc.limit {
+				t.Fatalf("limits after write = %v, want %s = %v", saved.APIKeyLimits, tc.entry, tc.limit)
+			}
+		})
+	}
+}

@@ -127,6 +127,8 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 	if m.HomeEnabled() {
+		// Home admits nothing locally; nothing refuses the request before upstream.
+		notifyUpstreamCommit(ctx)
 		resp, errHome := m.executeHome(ctx, normalized, req, opts, false)
 		return resp, unwrapExecutionBoundaryError(errHome)
 	}
@@ -134,6 +136,10 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	ctx = m.routingObs.beginRequest(ctx)
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
 	admission := m.newAdmissionCache(ctx)
+	if admission == nil {
+		// Nothing can refuse this call before upstream.
+		notifyUpstreamCommit(ctx)
+	}
 
 	var lastErr error
 	var preferredUpstreamErr error
@@ -184,6 +190,8 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	ctx = cliproxyexecutor.WithRequestProxyURL(ctx, opts.ProxyURL)
 	req, opts = cliproxysession.Enrich(req, opts)
+	// Count-tokens calls are never subject to admission.
+	notifyUpstreamCommit(ctx)
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
@@ -251,6 +259,10 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	ctx = m.routingObs.beginRequest(ctx)
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
 	admission := m.newAdmissionCache(ctx)
+	if admission == nil {
+		// Nothing can refuse this call before upstream.
+		notifyUpstreamCommit(ctx)
+	}
 
 	var lastErr error
 	var preferredUpstreamErr error
@@ -562,7 +574,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
-		admission.markAttempted()
+		admission.markAttempted(ctx)
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
@@ -1124,7 +1136,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
-		admission.markAttempted()
+		admission.markAttempted(ctx)
 		var errPrepare error
 		if selection != nil {
 			auth, errPrepare = m.prepareHomeRequestAuth(execCtx, executor, selection)

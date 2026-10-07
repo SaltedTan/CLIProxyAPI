@@ -191,6 +191,8 @@ func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handle
 }
 
 func (h *BaseAPIHandler) executeWithPluginExecutor(ctx context.Context, entryProtocol, responseProtocol, modelName, originalRequestedModel string, rawJSON []byte, alt, executorPluginID string, execOptions modelExecutionOptions) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	// A plugin executor is never refused by admission.
+	openUpstreamCommitGate(ctx)
 	if h.AuthManager != nil && h.AuthManager.HomeEnabled() {
 		return nil, nil, &interfaces.ErrorMessage{StatusCode: http.StatusServiceUnavailable, Error: fmt.Errorf("plugin executor routing is unavailable while Home is enabled")}
 	}
@@ -241,6 +243,8 @@ func (h *BaseAPIHandler) executeWithPluginExecutor(ctx context.Context, entryPro
 }
 
 func (h *BaseAPIHandler) countWithPluginExecutor(ctx context.Context, handlerType, modelName, originalRequestedModel string, rawJSON []byte, alt, executorPluginID string, execOptions modelExecutionOptions) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	// A plugin executor is never refused by admission.
+	openUpstreamCommitGate(ctx)
 	if h.AuthManager != nil && h.AuthManager.HomeEnabled() {
 		return nil, nil, &interfaces.ErrorMessage{StatusCode: http.StatusServiceUnavailable, Error: fmt.Errorf("plugin executor routing is unavailable while Home is enabled")}
 	}

@@ -328,7 +328,10 @@ Values must be plain scalars: a number, or empty for no limit (a quoted or
 tagged value is rejected before the YAML decoder can print it). The map itself
 must be a mapping or empty: a scalar or a list in its place, directly or
 behind an alias, is rejected before decoding as well, and a conversion error
-the decoder reports for the map is masked like one for a value. An
+the decoder reports for the map is masked like one for a value. An entry's
+text is always a client key, even `api-key-limits` or `api-key-names`. An
+empty value written in a flow mapping (`{key: }`) is saved back as an explicit
+`null`, so a re-encoded file keeps meaning "no limit". An
 entry counts as duplicated within one mapping, wherever that mapping appears in
 the document: under a YAML merge key (`<<`), behind an alias, in an anchored
 copy that a direct entry shadows, or in a nested `PATCH` body. An entry set
@@ -385,7 +388,11 @@ that request's own first attempt reached the limit, and reports the upstream
 outcome. A model call a plugin makes from inside a request is a request of its
 own and is admitted on its own. A request whose admission could not be decided
 (the policy failed while deciding) fails instead of being admitted; it never
-tries another credential as if the policy had refused only one.
+tries another credential as if the policy had refused only one. With
+`nonstream-keepalive-interval` set, no keepalive byte is written to a
+non-streaming response before the request is committed to an upstream attempt,
+so a refusal is still answered with the 429; a model call a plugin makes
+before that point does not release the keepalive either.
 
 A key is admitted again as soon as its current usage is below the limit: when a
 credential's weekly window resets, when the limit is raised or removed, or when

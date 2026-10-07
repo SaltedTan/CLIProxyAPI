@@ -1,6 +1,7 @@
 package config
 
 import (
+	"gopkg.in/yaml.v3"
 	"os"
 	"path/filepath"
 	"strings"
@@ -403,4 +404,90 @@ func TestClientKeyMapContainersMustBeMappings(t *testing.T) {
 			t.Fatalf("%s: ParseConfigBytes() = %v, %v", name, cfg, err)
 		}
 	}
+}
+
+// TestClientKeyNamedLikeAClientKeyMapIsAnEntry pins that a client key whose
+// text is "api-key-limits" or "api-key-names" is an ordinary entry of those
+// maps, not a nested configuration map.
+func TestClientKeyNamedLikeAClientKeyMapIsAnEntry(t *testing.T) {
+	raw := "config-version: 8\naccess:\n  api-keys: [api-key-limits, api-key-names]\n  api-key-limits: {api-key-limits: 1, api-key-names: 2}\n  api-key-names: {api-key-limits: alpha, api-key-names: beta}\n"
+	cfg, err := ParseConfigBytes([]byte(raw))
+	if err != nil {
+		t.Fatalf("ParseConfigBytes: %v", err)
+	}
+	if cfg.APIKeyLimits["api-key-limits"] != 1 || cfg.APIKeyLimits["api-key-names"] != 2 {
+		t.Fatalf("limits = %v", cfg.APIKeyLimits)
+	}
+	if cfg.APIKeyNames["api-key-limits"] != "alpha" || cfg.APIKeyNames["api-key-names"] != "beta" {
+		t.Fatalf("names = %v", cfg.APIKeyNames)
+	}
+	if err := ValidateV8Config([]byte(raw)); err != nil {
+		t.Fatalf("ValidateV8Config: %v", err)
+	}
+	update := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: "1"}
+	if err := CheckClientKeyMapWrite([]string{"access", "api-key-limits", "api-key-limits"}, update); err != nil {
+		t.Fatalf("CheckClientKeyMapWrite: %v", err)
+	}
+}
+
+// TestFlowStyleEmptyAllowanceSurvivesReencoding pins that an empty allowance
+// written in a flow mapping ({key: }) stays "no limit" through every path that
+// re-encodes the document, instead of turning into an empty string.
+func TestFlowStyleEmptyAllowanceSurvivesReencoding(t *testing.T) {
+	const key = "fixture-client-key-1"
+	raw := "config-version: 8\nserver:\n  port: 19090\naccess:\n  api-key-limits: {" + key + ": , 0123456789abcdef: 0.5}\n"
+	if err := ValidateV8Config([]byte(raw)); err != nil {
+		t.Fatalf("ValidateV8Config: %v", err)
+	}
+	normalized, _, err := NormalizeConfigLayout([]byte(raw), true)
+	if err != nil {
+		t.Fatalf("NormalizeConfigLayout: %v", err)
+	}
+	if _, err := ParseConfigBytes(normalized); err != nil {
+		t.Fatalf("ParseConfigBytes(normalized): %v\n%s", err, normalized)
+	}
+	check := func(t *testing.T, path string) {
+		t.Helper()
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(data), "''") {
+			t.Fatalf("the empty allowance became an empty string:\n%s", data)
+		}
+		loaded, err := LoadConfig(path)
+		if err != nil {
+			t.Fatalf("LoadConfig after save: %v\n%s", err, data)
+		}
+		if value, ok := loaded.APIKeyLimits[key]; !ok || value != 0 {
+			t.Fatalf("limits after save = %v, want %s with no limit", loaded.APIKeyLimits, key)
+		}
+		if loaded.APIKeyLimits["0123456789abcdef"] != 0.5 {
+			t.Fatalf("limits after save = %v", loaded.APIKeyLimits)
+		}
+	}
+	t.Run("SaveConfigPreserveComments", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := LoadConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := SaveConfigPreserveComments(path, cfg); err != nil {
+			t.Fatalf("SaveConfigPreserveComments: %v", err)
+		}
+		check(t, path)
+	})
+	t.Run("SaveConfigPreserveCommentsUpdateNestedScalar", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := SaveConfigPreserveCommentsUpdateNestedScalar(path, []string{"access", "api-key-names", key}, "laptop"); err != nil {
+			t.Fatalf("SaveConfigPreserveCommentsUpdateNestedScalar: %v", err)
+		}
+		check(t, path)
+	})
 }

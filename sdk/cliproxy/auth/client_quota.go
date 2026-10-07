@@ -269,6 +269,32 @@ func (c *admissionCache) decide(ctx context.Context, auth *Auth, provider string
 
 // markAttempted notes that the request went on to an upstream attempt. From then on
 // the outcome of that attempt, not a refusal, is the request's result.
+// upstreamCommitKey carries the notice a handler wants when the conductor
+// commits its request to an upstream attempt.
+type upstreamCommitKey struct{}
+
+// WithUpstreamCommitNotice returns ctx carrying notice, which the conductor
+// runs once the request can no longer be refused before upstream: when it
+// commits a credential to an upstream attempt, or at once when no admission
+// applies to the call (Home mode, no policy, count-tokens). A nil notice
+// detaches ctx from an outer request's notice. Handlers use it to hold a
+// non-streaming keepalive back while a refusal could still need to be a 429.
+func WithUpstreamCommitNotice(ctx context.Context, notice func()) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, upstreamCommitKey{}, notice)
+}
+
+func notifyUpstreamCommit(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	if notice, ok := ctx.Value(upstreamCommitKey{}).(func()); ok && notice != nil {
+		notice()
+	}
+}
+
 // abort returns the error a pick loop must stop on at once after admit failed:
 // the deciding call failed before deciding, or the caller's context ended.
 // Nil means the credential was refused and the loop may try the next one.
@@ -284,7 +310,8 @@ func (c *admissionCache) abort(ctx context.Context, err error) error {
 	return nil
 }
 
-func (c *admissionCache) markAttempted() {
+func (c *admissionCache) markAttempted(ctx context.Context) {
+	notifyUpstreamCommit(ctx)
 	if c == nil {
 		return
 	}

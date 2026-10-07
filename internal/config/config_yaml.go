@@ -142,7 +142,7 @@ func SaveConfigPreserveCommentsUpdateNestedScalar(configFile string, path []stri
 	}
 	// Client key maps are checked first so a duplicate is reported masked rather
 	// than named by the generic decoder below.
-	if err = checkClientKeyMapDuplicates(root.Content[0]); err != nil {
+	if err = validateClientKeyMaps(root.Content[0]); err != nil {
 		return err
 	}
 	// Resolve aliases and merge keys before updating a path. Otherwise replacing

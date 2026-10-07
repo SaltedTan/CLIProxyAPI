@@ -542,6 +542,7 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	}
 	newCtx = context.WithValue(newCtx, "gin", c)
 	newCtx = context.WithValue(newCtx, "handler", handler)
+	newCtx = withUpstreamCommitGate(newCtx)
 	return newCtx, func(params ...interface{}) {
 		if c != nil {
 			logging.SetResponseStatus(cancelCtx, c.Writer.Status())
@@ -610,12 +611,24 @@ func (h *BaseAPIHandler) StartNonStreamingKeepAlive(c *gin.Context, ctx context.
 		ctx = context.Background()
 	}
 
+	gate := upstreamCommitGateFrom(ctx)
 	stopChan := make(chan struct{})
 	var stopOnce sync.Once
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		if gate != nil {
+			// No keepalive byte before the request is committed upstream:
+			// until then an admission refusal must still be able to answer 429.
+			select {
+			case <-stopChan:
+				return
+			case <-ctx.Done():
+				return
+			case <-gate.opened():
+			}
+		}
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {

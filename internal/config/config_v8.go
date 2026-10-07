@@ -171,16 +171,14 @@ var (
 	unmarshalTargetPattern = regexp.MustCompile("(?s)cannot unmarshal (\\S+) `(.*?)` into (float64|map\\[string\\]float64|map\\[string\\]string)")
 )
 
-// checkClientKeyMapDuplicates rejects a duplicated or non-plain entry in a client
-// key map with the key masked. It walks the whole document, through aliases and
-// merge keys, because the generic decoder decodes every mapping it meets,
-// including anchored copies that merge precedence shadows, and names the key in
-// its error. Each mapping in the merge closure of a client key map is checked on
-// its own, matching how yaml.v3 decodes them; a direct entry overriding a merged
-// one is not a duplicate. Diagnostics name only the map and the line: an
-// ancestor key may itself be a client key, through an anchor that an alias
-// elsewhere turns into a client key map.
-func checkClientKeyMapDuplicates(root *yaml.Node) error {
+// validateClientKeyMaps rejects a client key map (api-key-limits, api-key-names)
+// that is not a mapping, and any duplicated, non-plain or, for an allowance,
+// non-numeric entry in one, wherever the document holds the map: directly, via
+// a merge key, behind an alias or anchored elsewhere. It runs before any YAML
+// decoding so that no decoder message can print a client key, and names only
+// the map and the line. It also keeps an empty flow-style value an explicit
+// null so that re-encoding the document preserves "no limit".
+func validateClientKeyMaps(root *yaml.Node) error {
 	return walkClientKeyMaps(root, make(map[*yaml.Node]struct{}))
 }
 
@@ -204,9 +202,13 @@ func walkClientKeyMaps(node *yaml.Node, seen map[*yaml.Node]struct{}) error {
 		for i := 0; i+1 < len(node.Content); i += 2 {
 			name := mapKeyName(node.Content[i])
 			if _, clientKeyMap := clientKeyMapNames[name]; clientKeyMap {
-				if err := checkClientKeyMapEntries(node.Content[i+1], name); err != nil {
+				// Entries of a client key map are client keys whatever their
+				// text, never configuration fields: the walk checks them and
+				// does not descend into them.
+				if err := checkClientKeyMapEntries(node, node.Content[i+1], name); err != nil {
 					return err
 				}
+				continue
 			}
 			if err := walkClientKeyMaps(node.Content[i+1], seen); err != nil {
 				return err
@@ -251,13 +253,14 @@ func mapKeyName(key *yaml.Node) string {
 // or has a value the decoder would reject, printing it: values must be plain
 // scalars, and allowances numbers or empty. Alias keys are compared by the
 // scalar they resolve to.
-func checkClientKeyMapEntries(mapping *yaml.Node, name string) error {
+func checkClientKeyMapEntries(parent, mapping *yaml.Node, name string) error {
 	// The map itself must be a mapping or empty: the decoder would otherwise
 	// print a scalar found there, which may well be a client key.
 	container := resolveAliasNode(mapping, make(map[*yaml.Node]struct{}))
 	if container != nil && container.Kind != yaml.MappingNode && !isNullScalar(container) {
 		return fmt.Errorf("%s: value at line %d must be a mapping", name, mapping.Line)
 	}
+	keepNullExplicit(parent, container)
 	for _, node := range mergedMappings(mapping, nil, make(map[*yaml.Node]struct{})) {
 		seen := make(map[string]struct{}, len(node.Content)/2)
 		for i := 0; i+1 < len(node.Content); i += 2 {
@@ -281,6 +284,7 @@ func checkClientKeyMapEntries(mapping *yaml.Node, name string) error {
 			if name == "api-key-limits" && value.Tag != "!!int" && value.Tag != "!!float" && value.Tag != "!!null" {
 				return fmt.Errorf("%s: entry at line %d must have a numeric value", name, line)
 			}
+			keepNullExplicit(node, value)
 		}
 	}
 	return nil
@@ -324,6 +328,18 @@ func maskDecoderError(err error) error {
 		return err
 	}
 	return errors.New(masked)
+}
+
+// keepNullExplicit gives an empty value in a flow mapping its explicit null:
+// yaml.v3 re-encodes an empty flow value as ” (an empty string), which would
+// turn "no limit" into an invalid allowance on the next save or validation.
+func keepNullExplicit(mapping, value *yaml.Node) {
+	if mapping == nil || value == nil || mapping.Style&yaml.FlowStyle == 0 {
+		return
+	}
+	if value.Kind == yaml.ScalarNode && value.Tag == "!!null" && value.Value == "" {
+		value.Value = "null"
+	}
 }
 
 // isNullScalar reports whether node is YAML null, including an empty value.
@@ -516,7 +532,7 @@ func flattenV8(node *yaml.Node) (*yaml.Node, error) {
 	}
 	// Maps keyed by client API keys are checked first so a duplicate is reported
 	// masked; the generic decoder below would name the key in its error.
-	if err := checkClientKeyMapDuplicates(node); err != nil {
+	if err := validateClientKeyMaps(node); err != nil {
 		return nil, err
 	}
 	// Decode once before transformation to reject duplicate keys even when a
