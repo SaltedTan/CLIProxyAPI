@@ -286,7 +286,10 @@ func WithUpstreamCommitNotice(ctx context.Context, notice func()) context.Contex
 	return context.WithValue(ctx, upstreamCommitKey{}, notice)
 }
 
-func notifyUpstreamCommit(ctx context.Context) {
+// NotifyUpstreamCommit runs the notice carried by ctx, if any. The conductor
+// calls it when it commits a request upstream; a handler path that bypasses
+// the conductor (a plugin executor) calls it for the same reason.
+func NotifyUpstreamCommit(ctx context.Context) {
 	if ctx == nil {
 		return
 	}
@@ -311,7 +314,7 @@ func (c *admissionCache) abort(ctx context.Context, err error) error {
 }
 
 func (c *admissionCache) markAttempted(ctx context.Context) {
-	notifyUpstreamCommit(ctx)
+	NotifyUpstreamCommit(ctx)
 	if c == nil {
 		return
 	}

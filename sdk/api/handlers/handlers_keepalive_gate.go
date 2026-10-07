@@ -50,14 +50,36 @@ func upstreamCommitGateFrom(ctx context.Context) *upstreamCommitGate {
 }
 
 // openUpstreamCommitGate releases the keepalive on paths that bypass the
-// conductor, such as plugin executors, which admission never refuses.
+// conductor, such as plugin executors, which admission never refuses. It goes
+// through the same notice the conductor uses, so a nested call detached from
+// the client request's notice cannot reach the client request's gate.
 func openUpstreamCommitGate(ctx context.Context) {
-	upstreamCommitGateFrom(ctx).open()
+	coreauth.NotifyUpstreamCommit(ctx)
 }
 
 // withoutUpstreamCommitNotice detaches a nested model call from the client
 // request's keepalive: it is a request of its own, and its upstream attempt
-// does not commit the client's response.
+// does not commit the client's response. Both the notice and the gate are
+// shadowed, so neither the conductor nor a handler path can find them.
 func withoutUpstreamCommitNotice(ctx context.Context) context.Context {
+	ctx = context.WithValue(ctx, upstreamCommitGateKey{}, (*upstreamCommitGate)(nil))
 	return coreauth.WithUpstreamCommitNotice(ctx, nil)
 }
+
+// UpstreamCommitted returns a channel that is closed once the request in ctx
+// is committed to an upstream attempt, or at once when ctx carries no gate.
+// Handlers that write anything to a response before their execution call
+// returns, such as a bootstrap heartbeat, wait on it first so that an
+// admission refusal can still be answered with a plain 429.
+func UpstreamCommitted(ctx context.Context) <-chan struct{} {
+	if gate := upstreamCommitGateFrom(ctx); gate != nil {
+		return gate.opened()
+	}
+	return closedUpstreamCommit
+}
+
+var closedUpstreamCommit = func() chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}()

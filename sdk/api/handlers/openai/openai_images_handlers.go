@@ -109,13 +109,18 @@ func writeImagesStreamErrorEvent(c *gin.Context, errMsg *interfaces.ErrorMessage
 	return errMsg
 }
 
-func (h *OpenAIAPIHandler) waitImagesStreamExecution(c *gin.Context, flusher http.Flusher, execute func() imagesStreamExecutionResult) (imagesStreamExecutionResult, bool, bool) {
+// waitImagesStreamExecution runs execute and, once the request is committed
+// upstream, sends SSE heartbeats while it is pending. No heartbeat is written
+// before that: until then an admission refusal must stay a plain 429.
+func (h *OpenAIAPIHandler) waitImagesStreamExecution(ctx context.Context, c *gin.Context, flusher http.Flusher, execute func() imagesStreamExecutionResult) (imagesStreamExecutionResult, bool, bool) {
 	resultChan := make(chan imagesStreamExecutionResult, 1)
 	go func() {
 		resultChan <- execute()
 	}()
 
-	keepAlive, keepAliveC := h.newImagesStreamKeepAliveTicker()
+	committed := handlers.UpstreamCommitted(ctx)
+	var keepAlive *time.Ticker
+	var keepAliveC <-chan time.Time
 	defer func() {
 		if keepAlive != nil {
 			keepAlive.Stop()
@@ -129,6 +134,9 @@ func (h *OpenAIAPIHandler) waitImagesStreamExecution(c *gin.Context, flusher htt
 			return imagesStreamExecutionResult{}, streamStarted, true
 		case result := <-resultChan:
 			return result, streamStarted, false
+		case <-committed:
+			committed = nil
+			keepAlive, keepAliveC = h.newImagesStreamKeepAliveTicker()
 		case <-keepAliveC:
 			setImagesSSEHeaders(c)
 			writeImagesStreamKeepAlive(c, flusher)
@@ -1224,7 +1232,7 @@ func (h *OpenAIAPIHandler) streamRoutedImages(c *gin.Context, imageReq []byte, i
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	cliCtx = handlers.WithDisallowFreeAuth(cliCtx)
 	model := strings.TrimSpace(imageModel)
-	execution, streamStarted, canceled := h.waitImagesStreamExecution(c, flusher, func() imagesStreamExecutionResult {
+	execution, streamStarted, canceled := h.waitImagesStreamExecution(cliCtx, c, flusher, func() imagesStreamExecutionResult {
 		dataChan, upstreamHeaders, errChan := h.ExecuteImageStreamWithAuthManager(cliCtx, xaiImagesHandlerType, model, imageReq, "")
 		return imagesStreamExecutionResult{Data: dataChan, UpstreamHeaders: upstreamHeaders, Errs: errChan}
 	})
@@ -1370,7 +1378,7 @@ func (h *OpenAIAPIHandler) streamOpenAICompatImages(c *gin.Context, compatReq []
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	model := strings.TrimSpace(imageModel)
-	execution, streamStarted, canceled := h.waitImagesStreamExecution(c, flusher, func() imagesStreamExecutionResult {
+	execution, streamStarted, canceled := h.waitImagesStreamExecution(cliCtx, c, flusher, func() imagesStreamExecutionResult {
 		dataChan, upstreamHeaders, errChan := h.ExecuteImageStreamWithAuthManager(cliCtx, xaiImagesHandlerType, model, compatReq, "")
 		return imagesStreamExecutionResult{Data: dataChan, UpstreamHeaders: upstreamHeaders, Errs: errChan}
 	})
@@ -1809,7 +1817,7 @@ func (h *OpenAIAPIHandler) streamImagesFromResponses(c *gin.Context, responsesRe
 	if mainModel == "" {
 		mainModel = defaultImagesMainModel
 	}
-	execution, streamStarted, canceled := h.waitImagesStreamExecution(c, flusher, func() imagesStreamExecutionResult {
+	execution, streamStarted, canceled := h.waitImagesStreamExecution(cliCtx, c, flusher, func() imagesStreamExecutionResult {
 		dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, "openai-response", mainModel, responsesReq, "")
 		return imagesStreamExecutionResult{Data: dataChan, UpstreamHeaders: upstreamHeaders, Errs: errChan}
 	})

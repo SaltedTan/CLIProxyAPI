@@ -128,7 +128,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	}
 	if m.HomeEnabled() {
 		// Home admits nothing locally; nothing refuses the request before upstream.
-		notifyUpstreamCommit(ctx)
+		NotifyUpstreamCommit(ctx)
 		resp, errHome := m.executeHome(ctx, normalized, req, opts, false)
 		return resp, unwrapExecutionBoundaryError(errHome)
 	}
@@ -138,7 +138,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	admission := m.newAdmissionCache(ctx)
 	if admission == nil {
 		// Nothing can refuse this call before upstream.
-		notifyUpstreamCommit(ctx)
+		NotifyUpstreamCommit(ctx)
 	}
 
 	var lastErr error
@@ -191,7 +191,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 	ctx = cliproxyexecutor.WithRequestProxyURL(ctx, opts.ProxyURL)
 	req, opts = cliproxysession.Enrich(req, opts)
 	// Count-tokens calls are never subject to admission.
-	notifyUpstreamCommit(ctx)
+	NotifyUpstreamCommit(ctx)
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
@@ -261,7 +261,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	admission := m.newAdmissionCache(ctx)
 	if admission == nil {
 		// Nothing can refuse this call before upstream.
-		notifyUpstreamCommit(ctx)
+		NotifyUpstreamCommit(ctx)
 	}
 
 	var lastErr error

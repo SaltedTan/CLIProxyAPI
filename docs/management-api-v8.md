@@ -392,7 +392,10 @@ tries another credential as if the policy had refused only one. With
 `nonstream-keepalive-interval` set, no keepalive byte is written to a
 non-streaming response before the request is committed to an upstream attempt,
 so a refusal is still answered with the 429; a model call a plugin makes
-before that point does not release the keepalive either.
+before that point does not release the keepalive either, whether a credential
+or a plugin executor serves it. The image generation stream's bootstrap
+heartbeat (`streaming.keepalive-seconds`) waits for the same point, so a
+refused image request is a plain JSON 429 rather than an SSE error.
 
 A key is admitted again as soon as its current usage is below the limit: when a
 credential's weekly window resets, when the limit is raised or removed, or when

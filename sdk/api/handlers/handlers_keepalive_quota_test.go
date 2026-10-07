@@ -253,3 +253,101 @@ func TestNestedModelCallDoesNotCommitTheOuterKeepAlive(t *testing.T) {
 		t.Fatal("the nested call's upstream attempt released the client request's keepalive")
 	}
 }
+
+// keepAlivePluginHost routes one model to a plugin executor and serves it.
+type keepAlivePluginHost struct {
+	*handlerInterceptorTestHost
+	pluginModel string
+}
+
+func (*keepAlivePluginHost) HasModelRouters() bool { return true }
+
+func (h *keepAlivePluginHost) RouteModel(_ context.Context, req pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, bool) {
+	if req.RequestedModel == h.pluginModel {
+		return pluginapi.ModelRouteResponse{Handled: true, TargetKind: pluginapi.ModelRouteTargetExecutor, Target: "keepalive-plugin"}, true
+	}
+	return pluginapi.ModelRouteResponse{}, false
+}
+
+func (*keepAlivePluginHost) ExecutePluginExecutor(context.Context, string, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
+}
+
+func (*keepAlivePluginHost) ExecutePluginExecutorStream(context.Context, string, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	chunks := make(chan coreexecutor.StreamChunk, 1)
+	chunks <- coreexecutor.StreamChunk{Payload: []byte(`data: {"ok":true}`)}
+	close(chunks)
+	return &coreexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func (*keepAlivePluginHost) CountPluginExecutor(context.Context, string, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, nil
+}
+
+// TestNestedPluginExecutorCallDoesNotCommitTheOuterKeepAlive pins that a
+// nested model call served by a plugin executor, which admission never
+// refuses, still does not release the client request's keepalive: the client
+// request itself may yet be refused.
+func TestNestedPluginExecutorCallDoesNotCommitTheOuterKeepAlive(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const key = "fixture-client-key-1"
+	for _, stream := range []bool{false, true} {
+		name := "execute"
+		if stream {
+			name = "stream"
+		}
+		t.Run(name, func(t *testing.T) {
+			authID := "auth-claude-keepalive-plugin-" + name
+			model := "claude-keepalive-plugin-" + name
+			pluginModel := "plugin-keepalive-" + name
+			manager := coreauth.NewManager(nil, nil, nil)
+			manager.SetAdmissionPolicy(newKeepAliveTracker(key, authID, model, "0.2"))
+			manager.SetConfig(&sdkconfig.Config{DisableCooling: true})
+			manager.RegisterExecutor(&keepAliveExecutor{bootstrapStreamExecutor: &bootstrapStreamExecutor{}, provider: "claude", execute: func(context.Context) (coreexecutor.Response, error) {
+				t.Error("the refused client request reached upstream")
+				return coreexecutor.Response{}, nil
+			}})
+			registerKeepAliveAuth(t, manager, authID, "claude", model)
+			h := keepAliveHandler(manager)
+			rec, c, ctx, cancel := newKeepAliveRequest(h, key)
+			defer cancel()
+			host := &keepAlivePluginHost{handlerInterceptorTestHost: &handlerInterceptorTestHost{}, pluginModel: pluginModel}
+			nestedOK := false
+			host.interceptRequestBeforeAuth = func(ctx context.Context, req pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse {
+				if req.Model == model {
+					nested := ModelExecutionRequest{EntryProtocol: "openai", ExitProtocol: "openai", Model: pluginModel, Body: []byte(`{"model":"` + pluginModel + `"}`), Stream: stream}
+					if stream {
+						result, errNested := h.ExecuteModelStream(ctx, nested)
+						nestedOK = errNested == nil
+						if errNested == nil {
+							for range result.Chunks {
+							}
+						}
+					} else {
+						_, errNested := h.ExecuteModel(ctx, nested)
+						nestedOK = errNested == nil
+					}
+					select {
+					case <-rec.flushed:
+					case <-time.After(keepAliveProbeWait):
+					}
+				}
+				return pluginapi.RequestInterceptResponse{Headers: cloneHeader(req.Headers)}
+			}
+			h.SetPluginHost(host)
+
+			stop := h.StartNonStreamingKeepAlive(c, ctx)
+			_, _, errMsg := h.ExecuteWithAuthManager(ctx, "openai", model, []byte(`{"model":"`+model+`"}`), "")
+			stop()
+			if !nestedOK {
+				t.Fatal("the nested plugin-executor call did not succeed")
+			}
+			if errMsg == nil || errMsg.StatusCode != http.StatusTooManyRequests {
+				t.Fatalf("errMsg = %v, want the 429 refusal of the client request", errMsg)
+			}
+			if rec.wasFlushed() {
+				t.Fatal("the nested plugin-executor call released the client request's keepalive")
+			}
+		})
+	}
+}
