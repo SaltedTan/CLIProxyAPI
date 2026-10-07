@@ -38,6 +38,7 @@ the corresponding group value. Legacy field names are rejected by v8 writes.
 | --- | --- |
 | `/config/access/api-keys` | Client authentication keys, for example `["client-key"]`. |
 | `/config/access/api-key-names` | Optional client key display names for usage reports, for example `{"client-key": "MacBook"}`. |
+| `/config/access/api-key-limits` | Optional Claude allowance per client key in Pro units per weekly window, for example `{"client-key": 1.5}`; `0` means no limit. |
 | `/config/api-keys` | All upstream provider groups. |
 | `/config/api-keys/codex` | Codex upstream groups. |
 | `/config/client/codex/optimize-multi-agent-v2` | Boolean, default `false`; applies to Codex clients across OAuth and API-key routes. |
@@ -185,7 +186,8 @@ stored: each key is identified by `id`, the first 16 hex characters of its
 SHA-256, plus a masked `key` for keys still listed in `access.api-keys`. Add
 `access.api-key-names` to show a display `name`; names may be keyed by the full
 API key or by its `id`. Requests without a client key (when `access.api-keys` is
-empty) are grouped under the `anonymous` id.
+empty) are grouped under the `anonymous` id. Add `access.api-key-limits` to cap
+a key's weekly Claude usage (see "Claude allowance per client key" below).
 
 Usage is saved to `client-usage.json` next to the config file (or under
 `WRITABLE_PATH`) every minute and on shutdown, and restored on startup. A file that
@@ -197,6 +199,7 @@ process stops may be lost. Usage is not tracked in Home mode.
 {
   "generated_at": "2026-10-07T12:00:00Z",
   "since": "2026-10-01T08:00:00Z",
+  "claude_limits_supported": true,
   "keys": [
     {
       "id": "3f9a1c2b7d4e5f60",
@@ -206,17 +209,21 @@ process stops may be lost. Usage is not tracked in Home mode.
       "first_used_at": "2026-10-01T08:05:00Z",
       "last_used_at": "2026-10-07T11:59:00Z",
       "totals": {
-        "requests": 412, "failed": 6,
+        "requests": 412, "failed": 6, "blocked": 3,
         "tokens": {
           "input_tokens": 9100000, "output_tokens": 310000, "reasoning_tokens": 42000,
           "cache_read_tokens": 8200000, "cache_write_tokens": 600000, "total_tokens": 9410000
         }
       },
       "models": { "claude-sonnet-4-5": { "requests": 400, "failed": 5, "tokens": { "total_tokens": 9300000 } } },
-      "daily": [ { "date": "2026-10-07", "requests": 51, "failed": 0, "tokens": { "total_tokens": 1200000 } } ],
+      "daily": [ { "date": "2026-10-07", "requests": 51, "failed": 0, "blocked": 3, "tokens": { "total_tokens": 1200000 } } ],
       "claude": {
         "current_pro_units": 0.84,
         "total_pro_units": 2.31,
+        "limit_pro_units": 1.5,
+        "remaining_pro_units": 0.66,
+        "limit_reached": false,
+        "limit_resets_at": "2026-10-09T15:00:00Z",
         "credentials": [
           {
             "auth_id": "claude-user@example.com.json",
@@ -258,6 +265,9 @@ process stops may be lost. Usage is not tracked in Home mode.
   including ones that were retried. Token fields do not overlap except that
   `input_tokens` includes cache reads and writes, and `output_tokens` includes
   reasoning.
+- `blocked` counts requests refused by the key's Claude allowance (see "Claude
+  allowance per client key" below). Refused requests are not counted as
+  `requests` or `failed`, and `models` entries have no `blocked` field.
 - `daily` covers the last 31 days, by the server's local date.
 - `claude` measures Claude subscription usage in Claude Pro units: `1.0` is one
   full weekly allowance of a Pro plan. A Team plan is worth 1.25 units, a Max 5x
@@ -265,7 +275,17 @@ process stops may be lost. Usage is not tracked in Home mode.
   credential's open weekly window; `total_*` accumulates across windows. Usage
   is converted with the plan in effect when it was attributed, so a later plan
   change does not rewrite history; usage attributed while the plan was unknown
-  uses the current plan.
+  uses the current plan. `claude` is present when the key has Claude usage or a
+  configured limit.
+- `limit_pro_units` and `remaining_pro_units` (`max(limit - current, 0)`) are
+  present when the key has a configured, non-zero allowance. `limit_reached` is
+  always present and `false` without a limit. `limit_resets_at` is the earliest
+  `window_resets_at` among the key's credentials with current usage, present
+  whenever the key has current usage, with or without a limit.
+- `claude_limits_supported` is `true` on backends that enforce
+  `access.api-key-limits`; older backends omit it and the limit fields above.
+- Keys with a configured limit are listed even without usage and even when they
+  are not in `access.api-keys` (`configured` is then `false`).
 - Claude credentials report weekly usage as a fraction of their own plan limit
   (`Anthropic-Ratelimit-Unified-7d-Utilization`). Each increase is split between
   the client keys that used the credential since the previous increase, by
@@ -285,6 +305,45 @@ process stops may be lost. Usage is not tracked in Home mode.
 `DELETE /observability/usage/clients?id=<id>` resets one key and returns 404
 for an unknown id. `DELETE /observability/usage/clients?all=true` resets every
 key; a request with neither parameter is rejected with 400.
+
+### Claude allowance per client key
+
+`access.api-key-limits` caps each client key's Claude usage in Pro units per
+weekly window. Entries are keyed by the full API key or by its `id`; `0` or a
+missing entry means no limit. A full-key entry wins over an `id` entry, and
+requests without a client key use the `anonymous` entry. Limits take effect on
+every configuration reload (file changes and management writes) without a
+restart. Negative, NaN or infinite values are rejected: the file fails to load
+and management writes return `400 invalid_config`; error messages mask the key.
+
+When a key's `current_pro_units` reaches its limit, the proxy refuses that key's
+requests to every Claude credential, OAuth and API-key alike, before any
+upstream connection is made. Other providers keep serving the key, and
+count-tokens requests are never refused. The refusal is `429 Too Many Requests`
+with a `Retry-After: <seconds>` header (`ceil(limit_resets_at - now)`, at least
+`1`; `60` when no reset time is known), sent regardless of
+`passthrough-headers`. The body is the endpoint's usual error envelope. OpenAI-
+and Claude-style endpoints receive
+
+```json
+{"error":{"message":"client API key Claude allowance reached: 1.52 of 1.5 Pro units used this week; resets in 2d3h","type":"rate_limit_error","code":"rate_limit_exceeded"}}
+```
+
+and Gemini-style endpoints their usual shape with the same status and message.
+The message never contains the raw key. Streaming requests receive the same
+JSON body before any stream opens, never an SSE error event. Refused requests
+increment `blocked` only: they are not counted as `requests` or `failed`,
+publish no usage record and do not cool down any credential.
+
+A key is admitted again as soon as its current usage is below the limit: when a
+credential's weekly window resets, when the limit is raised or removed, or when
+`DELETE /observability/usage/clients?id=<id>` resets the key.
+
+Limitations: attribution is estimate-based (usage is split from the
+`Anthropic-Ratelimit-Unified-7d-Utilization` header deltas as described above),
+so a key's share is approximate; requests already in flight when the limit is
+reached complete and may overshoot it; usage not yet flushed at shutdown is
+lost; and limits are not enforced in Home mode, where usage is not tracked.
 
 ## OAuth
 
