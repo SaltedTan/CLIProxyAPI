@@ -319,7 +319,12 @@ key; a request with neither parameter is rejected with 400.
 Claude allowance window without deleting anything else: its `current_*` usage
 drops to `0`, it is admitted again, its next Claude request opens a fresh window,
 and `totals`, `daily` and the per-credential `total_*` values are kept.
-`?all=true` does this for every key; the same 404 and 400 rules apply.
+`?all=true` does this for every key; the same 404 and 400 rules apply. After
+either reset, a request of the key that had started before the reset opens no
+window when its response is processed: only a request started after the reset
+does. A window starts at the earliest request of its period even when responses
+are processed out of order, and a window that had ended when the state was
+saved stays over after a restart, whatever the clock says.
 
 ### Claude allowance per client key
 

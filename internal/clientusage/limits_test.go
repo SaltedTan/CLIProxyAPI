@@ -972,3 +972,160 @@ func TestSnapshotMasksShortKeysCompletely(t *testing.T) {
 		t.Fatalf("medium key = %q", key.Key)
 	}
 }
+
+func TestWindowResetIgnoresRecordsOfRequestsStartedBeforeIt(t *testing.T) {
+	now := testNow
+	tracker, resetAt := limitedKeyTracker(t, &now)
+	tracker.SetLimits(map[string]float64{"key-a": 0.125})
+	ctx := requestContext("key-a")
+	refuse(t, tracker, ctx, claudeAuth)
+
+	// A request that started before the reset finishes after it: its record must
+	// not reopen a window for the key, and the usage it carries is history only.
+	startedBefore := now.Add(-time.Minute)
+	now = now.Add(time.Hour)
+	if !tracker.ResetWindow(KeyID("key-a")) {
+		t.Fatal("reset window must find the key")
+	}
+	now = now.Add(time.Second)
+	tracker.HandleUsage(context.Background(), claudeRecord("key-a", "claude-1", startedBefore, claudeObs{0.5, resetAt}, breakdown(100, 0, 0, 0, 0)))
+	key := findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a"))
+	// The record's own observation is ignored (its request predates the credential
+	// epoch), so its weight waits for the next increase.
+	if key.Claude == nil || key.Claude.WindowStartedAt != nil || key.Claude.CurrentProUnits != 0 || key.Claude.TotalProUnits != 0.25 || key.Totals.Requests != 3 {
+		t.Fatalf("a record of a request from before the reset must not open a window: %+v totals %+v", key.Claude, key.Totals)
+	}
+	// Another key's response attributes that weight: totals only.
+	now = now.Add(time.Second)
+	tracker.HandleUsage(context.Background(), claudeRecord("key-b", "claude-1", now.Add(-time.Second), claudeObs{0.625, resetAt}, breakdown(100, 0, 0, 0, 0)))
+	key = findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a"))
+	if key.Claude.WindowStartedAt != nil || key.Claude.CurrentProUnits != 0 || key.Claude.TotalProUnits != 0.5 {
+		t.Fatalf("usage attributed after the reset to a pre-reset request must stay out of a window: %+v", key.Claude)
+	}
+	if errAdmit := tracker.Admit(ctx, claudeAuth); errAdmit != nil {
+		t.Fatalf("the key made no request after the reset and must be admitted: %v", errAdmit)
+	}
+	// The key's next request, started after the reset, opens the window.
+	startedAfter := now.Add(time.Second)
+	now = startedAfter.Add(time.Second)
+	tracker.HandleUsage(context.Background(), claudeRecord("key-a", "claude-1", startedAfter, claudeObs{0.625, resetAt}, breakdown(100, 0, 0, 0, 0)))
+	key = findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a"))
+	if key.Claude.WindowStartedAt == nil || !key.Claude.WindowStartedAt.Equal(startedAfter) {
+		t.Fatalf("the first request after the reset must open the window: %+v", key.Claude)
+	}
+
+	// The same holds for the usage reset that deletes the key (and for resetting every key).
+	for _, reset := range []struct {
+		name  string
+		reset func() bool
+	}{
+		{"delete one", func() bool { return tracker.Reset(KeyID("key-a")) }},
+		{"delete all", func() bool { return tracker.Reset("") }},
+		{"reset every window", func() bool { return tracker.ResetWindow("") }},
+	} {
+		startedBefore := now.Add(-time.Minute)
+		now = now.Add(time.Hour)
+		if !reset.reset() {
+			t.Fatalf("%s: reset must succeed", reset.name)
+		}
+		now = now.Add(time.Second)
+		tracker.HandleUsage(context.Background(), claudeRecord("key-a", "claude-1", startedBefore, claudeObs{0.75, resetAt}, breakdown(100, 0, 0, 0, 0)))
+		key = findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a"))
+		if key.Claude != nil && key.Claude.WindowStartedAt != nil {
+			t.Fatalf("%s: a record of a request from before the reset must not open a window: %+v", reset.name, key.Claude)
+		}
+		startedAfter := now.Add(time.Second)
+		now = startedAfter.Add(time.Second)
+		tracker.HandleUsage(context.Background(), claudeRecord("key-a", "claude-1", startedAfter, claudeObs{0.75, resetAt}, breakdown(100, 0, 0, 0, 0)))
+		key = findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a"))
+		if key.Claude == nil || key.Claude.WindowStartedAt == nil || !key.Claude.WindowStartedAt.Equal(startedAfter) {
+			t.Fatalf("%s: the first request after the reset must open the window: %+v", reset.name, key.Claude)
+		}
+	}
+}
+
+func TestKeyWindowStartsAtTheEarliestRequestOfItsPeriod(t *testing.T) {
+	now := testNow
+	tracker := newTestTracker(&now)
+	resetAt := testNow.Add(72 * time.Hour)
+	first := testNow
+	second := testNow.Add(time.Hour)
+
+	// The second request finishes first and opens the window; the first request's
+	// record then moves the window back to the key's actual first request.
+	sendAt(tracker, &now, "key-a", second, second.Add(time.Second), claudeObs{0.10, resetAt})
+	key := findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a")).Claude
+	if key.WindowStartedAt == nil || !key.WindowStartedAt.Equal(second) {
+		t.Fatalf("window after the first processed record = %+v", key)
+	}
+	sendAt(tracker, &now, "key-a", first, second.Add(2*time.Second), claudeObs{0.20, resetAt})
+	key = findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a")).Claude
+	if key.WindowStartedAt == nil || !key.WindowStartedAt.Equal(first) || !key.WindowResetsAt.Equal(first.Add(claudeWeeklyWindow)) {
+		t.Fatalf("window must start at the earliest request: %+v", key)
+	}
+	// Usage attributed after the move lands in the moved window, which admission
+	// measures from the earliest request.
+	third := second.Add(3 * time.Second)
+	sendAt(tracker, &now, "key-a", third, third.Add(time.Second), claudeObs{0.20, resetAt})
+	key = findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a")).Claude
+	approx(t, "current after the move", key.CurrentProUnits, 0.10)
+	if !key.WindowStartedAt.Equal(first) {
+		t.Fatalf("window moved again: %+v", key)
+	}
+	tracker.SetLimits(map[string]float64{"key-a": 0.1})
+	quota := refuse(t, tracker, requestContext("key-a"), claudeAuth)
+	if want := first.Add(claudeWeeklyWindow).Sub(now); quota.ResetIn != want {
+		t.Fatalf("reset in = %s, want %s from the earliest request", quota.ResetIn, want)
+	}
+
+	// A late record of a request from the previous window does not pull the next
+	// window back into that period.
+	late := first.Add(claudeWeeklyWindow - time.Minute)
+	next := first.Add(claudeWeeklyWindow + time.Hour)
+	sendAt(tracker, &now, "key-a", next, next.Add(time.Second), claudeObs{0.30, resetAt.Add(claudeWeeklyWindow)})
+	sendAt(tracker, &now, "key-a", late, next.Add(2*time.Second), claudeObs{0.31, resetAt.Add(claudeWeeklyWindow)})
+	key = findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a")).Claude
+	if key.WindowStartedAt == nil || !key.WindowStartedAt.Equal(next) {
+		t.Fatalf("a late record of the previous window must not move the next window: %+v", key)
+	}
+}
+
+func TestExpiredWindowIsDroppedOnLoad(t *testing.T) {
+	now := testNow
+	path := filepath.Join(t.TempDir(), StateFileName)
+	tracker := newTestTracker(&now)
+	if errOpen := tracker.Open(path); errOpen != nil {
+		t.Fatal(errOpen)
+	}
+	seq := &claudeSeq{tracker: tracker, now: &now}
+	resetAt := testNow.Add(72 * time.Hour)
+	seq.send("key-a", "claude-1", claudeObs{0.125, resetAt}, breakdown(100, 0, 0, 0, 0))
+	seq.send("key-a", "claude-1", claudeObs{0.375, resetAt}, breakdown(100, 0, 0, 0, 0))
+	// Saved an hour after the window ended.
+	now = testWindowEnd.Add(time.Hour)
+	if errFlush := tracker.Flush(); errFlush != nil {
+		t.Fatal(errFlush)
+	}
+
+	// Reloaded with the clock an hour before the window end: the window stays over.
+	behind := testWindowEnd.Add(-time.Hour)
+	restarted := newTestTracker(&behind)
+	if errOpen := restarted.Open(path); errOpen != nil {
+		t.Fatal(errOpen)
+	}
+	restarted.SetLimits(map[string]float64{"key-a": 0.25})
+	key := findKey(t, restarted.Snapshot(SnapshotOptions{}), KeyID("key-a"))
+	if key.Claude == nil || key.Claude.WindowStartedAt != nil || key.Claude.CurrentProUnits != 0 || key.Claude.LimitReached || key.Claude.TotalProUnits != 0.25 {
+		t.Fatalf("an expired window must not come back after a reload: %+v", key.Claude)
+	}
+	if errAdmit := restarted.Admit(requestContext("key-a"), claudeAuth); errAdmit != nil {
+		t.Fatalf("a key whose window ended must be admitted after a reload: %v", errAdmit)
+	}
+	// The next request opens a window from its own start, even with the clock behind.
+	behind = behind.Add(time.Second)
+	restarted.HandleUsage(context.Background(), claudeRecord("key-a", "claude-1", behind, claudeObs{0.5, resetAt}, breakdown(100, 0, 0, 0, 0)))
+	key = findKey(t, restarted.Snapshot(SnapshotOptions{}), KeyID("key-a"))
+	if key.Claude.WindowStartedAt == nil || !key.Claude.WindowStartedAt.Equal(behind) {
+		t.Fatalf("the next request must open a window: %+v", key.Claude)
+	}
+}

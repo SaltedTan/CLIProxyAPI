@@ -78,6 +78,7 @@ func (t *Tracker) Open(path string) error {
 		t.since = time.Time{}
 		t.keys = make(map[string]*keyState)
 		t.claude = make(map[string]*claudeCredential)
+		t.floors = make(map[string]time.Time)
 		t.dirty = false
 	}
 	t.path = path
@@ -107,15 +108,28 @@ func (t *Tracker) Open(path string) error {
 		return fmt.Errorf("client usage state %s is invalid (%v); moved it to %s", path, errState, aside)
 	}
 	t.since = state.Since
-	t.keys = make(map[string]*keyState, len(state.Keys))
-	for id, key := range state.Keys {
-		if key != nil {
-			t.keys[id] = key
-		}
-	}
 	// No request survives a restart, so ordering restarts from now. This also keeps a
 	// wall clock that moved back from blocking genuine drops.
 	loadedAt := t.now()
+	t.keys = make(map[string]*keyState, len(state.Keys))
+	for id, key := range state.Keys {
+		if key == nil {
+			continue
+		}
+		// A window that had ended when the state was saved, or has ended now, stays
+		// over even if the clock moved back since; and no window floor may lie in the
+		// future, or nothing could open a window until the clock caught up.
+		if window := key.Window; window != nil && (!state.SavedAt.Before(window.EndsAt) || !loadedAt.Before(window.EndsAt)) {
+			key.Window = nil
+			if window.EndsAt.After(key.WindowFloor) {
+				key.WindowFloor = window.EndsAt
+			}
+		}
+		if key.WindowFloor.After(loadedAt) {
+			key.WindowFloor = loadedAt
+		}
+		t.keys[id] = key
+	}
 	t.claude = make(map[string]*claudeCredential, len(state.ClaudeCredentials))
 	for authID, credential := range state.ClaudeCredentials {
 		if credential != nil {

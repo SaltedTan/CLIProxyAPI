@@ -79,6 +79,10 @@ type keyState struct {
 	Claude      map[string]*claudeShare `json:"claude,omitempty"`
 	// Window is the key's current Claude allowance window; nil when none was opened.
 	Window *keyWindow `json:"window,omitempty"`
+	// WindowFloor is the earliest start a window may have: the last reset of the
+	// key's window, or the end of its previous window. Requests that started before
+	// it open no window.
+	WindowFloor time.Time `json:"window_floor,omitempty"`
 }
 
 func (k *keyState) modelCounters(model string) *Counters {
@@ -129,7 +133,10 @@ type Tracker struct {
 	claude  map[string]*claudeCredential
 	// limits caps Claude usage per client key in Pro units per weekly window, keyed
 	// by full API key or key ID. Entries are positive and finite.
-	limits   map[string]float64
+	limits map[string]float64
+	// floors holds the window floor of keys whose state was deleted by Reset, until
+	// their next record, so a request started before the reset opens no window.
+	floors   map[string]time.Time
 	dirty    bool
 	path     string
 	resolve  func(authID string) (CredentialInfo, bool)
@@ -142,6 +149,7 @@ func NewTracker() *Tracker {
 	return &Tracker{
 		keys:     make(map[string]*keyState),
 		claude:   make(map[string]*claudeCredential),
+		floors:   make(map[string]time.Time),
 		location: time.Local,
 	}
 }
@@ -217,7 +225,8 @@ func (t *Tracker) HandleUsage(_ context.Context, record coreusage.Record) {
 	state := t.keys[keyID]
 	// Keys with a Claude allowance are always tracked, past the cap, so it is enforced.
 	if state == nil && (len(t.keys) < maxTrackedKeys || t.limitedLocked(record.APIKey)) {
-		state = &keyState{FirstUsedAt: at}
+		state = &keyState{FirstUsedAt: at, WindowFloor: t.floors[keyID]}
+		delete(t.floors, keyID)
 		t.keys[keyID] = state
 	}
 	if state != nil {
@@ -241,22 +250,27 @@ func (t *Tracker) HandleUsage(_ context.Context, record coreusage.Record) {
 }
 
 // Reset clears the usage of one key ID, or of every key when keyID is empty.
-// Claude window baselines are kept so later attribution stays correct.
-// It reports whether anything was removed.
+// Claude window baselines are kept so later attribution stays correct, and a
+// request of the key that started before the reset opens no window when its
+// record arrives. It reports whether anything was removed.
 func (t *Tracker) Reset(keyID string) bool {
 	if t == nil {
 		return false
 	}
 	keyID = strings.TrimSpace(keyID)
+	now := t.now()
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if keyID == "" {
+		for id := range t.keys {
+			t.rememberFloorLocked(id, now)
+		}
 		t.keys = make(map[string]*keyState)
 		for _, credential := range t.claude {
 			credential.Pending = nil
 			credential.Unattributed = claudeShare{}
 		}
-		t.since = t.now()
+		t.since = now
 		t.dirty = true
 		return true
 	}
@@ -264,25 +278,40 @@ func (t *Tracker) Reset(keyID string) bool {
 		return false
 	}
 	// Pending weight stays so the key's last usage is not charged to other keys.
+	t.rememberFloorLocked(keyID, now)
 	delete(t.keys, keyID)
 	t.dirty = true
 	return true
 }
 
+// rememberFloorLocked keeps the window floor of a key being deleted until its next
+// record. Floors older than a window are dropped: no request is that old. t.mu
+// must be held.
+func (t *Tracker) rememberFloorLocked(keyID string, now time.Time) {
+	for id, floor := range t.floors {
+		if now.Sub(floor) > claudeWeeklyWindow {
+			delete(t.floors, id)
+		}
+	}
+	t.floors[keyID] = now
+}
+
 // ResetWindow ends the current Claude allowance window of one key ID, or of every
 // key when keyID is empty: the key's current usage is zero and its next Claude
-// request opens a fresh window. Totals, daily history, per-credential totals and
-// credential baselines are kept. It reports whether the key is known.
+// request opens a fresh window. Requests that started before the reset open no
+// window. Totals, daily history, per-credential totals and credential baselines
+// are kept. It reports whether the key is known.
 func (t *Tracker) ResetWindow(keyID string) bool {
 	if t == nil {
 		return false
 	}
 	keyID = strings.TrimSpace(keyID)
+	now := t.now()
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if keyID == "" {
 		for _, state := range t.keys {
-			state.Window = nil
+			state.closeWindow(now)
 		}
 		t.dirty = true
 		return true
@@ -291,7 +320,7 @@ func (t *Tracker) ResetWindow(keyID string) bool {
 	if !ok {
 		return false
 	}
-	state.Window = nil
+	state.closeWindow(now)
 	t.dirty = true
 	return true
 }

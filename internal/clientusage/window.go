@@ -64,11 +64,34 @@ func (s windowShare) proUnits(planProUnits float64) float64 {
 }
 
 // openWindow starts a window at the request time when the key has none open then.
-// A request that started inside the open window keeps it, however late its usage
-// is processed; the next request after the window ended opens the next one.
+// Records are processed in completion order, so a request that started earlier
+// than the window's first known request moves the window back to its own start;
+// a request that started inside the open window keeps it, however late its usage
+// is processed. Requests that started before the key's window floor (a reset of
+// the window, or the end of the previous window) belong to a period that is over
+// and open nothing: their usage counts in the totals only.
 func (k *keyState) openWindow(at time.Time) {
-	if k.Window.open(at) {
+	if at.Before(k.WindowFloor) {
 		return
 	}
+	if k.Window.open(at) {
+		if at.Before(k.Window.StartedAt) {
+			k.Window.StartedAt = at
+			k.Window.EndsAt = at.Add(claudeWeeklyWindow)
+		}
+		return
+	}
+	if k.Window != nil && k.Window.EndsAt.After(k.WindowFloor) {
+		k.WindowFloor = k.Window.EndsAt
+	}
 	k.Window = &keyWindow{StartedAt: at, EndsAt: at.Add(claudeWeeklyWindow)}
+}
+
+// closeWindow ends the key's window at now: the next request that starts after
+// now opens a fresh one, and requests that started earlier open nothing.
+func (k *keyState) closeWindow(now time.Time) {
+	k.Window = nil
+	if now.After(k.WindowFloor) {
+		k.WindowFloor = now
+	}
 }
