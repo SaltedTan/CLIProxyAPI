@@ -291,9 +291,11 @@ process stops may be lost. Usage is not tracked in Home mode.
   always present and `false` without a limit. It is `true` exactly when
   `current_pro_units`, as reported (rounded to six decimals), is at least
   `limit_pro_units`; admission uses the same comparison, so the proxy refuses
-  the key's Claude requests exactly when the report says the limit is reached. `limit_resets_at` equals
-  `window_resets_at` and is present whenever a window is open, with or without
-  a limit.
+  the key's Claude requests exactly when the report says the limit is reached.
+  `remaining_pro_units` is also rounded to six decimals, so for a limit
+  configured finer than that (`0.2500001`) it can read `0` one step before
+  `limit_reached` turns `true`. `limit_resets_at` equals `window_resets_at` and
+  is present whenever a window is open, with or without a limit.
 - `claude_limits_supported` is `true` on backends that enforce
   `access.api-key-limits`; older backends omit it and the limit fields above.
 - Keys with a configured limit are listed even without usage and even when they
