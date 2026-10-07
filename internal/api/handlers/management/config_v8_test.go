@@ -906,3 +906,35 @@ func TestConfigV8APIKeyLimits(t *testing.T) {
 		t.Fatalf("DELETE changed access.api-keys:\n%s", saved)
 	}
 }
+
+func TestConfigV8APIKeyLimitsDuplicateEntryIsMasked(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	raw := "config-version: 8\naccess:\n  api-keys: [fixture-key-laptop]\napi-keys:\n  codex: []\n"
+	if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &Handler{cfg: cfg, configFilePath: path}
+	router := gin.New()
+	router.PUT("/v8/management/config/*path", h.ConfigV8)
+	recorder := httptest.NewRecorder()
+	// A duplicated full key in the map must fail without echoing the key.
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPut, "/v8/management/config/access/api-key-limits", strings.NewReader(`{"fixture-client-key-1": 1, "fixture-client-key-1": 2}`)))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "fixture-client-key-1") {
+		t.Fatalf("response echoes the raw key: %s", recorder.Body.String())
+	}
+	saved, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	if strings.Contains(string(saved), "api-key-limits") {
+		t.Fatalf("rejected write reached the file:\n%s", saved)
+	}
+}

@@ -5,8 +5,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 )
 
 // SnapshotOptions supplies the configuration a report is rendered against.
@@ -141,7 +139,7 @@ func (t *Tracker) Snapshot(opts SnapshotOptions) Snapshot {
 		seen[id] = struct{}{}
 		limit, _ := t.limitForLocked(apiKey)
 		usage := t.keyUsageLocked(id, now, credentialRef, limit)
-		usage.Key = util.HideAPIKey(apiKey)
+		usage.Key = maskKey(apiKey)
 		usage.Configured = true
 		usage.Name = keyName(opts.APIKeyNames, apiKey, id)
 		snapshot.Keys = append(snapshot.Keys, usage)
@@ -168,7 +166,7 @@ func (t *Tracker) Snapshot(opts SnapshotOptions) Snapshot {
 		usage := t.keyUsageLocked(id, now, credentialRef, limits[id].Limit)
 		apiKey := others[id]
 		if apiKey != "" {
-			usage.Key = util.HideAPIKey(apiKey)
+			usage.Key = maskKey(apiKey)
 		}
 		usage.Name = keyName(opts.APIKeyNames, apiKey, id)
 		snapshot.Keys = append(snapshot.Keys, usage)

@@ -149,6 +149,30 @@ func buildV8Paths() []configPath {
 	return out
 }
 
+// clientKeyMapPaths are the config maps keyed by raw client API keys, in both
+// layouts. Their entries must never appear unmasked in errors or logs.
+var clientKeyMapPaths = []string{"access.api-key-limits", "api-key-limits", "access.api-key-names", "api-key-names"}
+
+// checkClientKeyMapDuplicates rejects a duplicated entry in a client key map with
+// the key masked.
+func checkClientKeyMapDuplicates(root *yaml.Node) error {
+	for _, path := range clientKeyMapPaths {
+		mapping := yamlPath(root, path)
+		if mapping == nil || mapping.Kind != yaml.MappingNode {
+			continue
+		}
+		seen := make(map[string]struct{}, len(mapping.Content)/2)
+		for i := 0; i+1 < len(mapping.Content); i += 2 {
+			key := mapping.Content[i].Value
+			if _, duplicate := seen[key]; duplicate {
+				return fmt.Errorf("%s: entry %s is defined more than once (line %d)", path, maskClientKey(key), mapping.Content[i].Line)
+			}
+			seen[key] = struct{}{}
+		}
+	}
+	return nil
+}
+
 func yamlPath(root *yaml.Node, path string) *yaml.Node {
 	for _, key := range strings.Split(path, ".") {
 		idx := findMapKeyIndex(root, key)
@@ -267,6 +291,11 @@ func (cfg *Config) UnmarshalYAML(node *yaml.Node) error {
 func flattenV8(node *yaml.Node) (*yaml.Node, error) {
 	if node.Kind != yaml.MappingNode {
 		return nil, fmt.Errorf("config must be a mapping")
+	}
+	// Maps keyed by client API keys are checked first so a duplicate is reported
+	// masked; the generic decoder below would name the key in its error.
+	if err := checkClientKeyMapDuplicates(node); err != nil {
+		return nil, err
 	}
 	// Decode once before transformation to reject duplicate keys even when a
 	// winning v8 value would otherwise hide the malformed legacy subtree.

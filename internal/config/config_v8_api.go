@@ -38,6 +38,13 @@ func ProjectV8ConfigAliases(root *yaml.Node, path string) {
 // Normalize request bodies before merging so an alias update can replace a
 // canonical value already present in the stored configuration.
 func NormalizeV8ConfigAliases(root *yaml.Node) error {
+	// Client key maps are checked first so a duplicated entry is reported masked
+	// rather than named by the generic decoder below.
+	if root.Kind == yaml.MappingNode {
+		if err := checkClientKeyMapDuplicates(root); err != nil {
+			return err
+		}
+	}
 	var shape any
 	if err := root.Decode(&shape); err != nil {
 		return err

@@ -801,3 +801,63 @@ func TestConductorCountsBlockedOnlyWhenTheRefusalIsReturned(t *testing.T) {
 		})
 	}
 }
+
+func TestLimitEntryAppliesToEveryKeyItNamesWhenIdentitiesOverlap(t *testing.T) {
+	now := testNow
+	tracker := newTestTracker(&now)
+	seq := &claudeSeq{tracker: tracker, now: &now}
+	resetAt := testNow.Add(72 * time.Hour)
+	keyA := "key-a"
+	// A real client key that spells key-a's id: a limit entry for it applies to both
+	// keys under admission (full-key match for B, id match for A).
+	keyB := KeyID(keyA)
+	seq.send(keyA, "claude-1", claudeObs{0.125, resetAt}, breakdown(100, 0, 0, 0, 0))
+	seq.send(keyA, "claude-1", claudeObs{0.375, resetAt}, breakdown(100, 0, 0, 0, 0))
+	seq.send(keyB, "claude-1", claudeObs{0.5, resetAt}, breakdown(100, 0, 0, 0, 0))
+	seq.send(keyB, "claude-1", claudeObs{0.75, resetAt}, breakdown(100, 0, 0, 0, 0))
+	tracker.SetLimits(map[string]float64{keyB: 0.125})
+	mustRefuse(t, tracker.Admit(requestContext(keyB), claudeAuth))
+	mustRefuse(t, tracker.Admit(requestContext(keyA), claudeAuth))
+	snapshot := tracker.Snapshot(SnapshotOptions{})
+	for _, id := range []string{KeyID(keyB), keyB} {
+		key := findKey(t, snapshot, id)
+		if key.Claude == nil || key.Claude.LimitProUnits == nil || *key.Claude.LimitProUnits != 0.125 || !key.Claude.LimitReached {
+			t.Fatalf("row %s claude = %+v, want the limit reached like admission", id, key.Claude)
+		}
+	}
+	// A full-key 0 for B lifts B's limit but not A's id entry.
+	tracker.SetLimits(map[string]float64{keyB: 0, KeyID(keyB): 0.125})
+	if errAdmit := tracker.Admit(requestContext(keyB), claudeAuth); errAdmit != nil {
+		t.Fatalf("full-key 0 must admit B: %v", errAdmit)
+	}
+	key := findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID(keyB))
+	if key.Claude == nil || key.Claude.LimitProUnits != nil {
+		t.Fatalf("B's row = %+v, want no limit", key.Claude)
+	}
+}
+
+func TestSnapshotMasksShortKeysCompletely(t *testing.T) {
+	now := testNow
+	tracker := newTestTracker(&now)
+	tracker.SetLimits(map[string]float64{"xy": 1, "abcdef": 2})
+	tracker.HandleUsage(context.Background(), record("ab", "gpt-5", breakdown(1, 0, 0, 1, 0)))
+	snapshot := tracker.Snapshot(SnapshotOptions{APIKeys: []string{"ab"}})
+	data, errMarshal := json.Marshal(snapshot)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	for _, raw := range []string{`"key":"xy"`, `"key":"ab"`, `"key":"abcdef"`} {
+		if strings.Contains(string(data), raw) {
+			t.Fatalf("snapshot shows a short key: %s", data)
+		}
+	}
+	if key := findKey(t, snapshot, KeyID("xy")); key.Key != "***" {
+		t.Fatalf("limit-only short key = %q, want fully masked", key.Key)
+	}
+	if key := findKey(t, snapshot, KeyID("ab")); key.Key != "***" {
+		t.Fatalf("configured short key = %q, want fully masked", key.Key)
+	}
+	if key := findKey(t, snapshot, KeyID("abcdef")); key.Key != "ab...ef" {
+		t.Fatalf("medium key = %q", key.Key)
+	}
+}

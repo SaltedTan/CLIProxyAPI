@@ -81,19 +81,23 @@ type keyLimit struct {
 	APIKey string
 }
 
-// limitsByIDLocked indexes the configured limits by key ID for the report. ID
-// entries are reported under that ID; full-key entries are reported under the key's
-// ID and take precedence, a full-key 0 lifting an ID entry's limit. configured is
-// the set of keys in access.api-keys, used to tell IDs from keys. t.mu must be held.
+// limitsByIDLocked indexes the configured limits by key ID for the report, applying
+// each entry to every row admission would apply it to: as an ID to the row with that
+// ID, and as a full key to the row of the key's ID. Full-key readings win, a full-key
+// 0 lifting the limit. configured is the set of keys in access.api-keys. t.mu must be held.
 func (t *Tracker) limitsByIDLocked(configured map[string]struct{}) map[string]keyLimit {
+	configuredIDs := make(map[string]struct{}, len(configured))
+	for apiKey := range configured {
+		configuredIDs[KeyID(apiKey)] = struct{}{}
+	}
 	index := make(map[string]keyLimit, len(t.limits))
 	for entry, limit := range t.limits {
-		if limit > 0 && t.isKeyIDLocked(entry, configured) {
+		if limit > 0 && t.appliesAsIDLocked(entry, configured, configuredIDs) {
 			index[entry] = keyLimit{Limit: limit}
 		}
 	}
 	for entry, limit := range t.limits {
-		if t.isKeyIDLocked(entry, configured) {
+		if !t.appliesAsFullKeyLocked(entry, configured) {
 			continue
 		}
 		id := KeyID(entry)
@@ -106,24 +110,37 @@ func (t *Tracker) limitsByIDLocked(configured map[string]struct{}) map[string]ke
 	return index
 }
 
-// isKeyIDLocked reports whether a limits entry names a key by ID rather than by full
-// key. Known identities decide first, so a real key that happens to look like an ID
-// is never reported as one: an entry equal to a configured key, or whose own ID has
-// usage, is a full key. Otherwise the shape decides (see isKeyID). t.mu must be held.
-func (t *Tracker) isKeyIDLocked(entry string, configured map[string]struct{}) bool {
-	if _, ok := configured[entry]; ok {
-		return false
-	}
+// appliesAsIDLocked reports whether a limits entry is read as a key ID: it has the
+// shape of one and either names a known ID (a tracked key or a configured key's ID)
+// or nothing identifies it as a full key. t.mu must be held.
+func (t *Tracker) appliesAsIDLocked(entry string, configured, configuredIDs map[string]struct{}) bool {
 	if !isKeyID(entry) {
 		return false
 	}
 	if _, ok := t.keys[entry]; ok {
 		return true
 	}
-	if _, ok := t.keys[KeyID(entry)]; ok {
-		return false
+	if _, ok := configuredIDs[entry]; ok {
+		return true
 	}
-	return true
+	return !t.knownFullKeyLocked(entry, configured)
+}
+
+// appliesAsFullKeyLocked reports whether a limits entry is read as a full key: it is
+// a known key (configured or with usage) or does not look like an ID. A real key that
+// happens to look like an ID is therefore never reported as one. t.mu must be held.
+func (t *Tracker) appliesAsFullKeyLocked(entry string, configured map[string]struct{}) bool {
+	return t.knownFullKeyLocked(entry, configured) || !isKeyID(entry)
+}
+
+// knownFullKeyLocked reports whether entry is a client key the tracker knows: it is
+// configured or its ID has usage. t.mu must be held.
+func (t *Tracker) knownFullKeyLocked(entry string, configured map[string]struct{}) bool {
+	if _, ok := configured[entry]; ok {
+		return true
+	}
+	_, ok := t.keys[KeyID(entry)]
+	return ok
 }
 
 // isKeyID reports whether value has the shape of a key ID (16 lowercase hex digits)
@@ -245,6 +262,19 @@ func apiKeyFromContext(ctx context.Context) string {
 		return value.String()
 	default:
 		return fmt.Sprint(value)
+	}
+}
+
+// maskKey masks a client API key for the report: four characters at each end of a
+// long key, two of a medium one, and nothing of a short one.
+func maskKey(apiKey string) string {
+	switch {
+	case len(apiKey) > 8:
+		return apiKey[:4] + "..." + apiKey[len(apiKey)-4:]
+	case len(apiKey) > 4:
+		return apiKey[:2] + "..." + apiKey[len(apiKey)-2:]
+	default:
+		return "***"
 	}
 }
 

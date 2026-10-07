@@ -315,12 +315,15 @@ full-key `0` lifts a limit set on the `id`. Requests without a client key use
 the `anonymous` entry. An entry is read as an `id` when it is 16 lowercase hex
 characters (or `anonymous`), unless it equals a key in `access.api-keys` or the
 key it spells has usage; a real key that happens to look like an `id` is
-therefore still reported under its own `id`, masked. Keys with a limit are
+therefore still reported under its own `id`, masked. When an entry names both
+a key and another key's `id` (a client key equal to some other key's `id`), it
+applies to both, as it does for admission. Keys with a limit are
 tracked even when the usage tracker is at its capacity of 1024 keys. Limits take
 effect on every configuration reload (file changes and management writes)
-without a restart. Negative, NaN or infinite values are rejected: the file fails
-to load and management writes return `400 invalid_config`; error messages mask
-the key.
+without a restart. Negative, NaN or infinite values and duplicated entries are
+rejected: the file fails to load and management writes return
+`400 invalid_config`; error messages mask the key (keys of four characters or
+fewer are masked completely, in errors and in the report's `key` field).
 
 When a key's `current_pro_units` reaches its limit, the proxy refuses that key's
 requests to every Claude credential, OAuth and API-key alike, before any
