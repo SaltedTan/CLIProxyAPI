@@ -952,6 +952,8 @@ func TestConfigV8RejectsDuplicateClientKeysInNestedPatchesAndMergedYAML(t *testi
 		{"nested PATCH of the limits map", http.MethodPatch, "/v8/management/config/access/api-key-limits", `{"` + key + `": 0.125, "` + key + `": 0}`},
 		{"PATCH of the access section", http.MethodPatch, "/v8/management/config/access", `{"api-key-names": {"` + key + `": "a", "` + key + `": "b"}}`},
 		{"YAML PUT with a merged duplicate", http.MethodPut, "/v8/management/config.yaml", "config-version: 8\naccess:\n  <<: &settings\n    api-key-limits:\n      " + key + ": 1\n      " + key + ": 2\n"},
+		{"YAML PUT with a shadowed anchored duplicate", http.MethodPut, "/v8/management/config.yaml", "config-version: 8\nx-shared: &shared\n  api-key-limits:\n    " + key + ": 1\n    " + key + ": 2\naccess:\n  <<: *shared\n  api-key-limits:\n    " + key + ": 3\n"},
+		{"YAML PUT with an unattributed duplicate", http.MethodPut, "/v8/management/config.yaml", "config-version: 8\nx-unrelated:\n  " + key + ": 1\n  " + key + ": 2\n"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

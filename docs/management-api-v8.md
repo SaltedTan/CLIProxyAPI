@@ -324,9 +324,12 @@ without a restart. Negative, NaN or infinite values and duplicated entries are
 rejected: the file fails to load and management writes return
 `400 invalid_config`; error messages mask the key (keys of four characters or
 fewer are masked completely, in errors and in the report's `key` field). An
-entry counts as duplicated within one mapping, also when the map is reached
-through a YAML merge key (`<<`) or an alias, and in a nested `PATCH` body; an
-entry set directly still overrides the same entry from a merged mapping.
+entry counts as duplicated within one mapping, wherever that mapping appears in
+the document: under a YAML merge key (`<<`), behind an alias, in an anchored
+copy that a direct entry shadows, or in a nested `PATCH` body. An entry set
+directly still overrides the same entry from a merged mapping. Any other
+duplicated mapping key the YAML decoder reports is masked the same way, with
+its line numbers kept.
 
 When a key's `current_pro_units` reaches its limit, the proxy refuses that key's
 requests to every Claude credential, OAuth and API-key alike, before any

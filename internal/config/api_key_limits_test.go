@@ -74,6 +74,12 @@ func TestDuplicateClientKeyEntriesBehindMergesAndAliasesAreReportedMasked(t *tes
 		"merge inside the v8 limits map":       "config-version: 8\naccess:\n  api-key-limits:\n    <<:\n      " + key + ": 1\n      " + key + ": 2\n",
 		"merge sequence inside the names map":  "config-version: 8\naccess:\n  api-key-names:\n    <<: [{" + key + ": a, " + key + ": b}]\n",
 		"legacy limits under a merged mapping": "<<: &settings\n  api-key-limits:\n    " + key + ": 1\n    " + key + ": 2\n",
+		// Round 4: the generic decoder also decodes anchored copies that merge
+		// precedence shadows, and mappings whose key is itself an alias.
+		"anchored limits map shadowed by a direct one":             "config-version: 8\nx-shared: &shared\n  api-key-limits:\n    " + key + ": 1\n    " + key + ": 2\naccess:\n  <<: *shared\n  api-key-limits:\n    " + key + ": 3\n",
+		"section named through an alias key":                       "config-version: 8\nserver: {host: &section access}\n*section:\n  api-key-limits:\n    " + key + ": 1\n    " + key + ": 2\n",
+		"limits anchored elsewhere, used only in a shadowed merge": "config-version: 8\nx-limits: &limits\n  " + key + ": 1\n  " + key + ": 2\naccess:\n  <<:\n    api-key-limits: *limits\n  api-key-limits:\n    " + key + ": 3\n",
+		"map name given through an alias key":                      "config-version: 8\nserver: {host: &name api-key-limits}\naccess:\n  *name:\n    " + key + ": 1\n    " + key + ": 2\n",
 	}
 	for name, raw := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -155,5 +161,23 @@ func TestSaveKeepsANewZeroLimitEntry(t *testing.T) {
 				t.Fatalf("the id limit changed: limits = %v\n%s", loaded.APIKeyLimits, saved)
 			}
 		})
+	}
+}
+
+// TestGenericDuplicateKeyErrorsAreMasked is the fallback for a duplicated key the
+// structural check cannot attribute to a client key map: the YAML decoder's own
+// error must not name it either.
+func TestGenericDuplicateKeyErrorsAreMasked(t *testing.T) {
+	const key = "fixture-client-key-1"
+	raw := "config-version: 8\nx-unrelated:\n  " + key + ": 1\n  " + key + ": 2\n"
+	_, errParse := ParseConfigBytes([]byte(raw))
+	if errParse == nil {
+		t.Fatal("ParseConfigBytes accepted a duplicated key")
+	}
+	if strings.Contains(errParse.Error(), key) || !strings.Contains(errParse.Error(), "fixt...ey-1") || !strings.Contains(errParse.Error(), "line 4") {
+		t.Fatalf("ParseConfigBytes error = %q, want the key masked and the line kept", errParse)
+	}
+	if errValidate := ValidateV8Config([]byte(raw)); errValidate == nil || strings.Contains(errValidate.Error(), key) {
+		t.Fatalf("ValidateV8Config error = %v, want a masked rejection", errValidate)
 	}
 }
