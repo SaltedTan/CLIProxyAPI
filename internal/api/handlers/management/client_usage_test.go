@@ -65,7 +65,8 @@ func TestClientUsageEndpoints(t *testing.T) {
 	publish("laptop-key-0001", "t2", "0.45")
 	// The laptop spent 0.1 Pro units; a 0.05 limit is reached. The tablet key is
 	// not configured and has no usage, so it is listed only because of its limit.
-	h.clientUsage.SetLimits(map[string]float64{"laptop-key-0001": 0.05, clientusage.KeyID("tablet-key-0003"): 0.5})
+	// An id entry naming no known key is not listed: it could be a raw key.
+	h.clientUsage.SetLimits(map[string]float64{"laptop-key-0001": 0.05, "tablet-key-0003": 0.5, clientusage.KeyID("watch-key-0004"): 0.25})
 
 	get := func() clientusage.Snapshot {
 		t.Helper()
@@ -120,7 +121,7 @@ func TestClientUsageEndpoints(t *testing.T) {
 		t.Fatalf("phone = %+v", phone)
 	}
 	tablet := snapshot.Keys[2]
-	if tablet.ID != clientusage.KeyID("tablet-key-0003") || tablet.Configured || tablet.Key != "" || tablet.Claude == nil || *tablet.Claude.LimitProUnits != 0.5 || tablet.Claude.LimitReached || len(tablet.Claude.Credentials) != 0 {
+	if tablet.ID != clientusage.KeyID("tablet-key-0003") || tablet.Configured || tablet.Key != "tabl...0003" || tablet.Claude == nil || *tablet.Claude.LimitProUnits != 0.5 || tablet.Claude.LimitReached || len(tablet.Claude.Credentials) != 0 {
 		t.Fatalf("limit-only tablet = %+v claude = %+v", tablet, tablet.Claude)
 	}
 

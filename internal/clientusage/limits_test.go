@@ -496,8 +496,9 @@ func TestSnapshotReportsLimitsAndLimitOnlyKeys(t *testing.T) {
 	for _, key := range snapshot.Keys {
 		ids = append(ids, key.ID)
 	}
-	// Configured keys first in order, then the rest sorted by id.
-	rest := []string{KeyID("key-b"), KeyID("limit-only-secret"), "0123456789abcdef"}
+	// Configured keys first in order, then the rest sorted by id. The entry shaped
+	// like an id names no known key and is not listed.
+	rest := []string{KeyID("key-b"), KeyID("limit-only-secret")}
 	sort.Strings(rest)
 	want := append([]string{KeyID("key-a"), KeyID("configured-secret")}, rest...)
 	if strings.Join(ids, ",") != strings.Join(want, ",") {
@@ -523,14 +524,20 @@ func TestSnapshotReportsLimitsAndLimitOnlyKeys(t *testing.T) {
 	if limitOnly.Configured || limitOnly.Key != "limi...cret" || limitOnly.Name != "Tablet" || limitOnly.Totals != (Counters{}) || limitOnly.Claude == nil || *limitOnly.Claude.LimitProUnits != 1 {
 		t.Fatalf("limit-only key = %+v claude = %+v", limitOnly, limitOnly.Claude)
 	}
-	byID := findKey(t, snapshot, "0123456789abcdef")
-	if byID.Configured || byID.Key != "" || byID.Name != "By id" || byID.Claude == nil || *byID.Claude.LimitProUnits != 2 {
-		t.Fatalf("limit-only key by id = %+v claude = %+v", byID, byID.Claude)
-	}
 	for _, key := range snapshot.Keys {
 		if key.ID == KeyID("key-unknown") {
 			t.Fatal("a limit of 0 must not list a key")
 		}
+	}
+	// An id entry is listed once its key is configured, and an anonymous entry always is.
+	tracker.SetLimits(map[string]float64{KeyID("configured-by-id"): 2, AnonymousKeyID: 0.5})
+	snapshot = tracker.Snapshot(SnapshotOptions{APIKeys: []string{"configured-by-id"}, APIKeyNames: map[string]string{KeyID("configured-by-id"): "By id"}})
+	byID := findKey(t, snapshot, KeyID("configured-by-id"))
+	if !byID.Configured || byID.Name != "By id" || byID.Claude == nil || *byID.Claude.LimitProUnits != 2 {
+		t.Fatalf("configured key limited by id = %+v claude = %+v", byID, byID.Claude)
+	}
+	if anonymous := findKey(t, snapshot, AnonymousKeyID); anonymous.Claude == nil || *anonymous.Claude.LimitProUnits != 0.5 {
+		t.Fatalf("anonymous limit = %+v", anonymous.Claude)
 	}
 
 	// A key with Claude usage but no limit reports when its window resets.
@@ -753,6 +760,15 @@ func TestSnapshotNeverShowsARealKeyThatLooksLikeAnID(t *testing.T) {
 		if key.Key != "0123...cdef" {
 			t.Fatalf("%s: masked key = %q", label, key.Key)
 		}
+	}
+	// Neither configured nor used: nothing tells the entry is a key rather than an
+	// id, so no row may show it until one does.
+	data, errMarshal := json.Marshal(tracker.Snapshot(SnapshotOptions{}))
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	if strings.Contains(string(data), hexKey) {
+		t.Fatalf("unknown: snapshot shows the raw key: %s", data)
 	}
 	// Known because it is configured.
 	assertHidden(SnapshotOptions{APIKeys: []string{hexKey}}, "configured")

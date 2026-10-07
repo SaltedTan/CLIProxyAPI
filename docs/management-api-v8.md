@@ -297,7 +297,11 @@ process stops may be lost. Usage is not tracked in Home mode.
 - `claude_limits_supported` is `true` on backends that enforce
   `access.api-key-limits`; older backends omit it and the limit fields above.
 - Keys with a configured limit are listed even without usage and even when they
-  are not in `access.api-keys` (`configured` is then `false`).
+  are not in `access.api-keys` (`configured` is then `false`). An entry shaped
+  like an `id` that names no key in `access.api-keys` is listed only once a key
+  with that `id` has usage (an `anonymous` entry always is): until then it may be
+  a real key that happens to look like an `id`, which its row would show
+  unmasked. It applies to admission either way.
 - Claude credentials report weekly usage as a fraction of their own plan limit
   (`Anthropic-Ratelimit-Unified-7d-Utilization`). Each increase is split between
   the client keys that used the credential since the previous increase, by
@@ -343,7 +347,8 @@ full-key `0` lifts a limit set on the `id`. Requests without a client key use
 the `anonymous` entry. An entry is read as an `id` when it is 16 lowercase hex
 characters (or `anonymous`), unless it equals a key in `access.api-keys` or the
 key it spells has usage; a real key that happens to look like an `id` is
-therefore still reported under its own `id`, masked. When an entry names both
+therefore still reported under its own `id`, masked, and an entry nothing
+identifies yet is not listed (see above). When an entry names both
 a key and another key's `id` (a client key equal to some other key's `id`), it
 applies to both, as it does for admission. Keys with a limit are
 tracked even when the usage tracker is at its capacity of 1024 keys. Limits take

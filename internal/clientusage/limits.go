@@ -85,7 +85,8 @@ type keyLimit struct {
 // limitsByIDLocked indexes the configured limits by key ID for the report, applying
 // each entry to every row admission would apply it to: as an ID to the row with that
 // ID, and as a full key to the row of the key's ID. Full-key readings win, a full-key
-// 0 lifting the limit. configured is the set of keys in access.api-keys. t.mu must be held.
+// 0 lifting the limit. An entry that is neither is not listed (see appliesAsIDLocked).
+// configured is the set of keys in access.api-keys. t.mu must be held.
 func (t *Tracker) limitsByIDLocked(configured map[string]struct{}) map[string]keyLimit {
 	configuredIDs := make(map[string]struct{}, len(configured))
 	for apiKey := range configured {
@@ -93,7 +94,7 @@ func (t *Tracker) limitsByIDLocked(configured map[string]struct{}) map[string]ke
 	}
 	index := make(map[string]keyLimit, len(t.limits))
 	for entry, limit := range t.limits {
-		if limit > 0 && t.appliesAsIDLocked(entry, configured, configuredIDs) {
+		if limit > 0 && t.appliesAsIDLocked(entry, configuredIDs) {
 			index[entry] = keyLimit{Limit: limit}
 		}
 	}
@@ -111,20 +112,24 @@ func (t *Tracker) limitsByIDLocked(configured map[string]struct{}) map[string]ke
 	return index
 }
 
-// appliesAsIDLocked reports whether a limits entry is read as a key ID: it has the
-// shape of one and either names a known ID (a tracked key or a configured key's ID)
-// or nothing identifies it as a full key. t.mu must be held.
-func (t *Tracker) appliesAsIDLocked(entry string, configured, configuredIDs map[string]struct{}) bool {
+// appliesAsIDLocked reports whether the report reads a limits entry as a key ID: it
+// is the anonymous ID, or it has the shape of an ID and names a known one (a tracked
+// key or a configured key's ID). An unknown entry of that shape is not listed until
+// a key with that ID has usage: it may be a real key that happens to look like an
+// ID, which its row would show unmasked. Admission applies it either way. t.mu must
+// be held.
+func (t *Tracker) appliesAsIDLocked(entry string, configuredIDs map[string]struct{}) bool {
+	if entry == AnonymousKeyID {
+		return true
+	}
 	if !isKeyID(entry) {
 		return false
 	}
 	if _, ok := t.keys[entry]; ok {
 		return true
 	}
-	if _, ok := configuredIDs[entry]; ok {
-		return true
-	}
-	return !t.knownFullKeyLocked(entry, configured)
+	_, ok := configuredIDs[entry]
+	return ok
 }
 
 // appliesAsFullKeyLocked reports whether a limits entry is read as a full key: it is
