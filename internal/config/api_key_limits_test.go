@@ -592,6 +592,38 @@ func TestClientKeysAreMaskedInValueDiagnostics(t *testing.T) {
 	}
 }
 
+// TestClientKeyInThePrivateIPFlagIsMasked covers the deprecated private IP
+// flag, decoded before any other value and on save: the decoder truncates a long
+// value to its first seven characters, which no later pass can recognize, and
+// the save helpers have no later pass at all.
+func TestClientKeyInThePrivateIPFlagIsMasked(t *testing.T) {
+	for _, key := range []string{aliasedClientKey, "fixture-client-key-12345"} {
+		raw := "config-version: 8\naccess:\n  api-keys: [&client " + key + "]\ncodex: {live-media-relay: {allow-private-remote-ips: *client}}\n"
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+			t.Fatal(err)
+		}
+		_, errParse := ParseConfigBytes([]byte(raw))
+		_, errLoad := LoadConfig(path)
+		_, _, errNormalize := NormalizeConfigLayout([]byte(raw), true)
+		errs := map[string]error{
+			"ParseConfigBytes":           errParse,
+			"LoadConfig":                 errLoad,
+			"NormalizeConfigLayout":      errNormalize,
+			"ValidateV8Config":           ValidateV8Config([]byte(raw)),
+			"SaveConfigPreserveComments": SaveConfigPreserveComments(path, &Config{}, true),
+		}
+		for label, err := range errs {
+			if err == nil || !strings.Contains(err.Error(), "allow-private-remote-ips") {
+				t.Fatalf("%s(%d-character key) error = %v, want the flag rejected", label, len(key), err)
+			}
+			if strings.Contains(err.Error(), key[:7]) {
+				t.Fatalf("%s error shows the key: %q", label, err)
+			}
+		}
+	}
+}
+
 // TestAliasedClientKeySectionWarningIsMasked covers the warning logged when a
 // write comments out an unknown section: a client key aliased as the section
 // name must appear masked there too.

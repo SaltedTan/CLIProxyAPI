@@ -1142,7 +1142,8 @@ func normalizeV8PrivateIPAlias(root *yaml.Node, migrate bool) (bool, error) {
 	}
 	var allow bool
 	if err := value.Decode(&allow); err != nil {
-		return false, fmt.Errorf("decode %s: %w", old, err)
+		// The value can be a client key aliased here; the decoder prints it.
+		return false, fmt.Errorf("decode %s: %w", old, maskDecoderError(err))
 	}
 	replacement := deepCopyNode(value)
 	if err := replacement.Encode(!allow); err != nil {
