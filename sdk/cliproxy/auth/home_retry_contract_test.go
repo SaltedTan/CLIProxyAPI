@@ -950,7 +950,7 @@ func TestHomeRetryRoundUsesAuthoritativeRemoteCooldown(t *testing.T) {
 		{
 			name: "stream",
 			execute: func(manager *Manager, retryLimit *int) error {
-				_, errExecute := manager.executeStreamMixedOnce(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{Stream: true}, 2, retryLimit, 0, 0)
+				_, errExecute := manager.executeStreamMixedOnce(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{Stream: true}, 2, retryLimit, 0, 0, nil)
 				return errExecute
 			},
 		},
@@ -1002,7 +1002,7 @@ func TestHomeCooldownClassificationPreservesNonRetryableRoundStatus(t *testing.T
 		{
 			name: "stream",
 			execute: func(manager *Manager, retryLimit *int) error {
-				_, errExecute := manager.executeStreamMixedOnce(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{Stream: true}, 2, retryLimit, 0, 0)
+				_, errExecute := manager.executeStreamMixedOnce(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{Stream: true}, 2, retryLimit, 0, 0, nil)
 				return errExecute
 			},
 		},
@@ -1053,7 +1053,7 @@ func TestHomeRetryRoundStartsImmediatelyWhenHomeReportsAvailableNextRound(t *tes
 		{
 			name: "stream",
 			execute: func(manager *Manager, retryLimit *int) error {
-				_, errExecute := manager.executeStreamMixedOnce(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{Stream: true}, 0, retryLimit, 0, 0)
+				_, errExecute := manager.executeStreamMixedOnce(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{Stream: true}, 0, retryLimit, 0, 0, nil)
 				return errExecute
 			},
 		},
@@ -1105,7 +1105,7 @@ func TestHomeRetryRoundUsesRemoteCooldownWhenAttemptedErrorHasNoTiming(t *testin
 		{
 			name: "stream",
 			execute: func(manager *Manager, retryLimit *int) error {
-				_, errExecute := manager.executeStreamMixedOnce(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{Stream: true}, 2, retryLimit, 0, 0)
+				_, errExecute := manager.executeStreamMixedOnce(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{Stream: true}, 2, retryLimit, 0, 0, nil)
 				return errExecute
 			},
 		},
@@ -1445,7 +1445,7 @@ func TestHomeLocalSelectionRejectionWaitsForReleaseAcknowledgement(t *testing.T)
 			blockedGroup:        executionregistry.ReleaseGroup{CredentialID: "home-retry-a", Model: "gpt"},
 			blockedSequence:     2,
 			execute: func(manager *Manager, maxRetryCredentials int, retryLimit *int) error {
-				_, errExecute := manager.executeStreamMixedOnce(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{Stream: true}, maxRetryCredentials, retryLimit, 0, 0)
+				_, errExecute := manager.executeStreamMixedOnce(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{Stream: true}, maxRetryCredentials, retryLimit, 0, 0, nil)
 				return errExecute
 			},
 		},
@@ -1460,7 +1460,7 @@ func TestHomeLocalSelectionRejectionWaitsForReleaseAcknowledgement(t *testing.T)
 			blockedGroup:        executionregistry.ReleaseGroup{CredentialID: "home-retry-b", Model: "gpt"},
 			blockedSequence:     1,
 			execute: func(manager *Manager, maxRetryCredentials int, retryLimit *int) error {
-				_, errExecute := manager.executeStreamMixedOnce(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{Stream: true}, maxRetryCredentials, retryLimit, 0, 0)
+				_, errExecute := manager.executeStreamMixedOnce(context.Background(), []string{"home-retry-contract"}, cliproxyexecutor.Request{Model: "gpt"}, cliproxyexecutor.Options{Stream: true}, maxRetryCredentials, retryLimit, 0, 0, nil)
 				return errExecute
 			},
 		},

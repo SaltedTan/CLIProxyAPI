@@ -150,6 +150,7 @@ type Manager struct {
 	selector                  Selector
 	hook                      Hook
 	resultPolicy              atomic.Pointer[resultPolicyHolder]
+	admissionPolicy           atomic.Pointer[admissionPolicyHolder]
 	mu                        sync.RWMutex
 	selectorMu                sync.Mutex
 	configCooldownMu          sync.Mutex

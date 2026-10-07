@@ -69,6 +69,48 @@ func TestWriteErrorResponse_AddonHeadersDisabledByDefault(t *testing.T) {
 	}
 }
 
+func TestWriteErrorResponseClientQuotaSetsRetryAfterWithoutPassthrough(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	quota := &coreauth.ClientQuotaError{
+		Code:    coreauth.ErrorCodeClientKeyLimitReached,
+		Message: "client API key Claude allowance reached: 1.50 of 1.50 Pro units used this week; resets in 2d3h",
+		ResetIn: 2*24*time.Hour + 3*time.Hour,
+	}
+	msg := executionErrorMessage(quota)
+	if msg.StatusCode != http.StatusTooManyRequests || msg.DirectResponse {
+		t.Fatalf("executionErrorMessage() = %+v", msg)
+	}
+	// Cfg is nil, so passthrough-headers is disabled and Addon headers are dropped.
+	NewBaseAPIHandlers(nil, nil).WriteErrorResponse(c, msg)
+
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", recorder.Code)
+	}
+	if got := recorder.Header().Values("Retry-After"); len(got) != 1 || got[0] != "183600" {
+		t.Fatalf("Retry-After = %v, want a single 183600", got)
+	}
+	if got := recorder.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q", got)
+	}
+	var body struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &body); errDecode != nil {
+		t.Fatalf("body = %s: %v", recorder.Body.String(), errDecode)
+	}
+	if body.Error.Message != quota.Message || body.Error.Type != "rate_limit_error" || body.Error.Code != "rate_limit_exceeded" {
+		t.Fatalf("body = %s", recorder.Body.String())
+	}
+}
+
 func TestWriteErrorResponseDirectResponse(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()

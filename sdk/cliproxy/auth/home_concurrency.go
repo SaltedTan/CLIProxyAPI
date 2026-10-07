@@ -309,6 +309,10 @@ func SafeResponseHeaders(err error) http.Header {
 	if errors.As(err, &unavailable) && unavailable != nil {
 		return unavailable.Headers()
 	}
+	var clientQuota *ClientQuotaError
+	if errors.As(err, &clientQuota) && clientQuota != nil {
+		return safeRetryAfterHeader(clientQuota.retryAfter())
+	}
 	return nil
 }
 

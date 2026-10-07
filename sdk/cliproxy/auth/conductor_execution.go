@@ -133,6 +133,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 
 	ctx = m.routingObs.beginRequest(ctx)
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
+	admission := m.newAdmissionCache()
 
 	var lastErr error
 	var preferredUpstreamErr error
@@ -140,7 +141,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	for attempt := 0; ; attempt++ {
 		roundAttempted := make(map[string]struct{})
 		roundOpts := withAttemptedAuthTracker(opts, roundAttempted)
-		resp, errExec := m.executeMixedOnce(ctx, normalized, req, roundOpts, maxRetryCredentials, attempt, defaultRequestRetry)
+		resp, errExec := m.executeMixedOnce(ctx, normalized, req, roundOpts, maxRetryCredentials, attempt, defaultRequestRetry, admission)
 		if errExec == nil {
 			return resp, nil
 		}
@@ -249,6 +250,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 
 	ctx = m.routingObs.beginRequest(ctx)
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
+	admission := m.newAdmissionCache()
 
 	var lastErr error
 	var preferredUpstreamErr error
@@ -260,7 +262,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	for {
 		roundAttempted := make(map[string]struct{})
 		roundOpts := withAttemptedAuthTracker(opts, roundAttempted)
-		result, errStream := m.executeStreamMixedOnce(ctx, normalized, req, roundOpts, maxRetryCredentials, &homeRetryLimit, attempt, defaultRequestRetry)
+		result, errStream := m.executeStreamMixedOnce(ctx, normalized, req, roundOpts, maxRetryCredentials, &homeRetryLimit, attempt, defaultRequestRetry, admission)
 		if errStream == nil {
 			return result, nil
 		}
@@ -483,7 +485,10 @@ func executorForAuth(executor ProviderExecutor, auth *Auth) ProviderExecutor {
 	return executor
 }
 
-func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, retryRound int, defaultRequestRetry int) (cliproxyexecutor.Response, error) {
+// executeMixedOnce runs one credential pick loop. admission (nil when no policy is
+// installed) refuses credentials before any upstream call; its refusal is returned
+// only when the loop ends without an upstream attempt.
+func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, retryRound int, defaultRequestRetry int, admission *admissionCache) (cliproxyexecutor.Response, error) {
 	if len(providers) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
@@ -506,6 +511,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, preferredExecutionAttemptError(lastErr, upstreamErr)
 			}
+			if errRefused := admission.refused(); errRefused != nil {
+				return cliproxyexecutor.Response{}, errRefused
+			}
 			return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
 		pickOpts := opts
@@ -519,7 +527,18 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return cliproxyexecutor.Response{}, preferredExecutionAttemptError(lastErr, upstreamErr)
 			}
+			if errRefused := admission.refused(); errRefused != nil {
+				return cliproxyexecutor.Response{}, errRefused
+			}
 			return cliproxyexecutor.Response{}, errPick
+		}
+		if !homeMode {
+			// Refused credentials are skipped without any upstream attempt, result,
+			// or cooldown; other providers still serve the request.
+			if errAdmit := admission.admit(ctx, auth); errAdmit != nil {
+				tried[auth.ID] = struct{}{}
+				continue
+			}
 		}
 
 		entry := logEntryWithRequestID(ctx)
@@ -911,7 +930,11 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	}
 }
 
-func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, homeRetryLimit *int, retryRound int, defaultRequestRetry int) (*cliproxyexecutor.StreamResult, error) {
+// executeStreamMixedOnce runs one credential pick loop for a stream. admission (nil
+// when no policy is installed, never consulted in Home mode) refuses credentials
+// before the stream opens; its refusal is returned only when the loop ends without
+// an upstream attempt, so clients receive a plain error rather than an SSE event.
+func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, homeRetryLimit *int, retryRound int, defaultRequestRetry int, admission *admissionCache) (*cliproxyexecutor.StreamResult, error) {
 	if len(providers) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
@@ -944,6 +967,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 					return nil, markHomeRetryRoundExhausted(preferredErr, roundTiming.RetryAfter(), true)
 				}
 				return nil, preferredErr
+			}
+			if errRefused := admission.refused(); errRefused != nil {
+				return nil, errRefused
 			}
 			return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
@@ -982,6 +1008,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				}
 				return nil, preferredErr
 			}
+			if errRefused := admission.refused(); errRefused != nil {
+				return nil, errRefused
+			}
 			return nil, errPick
 		}
 		if auth == nil || executor == nil {
@@ -989,6 +1018,14 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				selection.End("missing_execution_target")
 			}
 			return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
+		}
+		if !homeMode {
+			// Refused credentials are skipped without any upstream attempt, result,
+			// or cooldown; other providers still serve the request.
+			if errAdmit := admission.admit(ctx, auth); errAdmit != nil {
+				tried[auth.ID] = struct{}{}
+				continue
+			}
 		}
 		if homeMode {
 			m.observeHomeRetryLimit(auth, selection, homeRetryLimit)
