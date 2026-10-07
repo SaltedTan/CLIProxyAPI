@@ -956,6 +956,8 @@ func TestConfigV8RejectsDuplicateClientKeysInNestedPatchesAndMergedYAML(t *testi
 		{"YAML PUT with an unattributed duplicate", http.MethodPut, "/v8/management/config.yaml", "config-version: 8\nx-unrelated:\n  " + key + ": 1\n  " + key + ": 2\n"},
 		{"YAML PUT with a nested map under a client key", http.MethodPut, "/v8/management/config.yaml", "config-version: 8\naccess:\n  api-key-limits:\n    " + key + ":\n      api-key-limits:\n        x: 1\n        x: 2\n"},
 		{"YAML PUT with a compound key", http.MethodPut, "/v8/management/config.yaml", "config-version: 8\naccess:\n  api-key-limits:\n    ? [" + key + "]\n    : 1\n"},
+		{"YAML PUT with a tagged key", http.MethodPut, "/v8/management/config.yaml", "config-version: 8\naccess:\n  api-key-limits:\n    !!int " + key + ": 1\n"},
+		{"YAML PUT with an unknown anchor", http.MethodPut, "/v8/management/config.yaml", "config-version: 8\naccess:\n  api-key-limits:\n    *" + key + ": 1\n"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -163,6 +163,8 @@ var (
 	duplicateMappingKeyPattern = regexp.MustCompile(`mapping key ("(?:[^"\\]|\\.)*") already defined`)
 	invalidMapKeyPattern       = regexp.MustCompile(`invalid map key: [^\n]*`)
 	selfAnchorPattern          = regexp.MustCompile(`anchor '([^']*)' value contains itself`)
+	unknownAnchorPattern       = regexp.MustCompile(`unknown anchor '([^']*)' referenced`)
+	taggedScalarPattern        = regexp.MustCompile("cannot decode (\\S+) `([^`]*)` as a")
 )
 
 // checkClientKeyMapDuplicates rejects a duplicated or non-scalar entry in a client
@@ -222,11 +224,20 @@ func walkClientKeyMaps(node *yaml.Node, path string, masked bool, seen map[*yaml
 // scalarKey returns the scalar a mapping key decodes to, following aliases, and
 // whether the key is a scalar at all.
 func scalarKey(key *yaml.Node) (string, bool) {
-	resolved := resolveAliasNode(key, make(map[*yaml.Node]struct{}))
-	if resolved == nil || resolved.Kind != yaml.ScalarNode {
+	resolved := scalarKeyNode(key)
+	if resolved == nil {
 		return "", false
 	}
 	return resolved.Value, true
+}
+
+// scalarKeyNode returns the scalar node a mapping key resolves to, or nil.
+func scalarKeyNode(key *yaml.Node) *yaml.Node {
+	resolved := resolveAliasNode(key, make(map[*yaml.Node]struct{}))
+	if resolved == nil || resolved.Kind != yaml.ScalarNode {
+		return nil
+	}
+	return resolved
 }
 
 // mapKeyName returns the name a mapping key decodes to: the merge marker for <<,
@@ -240,8 +251,9 @@ func mapKeyName(key *yaml.Node) string {
 }
 
 // checkClientKeyMapEntries reports the first entry of the client key map at path
-// that is not a scalar key or is defined twice within one of its mappings. Alias
-// keys are compared by the scalar they resolve to.
+// that is not a plain scalar key (a compound or explicitly tagged key, which the
+// decoder would otherwise print) or is defined twice within one of its mappings.
+// Alias keys are compared by the scalar they resolve to.
 func checkClientKeyMapEntries(mapping *yaml.Node, path string) error {
 	for _, node := range mergedMappings(mapping, nil, make(map[*yaml.Node]struct{})) {
 		seen := make(map[string]struct{}, len(node.Content)/2)
@@ -249,10 +261,11 @@ func checkClientKeyMapEntries(mapping *yaml.Node, path string) error {
 			if isMergeKey(node.Content[i]) {
 				continue
 			}
-			key, scalar := scalarKey(node.Content[i])
-			if !scalar {
+			resolved := scalarKeyNode(node.Content[i])
+			if resolved == nil || resolved.Style&yaml.TaggedStyle != 0 {
 				return fmt.Errorf("%s: entry at line %d must be a plain key", path, node.Content[i].Line)
 			}
+			key := resolved.Value
 			if _, duplicate := seen[key]; duplicate {
 				return fmt.Errorf("%s: entry %s is defined more than once (line %d)", path, maskClientKey(key), node.Content[i].Line)
 			}
@@ -262,10 +275,12 @@ func checkClientKeyMapEntries(mapping *yaml.Node, path string) error {
 	return nil
 }
 
-// maskDecoderError masks the key or anchor named by the YAML decoder's own
-// errors. It is the fallback for a mapping the structural check could not
-// attribute to a client key map, such as an anchor declared under an unrelated
-// name; line numbers are kept so the entry stays findable.
+// maskDecoderError masks the key, value or anchor named by the YAML parser's and
+// decoder's own errors: a duplicated or non-scalar key, an explicitly tagged
+// scalar its tag does not fit, and an unknown or self-referencing anchor. It is
+// the fallback for an entry the structural check could not attribute to a client
+// key map, such as an anchor declared under an unrelated name; line numbers are
+// kept so the entry stays findable.
 func maskDecoderError(err error) error {
 	if err == nil {
 		return nil
@@ -282,6 +297,13 @@ func maskDecoderError(err error) error {
 	masked = invalidMapKeyPattern.ReplaceAllLiteralString(masked, "invalid map key: a key must be a plain scalar")
 	masked = selfAnchorPattern.ReplaceAllStringFunc(masked, func(match string) string {
 		return "anchor '" + maskClientKey(selfAnchorPattern.FindStringSubmatch(match)[1]) + "' value contains itself"
+	})
+	masked = unknownAnchorPattern.ReplaceAllStringFunc(masked, func(match string) string {
+		return "unknown anchor '" + maskClientKey(unknownAnchorPattern.FindStringSubmatch(match)[1]) + "' referenced"
+	})
+	masked = taggedScalarPattern.ReplaceAllStringFunc(masked, func(match string) string {
+		parts := taggedScalarPattern.FindStringSubmatch(match)
+		return "cannot decode " + parts[1] + " `" + maskClientKey(parts[2]) + "` as a"
 	})
 	if masked == message {
 		return err
@@ -658,7 +680,7 @@ func groupLegacyKeys(keys *yaml.Node, provider string) *yaml.Node {
 func NormalizeConfigLayout(data []byte, migrate bool) ([]byte, bool, error) {
 	var doc yaml.Node
 	if err := yaml.Unmarshal(data, &doc); err != nil {
-		return nil, false, err
+		return nil, false, maskDecoderError(err)
 	}
 	if len(doc.Content) == 0 {
 		if !migrate {
@@ -1058,7 +1080,7 @@ func expandConfigAliases(node *yaml.Node) *yaml.Node {
 func ValidateV8Config(data []byte) error {
 	var doc yaml.Node
 	if err := yaml.Unmarshal(data, &doc); err != nil {
-		return err
+		return maskDecoderError(err)
 	}
 	if len(doc.Content) == 0 {
 		return fmt.Errorf("empty config")

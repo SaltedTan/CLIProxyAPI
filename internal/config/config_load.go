@@ -88,7 +88,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 			cfgOptional.NormalizePluginsConfig()
 			return cfgOptional, nil
 		}
-		return nil, fmt.Errorf("failed to parse config file: %w", err)
+		return nil, fmt.Errorf("failed to parse config file: %w", maskDecoderError(err))
 	}
 	if errValidate := validateTrustedProxies(cfg.TrustedProxies); errValidate != nil {
 		return nil, errValidate

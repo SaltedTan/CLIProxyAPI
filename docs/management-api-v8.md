@@ -328,9 +328,11 @@ entry counts as duplicated within one mapping, wherever that mapping appears in
 the document: under a YAML merge key (`<<`), behind an alias, in an anchored
 copy that a direct entry shadows, or in a nested `PATCH` body. An entry set
 directly still overrides the same entry from a merged mapping; an alias key
-counts as the key it resolves to. Entries must be plain scalar keys. Any other
-duplicated or non-scalar mapping key the YAML decoder reports is masked the
-same way, with its line numbers kept, and diagnostic paths mask every segment
+counts as the key it resolves to. Entries must be plain scalar keys: compound
+keys and explicitly tagged keys are rejected. Any key, value or anchor name the
+YAML parser or decoder itself reports (a duplicated or non-scalar key, a tagged
+scalar its tag does not fit, an unknown or self-referencing anchor) is masked
+the same way, with line numbers kept, and diagnostic paths mask every segment
 that is a client key.
 
 When a key's `current_pro_units` reaches its limit, the proxy refuses that key's
@@ -374,7 +376,8 @@ the Claude refusal, the upstream failure is reported, not the 429. Admission is
 decided once per client request: a stream bootstrap retry
 (`streaming.bootstrap-retries`) of a request already admitted proceeds even if
 that request's own first attempt reached the limit, and reports the upstream
-outcome.
+outcome. A model call a plugin makes from inside a request is a request of its
+own and is admitted on its own.
 
 A key is admitted again as soon as its current usage is below the limit: when a
 credential's weekly window resets, when the limit is raised or removed, or when

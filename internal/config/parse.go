@@ -42,7 +42,7 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.CredentialInFlight = DefaultCredentialInFlightConfig()
 
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parse config payload: %w", err)
+		return nil, fmt.Errorf("parse config payload: %w", maskDecoderError(err))
 	}
 	if errValidate := validateTrustedProxies(cfg.TrustedProxies); errValidate != nil {
 		return nil, errValidate

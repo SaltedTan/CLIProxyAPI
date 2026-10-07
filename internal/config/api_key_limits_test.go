@@ -255,3 +255,40 @@ func TestAliasKeysAreComparedByTheirResolvedName(t *testing.T) {
 		}
 	})
 }
+
+// TestTaggedKeysAndUnknownAnchorsAreMasked covers the decoder and parser errors
+// that print a key: an explicitly tagged scalar key whose tag does not fit, and
+// an alias key naming an anchor that does not exist.
+func TestTaggedKeysAndUnknownAnchorsAreMasked(t *testing.T) {
+	const key = "fixture-client-key-1"
+	cases := map[string]string{
+		"tagged key in the limits map":     "config-version: 8\naccess:\n  api-key-limits:\n    !!int " + key + ": 1\n",
+		"tagged key in an unrelated map":   "config-version: 8\nx-unrelated:\n  !!int " + key + ": 1\n",
+		"unknown anchor in the limits map": "config-version: 8\naccess:\n  api-key-limits:\n    *" + key + ": 1\n",
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, errParse := ParseConfigBytes([]byte(raw))
+			if errParse == nil {
+				t.Fatal("ParseConfigBytes accepted the document")
+			}
+			if strings.Contains(errParse.Error(), key) {
+				t.Fatalf("ParseConfigBytes error echoes the key: %q", errParse)
+			}
+			if errValidate := ValidateV8Config([]byte(raw)); errValidate == nil || strings.Contains(errValidate.Error(), key) {
+				t.Fatalf("ValidateV8Config error = %v, want a rejection without the key", errValidate)
+			}
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+				t.Fatal(err)
+			}
+			_, errLoad := LoadConfig(path)
+			if errLoad == nil {
+				t.Fatal("LoadConfig accepted the document")
+			}
+			if strings.Contains(errLoad.Error(), key) {
+				t.Fatalf("LoadConfig error echoes the key: %q", errLoad)
+			}
+		})
+	}
+}

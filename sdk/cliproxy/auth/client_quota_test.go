@@ -550,9 +550,48 @@ func TestRequestAdmissionIsSharedAcrossConductorCalls(t *testing.T) {
 			if err := run(WithRequestAdmission(context.Background())); !errors.As(err, &quota) {
 				t.Fatalf("a new request must be refused: %v", err)
 			}
+			// A nested execution derives its context from the request's but is a request of its own.
+			if err := run(WithRequestAdmission(ctx)); !errors.As(err, &quota) {
+				t.Fatalf("a new scope on a scoped context must be admitted on its own: %v", err)
+			}
 			if err := run(context.Background()); !errors.As(err, &quota) {
 				t.Fatalf("a call without a scope must be refused: %v", err)
 			}
 		})
+	}
+}
+
+// TestAdmissionCacheIsSafeForConcurrentCallsOnOneScope runs several conductor
+// calls concurrently with one request scope; the shared cache must stay
+// consistent (the race detector guards the data).
+func TestAdmissionCacheIsSafeForConcurrentCallsOnOneScope(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	manager.SetRetryConfig(0, 0, 0)
+	const model = "admission-scope-concurrent"
+	claude := &admissionTestExecutor{identifier: "claude"}
+	manager.RegisterExecutor(claude)
+	registerAdmissionAuth(t, manager, "admission-scope-concurrent-claude", "claude", model)
+	policy := &admissionTestPolicy{refuse: map[string]*ClientQuotaError{}}
+	manager.SetAdmissionPolicy(policy)
+	ctx := WithRequestAdmission(context.Background())
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := manager.Execute(ctx, []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("Execute() error = %v", err)
+		}
+	}
+	if got := len(claude.ids("execute")); got != 8 {
+		t.Fatalf("upstream calls = %d, want 8", got)
 	}
 }

@@ -24,7 +24,7 @@ func SaveConfigPreserveComments(configFile string, cfg *Config, migrateV8 ...boo
 
 	var original yaml.Node
 	if err = yaml.Unmarshal(data, &original); err != nil {
-		return err
+		return maskDecoderError(err)
 	}
 	if original.Kind != yaml.DocumentNode || len(original.Content) == 0 {
 		return fmt.Errorf("invalid yaml document structure")
@@ -135,7 +135,7 @@ func SaveConfigPreserveCommentsUpdateNestedScalar(configFile string, path []stri
 	}
 	var root yaml.Node
 	if err = yaml.Unmarshal(data, &root); err != nil {
-		return err
+		return maskDecoderError(err)
 	}
 	if root.Kind != yaml.DocumentNode || len(root.Content) == 0 {
 		return fmt.Errorf("invalid yaml document structure")

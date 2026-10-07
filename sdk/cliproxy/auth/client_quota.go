@@ -142,8 +142,11 @@ func retryAfterSeconds(retryAfter time.Duration) int64 {
 // retry rounds. It also remembers whether the request reached an upstream, so a
 // refusal is returned, and recorded with the policy, only for requests that never did.
 type admissionCache struct {
-	holder    *admissionPolicyHolder
-	policy    AdmissionPolicy
+	holder *admissionPolicyHolder
+	policy AdmissionPolicy
+	// mu guards the fields below: calls sharing a request scope are normally
+	// sequential, but the cache must stay consistent if a caller overlaps them.
+	mu        sync.Mutex
 	decisions map[string]error
 	refusal   error
 	attempted bool
@@ -162,14 +165,13 @@ type admissionScope struct {
 type admissionScopeKey struct{}
 
 // WithRequestAdmission returns a context whose conductor calls share one
-// admission decision. Handlers call it once per client request; a context that
-// already carries a scope is returned unchanged.
+// admission decision. Handlers call it once per request they execute. It always
+// starts a new scope: a nested execution derives its context from the request
+// that triggered it, yet is a request of its own and must not inherit that
+// request's decision or its upstream attempt.
 func WithRequestAdmission(ctx context.Context) context.Context {
 	if ctx == nil {
 		ctx = context.Background()
-	}
-	if scope, ok := ctx.Value(admissionScopeKey{}).(*admissionScope); ok && scope != nil {
-		return ctx
 	}
 	return context.WithValue(ctx, admissionScopeKey{}, &admissionScope{})
 }
@@ -207,10 +209,18 @@ func (c *admissionCache) admit(ctx context.Context, auth *Auth) error {
 		return nil
 	}
 	provider := canonicalSchedulingProvider(auth.Provider)
-	if decision, ok := c.decisions[provider]; ok {
+	c.mu.Lock()
+	decision, ok := c.decisions[provider]
+	c.mu.Unlock()
+	if ok {
 		return decision
 	}
-	decision := c.policy.Admit(ctx, auth)
+	decision = c.policy.Admit(ctx, auth)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if earlier, raced := c.decisions[provider]; raced {
+		return earlier
+	}
 	c.decisions[provider] = decision
 	if decision != nil && c.refusal == nil {
 		c.refusal = decision
@@ -221,23 +231,34 @@ func (c *admissionCache) admit(ctx context.Context, auth *Auth) error {
 // markAttempted notes that the request went on to an upstream attempt. From then on
 // the outcome of that attempt, not a refusal, is the request's result.
 func (c *admissionCache) markAttempted() {
-	if c != nil {
-		c.attempted = true
+	if c == nil {
+		return
 	}
+	c.mu.Lock()
+	c.attempted = true
+	c.mu.Unlock()
 }
 
 // finalRefusal returns the request's refusal when every candidate was refused and no
 // upstream attempt was made in any round, recording it with the policy exactly once.
 // It returns nil otherwise, so an earlier upstream outcome is reported instead.
 func (c *admissionCache) finalRefusal(ctx context.Context) error {
-	if c == nil || c.refusal == nil || c.attempted {
+	if c == nil {
 		return nil
 	}
-	if !c.recorded {
-		c.recorded = true
+	c.mu.Lock()
+	if c.refusal == nil || c.attempted {
+		c.mu.Unlock()
+		return nil
+	}
+	refusal := c.refusal
+	record := !c.recorded
+	c.recorded = true
+	c.mu.Unlock()
+	if record {
 		if recorder, ok := c.policy.(RefusalRecorder); ok {
-			recorder.RecordRefusal(ctx, c.refusal)
+			recorder.RecordRefusal(ctx, refusal)
 		}
 	}
-	return c.refusal
+	return refusal
 }
