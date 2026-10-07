@@ -42,6 +42,8 @@ const (
 // claudeShare is usage of one credential's weekly limit. Fractions are of that
 // credential's limit. Usage attributed while the plan allowance was known is converted
 // to Claude Pro units at that time; the rest stays unpriced and is converted at read time.
+// The Window values follow the credential's own weekly window and are read for the
+// credential's unattributed usage; a key's current usage is kept in its keyWindow.
 type claudeShare struct {
 	// Epoch is the credential window the Window values belong to.
 	Epoch          int64   `json:"epoch"`
@@ -225,7 +227,7 @@ func (t *Tracker) applyClaudeObservationLocked(authID string, credential *claude
 			}
 		}
 		credential.startEpoch(observation.resetAt, now)
-		t.attributeClaudeLocked(authID, credential, observation.utilization, plan)
+		t.attributeClaudeLocked(authID, credential, observation.utilization, plan, now)
 		credential.setUtilization(observation.utilization, now)
 	case observation.resetAt.Before(credential.ResetAt.Add(-claudeResetSlack)):
 		if !causallyNewer || !observation.resetAt.After(now) {
@@ -239,7 +241,7 @@ func (t *Tracker) applyClaudeObservationLocked(authID string, credential *claude
 		delta := observation.utilization - credential.Utilization
 		switch {
 		case delta > 0:
-			t.attributeClaudeLocked(authID, credential, delta, plan)
+			t.attributeClaudeLocked(authID, credential, delta, plan, now)
 			credential.setUtilization(observation.utilization, now)
 		case -delta >= claudeMinDrop && causallyNewer:
 			// Usage was reset or rescaled (for example a plan change): start a new
@@ -266,7 +268,11 @@ func (c *claudeCredential) setUtilization(utilization float64, now time.Time) {
 	c.UtilizationSetAt = now
 }
 
-func (t *Tracker) attributeClaudeLocked(authID string, credential *claudeCredential, amount float64, plan *CredentialInfo) {
+// attributeClaudeLocked splits an observed increase between the keys with pending
+// weight on the credential. Each key's share also counts toward its allowance window
+// when that window is open at now; usage attributed after the window ended belongs to
+// a period that is over and is kept in the totals only. t.mu must be held.
+func (t *Tracker) attributeClaudeLocked(authID string, credential *claudeCredential, amount float64, plan *CredentialInfo, now time.Time) {
 	if amount <= 0 {
 		return
 	}
@@ -301,6 +307,9 @@ func (t *Tracker) attributeClaudeLocked(authID string, credential *claudeCredent
 			state.Claude[authID] = keyShare
 		}
 		keyShare.add(share, credential.Epoch, info, priced)
+		if state.Window.open(now) {
+			state.Window.add(authID, share, info, priced)
+		}
 	}
 	credential.Pending = nil
 }

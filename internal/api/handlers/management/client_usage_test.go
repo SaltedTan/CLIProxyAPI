@@ -152,6 +152,38 @@ func TestClientUsageEndpoints(t *testing.T) {
 		t.Fatalf("response = %s", body)
 	}
 
+	// Resetting the window zeroes current usage and re-admits the key, keeping its history.
+	resetWindow := func(query string) int {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/v8/management/observability/usage/clients/window/reset"+query, nil)
+		h.ResetClientUsageWindow(ctx)
+		return rec.Code
+	}
+	if code := resetWindow(""); code != http.StatusBadRequest {
+		t.Fatalf("POST window reset without id or all status = %d, want 400", code)
+	}
+	if code := resetWindow("?id=unknown"); code != http.StatusNotFound {
+		t.Fatalf("POST window reset unknown id status = %d, want 404", code)
+	}
+	if code := resetWindow("?id=" + laptop.ID); code != http.StatusOK {
+		t.Fatalf("POST window reset status = %d, want 200", code)
+	}
+	laptop = get().Keys[0]
+	if laptop.Totals.Requests != 2 || laptop.Totals.Blocked != 1 || len(laptop.Daily) != 1 || laptop.Claude == nil || laptop.Claude.CurrentProUnits != 0 || laptop.Claude.TotalProUnits != 0.1 || laptop.Claude.LimitReached || laptop.Claude.WindowResetsAt != nil || laptop.Claude.LimitResetsAt != nil {
+		t.Fatalf("laptop after window reset = %+v claude = %+v", laptop.Totals, laptop.Claude)
+	}
+	if len(laptop.Claude.Credentials) != 1 || laptop.Claude.Credentials[0].CurrentProUnits != 0 || laptop.Claude.Credentials[0].TotalProUnits != 0.1 {
+		t.Fatalf("laptop credentials after window reset = %+v", laptop.Claude.Credentials)
+	}
+	if errAdmit := h.clientUsage.Admit(requestCtx, &coreauth.Auth{ID: "claude-max", Provider: "claude"}); errAdmit != nil {
+		t.Fatalf("a key whose window was reset must be re-admitted: %v", errAdmit)
+	}
+	if code := resetWindow("?all=true"); code != http.StatusOK {
+		t.Fatalf("POST window reset all status = %d, want 200", code)
+	}
+
 	if code := del("?id=unknown"); code != http.StatusNotFound {
 		t.Fatalf("DELETE unknown id status = %d, want 404", code)
 	}

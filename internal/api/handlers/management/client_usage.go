@@ -52,6 +52,17 @@ func (h *Handler) GetClientUsage(c *gin.Context) {
 // DeleteClientUsage resets the usage of one client key (?id=<key id>) or of every key
 // (?all=true).
 func (h *Handler) DeleteClientUsage(c *gin.Context) {
+	h.resetClientUsage(c, func(tracker *clientusage.Tracker, id string) bool { return tracker.Reset(id) })
+}
+
+// ResetClientUsageWindow ends the current Claude allowance window of one client key
+// (?id=<key id>) or of every key (?all=true), so the key's current usage is zero and
+// its next Claude request opens a fresh window. Totals and daily history are kept.
+func (h *Handler) ResetClientUsageWindow(c *gin.Context) {
+	h.resetClientUsage(c, func(tracker *clientusage.Tracker, id string) bool { return tracker.ResetWindow(id) })
+}
+
+func (h *Handler) resetClientUsage(c *gin.Context, reset func(tracker *clientusage.Tracker, id string) bool) {
 	if h == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler unavailable"})
 		return
@@ -61,7 +72,7 @@ func (h *Handler) DeleteClientUsage(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "id or all=true is required"})
 		return
 	}
-	if !h.clientUsageTracker().Reset(id) {
+	if !reset(h.clientUsageTracker(), id) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "client usage not found"})
 		return
 	}

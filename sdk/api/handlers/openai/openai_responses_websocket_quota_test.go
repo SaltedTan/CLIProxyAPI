@@ -76,7 +76,7 @@ func (e *websocketQuotaExecutor) callCount() int {
 func websocketQuotaRefusal(resetIn time.Duration) *coreauth.ClientQuotaError {
 	return &coreauth.ClientQuotaError{
 		Code:    coreauth.ErrorCodeClientKeyLimitReached,
-		Message: "client API key Claude allowance reached: 1.52 of 1.5 Pro units used this week; resets in 1h30m",
+		Message: "client API key Claude allowance reached: 1.52 of 1.5 Pro units used in the current 7-day window; resets in 1h30m",
 		ResetIn: resetIn,
 	}
 }

@@ -77,6 +77,8 @@ type keyState struct {
 	FirstUsedAt time.Time               `json:"first_used_at"`
 	LastUsedAt  time.Time               `json:"last_used_at"`
 	Claude      map[string]*claudeShare `json:"claude,omitempty"`
+	// Window is the key's current Claude allowance window; nil when none was opened.
+	Window *keyWindow `json:"window,omitempty"`
 }
 
 func (k *keyState) modelCounters(model string) *Counters {
@@ -228,6 +230,13 @@ func (t *Tracker) HandleUsage(_ context.Context, record coreusage.Record) {
 	}
 	// Untracked keys still take part so their usage is not charged to other keys.
 	t.observeClaudeLocked(keyID, record, detail.TokenBreakdown, record.RequestedAt, now, plan)
+	// A Claude request opens the key's allowance window when none is running. It
+	// does so after the increase its response carries is attributed: that increase
+	// is usage from before the request started, which belongs to the period that
+	// ended, not to the window this request opens.
+	if state != nil && claudeAuthID(record) != "" {
+		state.openWindow(at)
+	}
 	t.dirty = true
 }
 
@@ -256,6 +265,33 @@ func (t *Tracker) Reset(keyID string) bool {
 	}
 	// Pending weight stays so the key's last usage is not charged to other keys.
 	delete(t.keys, keyID)
+	t.dirty = true
+	return true
+}
+
+// ResetWindow ends the current Claude allowance window of one key ID, or of every
+// key when keyID is empty: the key's current usage is zero and its next Claude
+// request opens a fresh window. Totals, daily history, per-credential totals and
+// credential baselines are kept. It reports whether the key is known.
+func (t *Tracker) ResetWindow(keyID string) bool {
+	if t == nil {
+		return false
+	}
+	keyID = strings.TrimSpace(keyID)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if keyID == "" {
+		for _, state := range t.keys {
+			state.Window = nil
+		}
+		t.dirty = true
+		return true
+	}
+	state, ok := t.keys[keyID]
+	if !ok {
+		return false
+	}
+	state.Window = nil
 	t.dirty = true
 	return true
 }

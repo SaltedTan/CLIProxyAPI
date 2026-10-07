@@ -14,17 +14,19 @@ import (
 )
 
 // Per client key Claude allowance. Operators cap each key's Claude usage in Pro units
-// per weekly window (access.api-key-limits). The tracker compares the key's current
-// Pro units, attributed from the weekly utilization headers, with that cap before a
-// Claude credential is used, and refuses the request with a 429 once the cap is
-// reached. The comparison uses the same arithmetic as the usage report so what the
-// dashboard shows is what is enforced. The attribution is an estimate, requests in
-// flight when the cap is reached still complete, and nothing is enforced in Home mode.
+// per 7-day window (access.api-key-limits). The window is the key's own (see
+// keyWindow): it opens at the key's first Claude request and ends 7 days later. The
+// tracker compares the Pro units attributed to the key inside that window, from the
+// weekly utilization headers, with the cap before a Claude credential is used, and
+// refuses the request with a 429 once the cap is reached. The comparison uses the
+// same arithmetic as the usage report so what the dashboard shows is what is
+// enforced. The attribution is an estimate, requests in flight when the cap is
+// reached still complete, and nothing is enforced in Home mode.
 
 // clientQuotaUnknownReset is the recovery hint when no open window is known.
 const clientQuotaUnknownReset = time.Minute
 
-// SetLimits replaces the Claude allowance per client key, in Pro units per weekly
+// SetLimits replaces the Claude allowance per client key, in Pro units per 7-day
 // window, keyed by full API key or key ID. Keys are trimmed; negative and non-finite
 // entries are dropped. A 0 means no limit and is kept, because a full-key 0 takes
 // precedence over an ID entry for the same key. Limits take effect on the next
@@ -162,12 +164,12 @@ func isKeyID(value string) bool {
 }
 
 // Admit implements coreauth.AdmissionPolicy. Claude credentials (OAuth and API key
-// alike) are refused for a client key whose current Pro units reached its limit;
-// other providers and keys without a limit are always admitted. The refusal is a
-// *coreauth.ClientQuotaError whose ResetIn is the time to the earliest open-window
-// reset among the credentials the key used (one minute when unknown). Deciding does
-// not count: the conductor may still serve the request through another provider and
-// calls RecordRefusal only when it returns the refusal to the client.
+// alike) are refused for a client key whose Pro units in its open allowance window
+// reached its limit; other providers and keys without a limit are always admitted,
+// as is a key with no open window. The refusal is a *coreauth.ClientQuotaError whose
+// ResetIn is the time to the end of the key's window (one minute when unknown).
+// Deciding does not count: the conductor may still serve the request through another
+// provider and calls RecordRefusal only when it returns the refusal to the client.
 func (t *Tracker) Admit(ctx context.Context, auth *coreauth.Auth) error {
 	if t == nil || auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
 		return nil
@@ -186,7 +188,7 @@ func (t *Tracker) Admit(ctx context.Context, auth *coreauth.Auth) error {
 	var current float64
 	var resetsAt time.Time
 	state := t.keys[keyID]
-	if state != nil && len(state.Claude) > 0 {
+	if state != nil && state.Window.open(now) {
 		_, current, resetsAt = t.claudeUsageLocked(state, now, t.credentialRefLocked(t.resolve))
 	}
 	t.mu.Unlock()
@@ -209,7 +211,7 @@ func (t *Tracker) Admit(ctx context.Context, auth *coreauth.Auth) error {
 	}
 	return &coreauth.ClientQuotaError{
 		Code:    coreauth.ErrorCodeClientKeyLimitReached,
-		Message: fmt.Sprintf("client API key Claude allowance reached: %s of %s Pro units used this week; resets in %s", formatProUnits(current), formatProUnits(limit), formatResetDuration(resetIn)),
+		Message: fmt.Sprintf("client API key Claude allowance reached: %s of %s Pro units used in the current 7-day window; resets in %s", formatProUnits(current), formatProUnits(limit), formatResetDuration(resetIn)),
 		ResetIn: resetIn,
 	}
 }

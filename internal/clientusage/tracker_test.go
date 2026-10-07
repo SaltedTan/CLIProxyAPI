@@ -198,7 +198,7 @@ func TestClaudeWeeklyUsageIsAttributedByWeightedTokens(t *testing.T) {
 	approx(t, "key B fraction", keyB.Credentials[0].CurrentFraction, 0.08*3001/4002)
 	approx(t, "key A pro units", keyA.CurrentProUnits, 0.8*1001/4002)
 	approx(t, "key B total pro units", keyB.TotalProUnits, 0.8*3001/4002)
-	if keyA.Credentials[0].Plan != PlanMax20x || keyA.Credentials[0].WindowResetsAt == nil {
+	if keyA.Credentials[0].Plan != PlanMax20x || keyA.WindowResetsAt == nil {
 		t.Fatalf("credential ref = %+v", keyA.Credentials[0])
 	}
 	if len(snapshot.ClaudeCredentials) != 1 {
@@ -251,12 +251,13 @@ func TestClaudeWeeklyUsageOrderingAndUnattributedIncreases(t *testing.T) {
 	approx(t, "utilization after ignored drops", tracker.Snapshot(SnapshotOptions{}).ClaudeCredentials[0].WeeklyUtilization, 0.34)
 
 	// A lower value from a request started after the last reading is a real drop
-	// (limits reset or rescaled): it starts a new window epoch from that baseline.
+	// (limits reset or rescaled): it starts a new credential epoch from that baseline.
+	// The key's usage keeps accumulating in its own window across the drop.
 	send(15, 16, claudeObs{0.05, resetAt})
 	send(17, 18, claudeObs{0.12, resetAt})
 	snapshot = tracker.Snapshot(SnapshotOptions{})
 	keyA = findKey(t, snapshot, KeyID("key-a")).Claude
-	approx(t, "key A current after drop", keyA.Credentials[0].CurrentFraction, 0.07)
+	approx(t, "key A current after drop", keyA.Credentials[0].CurrentFraction, 0.17)
 	approx(t, "key A total after drop", keyA.Credentials[0].TotalFraction, 0.17)
 	approx(t, "utilization after drop", snapshot.ClaudeCredentials[0].WeeklyUtilization, 0.12)
 }
@@ -387,12 +388,16 @@ func TestClaudeWeeklyWindowRollover(t *testing.T) {
 	send("key-a", testNow, claudeObs{0.50, firstReset})
 	send("key-a", testNow.Add(time.Minute), claudeObs{0.60, firstReset})
 
-	// After the reset passes, the open window is empty until a new observation.
+	// After the credential's reset passes its window is closed, while the key's own
+	// window, opened by its first request, still holds the key's usage.
 	now = firstReset.Add(time.Minute)
 	snapshot := tracker.Snapshot(SnapshotOptions{})
 	keyA := findKey(t, snapshot, KeyID("key-a")).Claude
-	approx(t, "current after reset", keyA.CurrentProUnits, 0)
-	approx(t, "total after reset", keyA.TotalProUnits, 0.10)
+	approx(t, "current after the credential reset", keyA.CurrentProUnits, 0.10)
+	approx(t, "total after the credential reset", keyA.TotalProUnits, 0.10)
+	if keyA.WindowStartedAt == nil || !keyA.WindowStartedAt.Equal(testNow) || !keyA.WindowResetsAt.Equal(testNow.Add(claudeWeeklyWindow)) {
+		t.Fatalf("key window = %v..%v, want the seven days from the first request", keyA.WindowStartedAt, keyA.WindowResetsAt)
+	}
 	if snapshot.ClaudeCredentials[0].WindowResetsAt != nil {
 		t.Fatalf("expired window must not report a reset time")
 	}
@@ -536,6 +541,9 @@ func TestTrackerPersistsAcrossRestart(t *testing.T) {
 		t.Fatalf("totals after restart = %+v", key.Totals)
 	}
 	approx(t, "fraction after restart", key.Claude.Credentials[0].CurrentFraction, 0.10)
+	if key.Claude.WindowStartedAt == nil || !key.Claude.WindowStartedAt.Equal(testNow) {
+		t.Fatalf("the key's window must survive a restart: %+v", key.Claude)
+	}
 	if snapshot.Since == nil || !snapshot.Since.Equal(testNow) {
 		t.Fatalf("since = %v, want %v", snapshot.Since, testNow)
 	}

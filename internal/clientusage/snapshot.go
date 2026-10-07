@@ -58,12 +58,15 @@ type DailyUsage struct {
 }
 
 // KeyClaudeUsage is the Claude subscription usage attributed to one key, in Claude
-// Pro units: 1.0 is one full weekly allowance of a Claude Pro plan. The limit
-// fields are set when the key has a configured allowance; LimitResetsAt is the
-// earliest window reset among the credentials the key currently uses.
+// Pro units: 1.0 is one full weekly allowance of a Claude Pro plan. Current usage
+// is the usage inside the key's own allowance window (see keyWindow), whose bounds
+// are WindowStartedAt and WindowResetsAt while it is open. The limit fields are set
+// when the key has a configured allowance; LimitResetsAt equals WindowResetsAt.
 type KeyClaudeUsage struct {
 	CurrentProUnits   float64                    `json:"current_pro_units"`
 	TotalProUnits     float64                    `json:"total_pro_units"`
+	WindowStartedAt   *time.Time                 `json:"window_started_at,omitempty"`
+	WindowResetsAt    *time.Time                 `json:"window_resets_at,omitempty"`
 	LimitProUnits     *float64                   `json:"limit_pro_units,omitempty"`
 	RemainingProUnits *float64                   `json:"remaining_pro_units,omitempty"`
 	LimitReached      bool                       `json:"limit_reached"`
@@ -81,17 +84,16 @@ type ClaudeCredentialRef struct {
 	PlanSource   string  `json:"plan_source"`
 }
 
-// KeyClaudeCredentialUsage is one key's share of one credential's weekly limit.
-// Fractions are of that credential's own weekly limit. Pro units use the plan at the
-// time the usage was attributed, or the current plan for usage attributed while the
-// plan was unknown.
+// KeyClaudeCredentialUsage is one key's usage of one credential: Current inside the
+// key's allowance window, Total since tracking began. Fractions are of that
+// credential's own weekly limit. Pro units use the plan at the time the usage was
+// attributed, or the current plan for usage attributed while the plan was unknown.
 type KeyClaudeCredentialUsage struct {
 	ClaudeCredentialRef
-	WindowResetsAt  *time.Time `json:"window_resets_at,omitempty"`
-	CurrentFraction float64    `json:"current_fraction"`
-	CurrentProUnits float64    `json:"current_pro_units"`
-	TotalFraction   float64    `json:"total_fraction"`
-	TotalProUnits   float64    `json:"total_pro_units"`
+	CurrentFraction float64 `json:"current_fraction"`
+	CurrentProUnits float64 `json:"current_pro_units"`
+	TotalFraction   float64 `json:"total_fraction"`
+	TotalProUnits   float64 `json:"total_pro_units"`
 }
 
 // ClaudeCredentialUsage is the latest weekly window state of one Claude credential.
@@ -256,7 +258,7 @@ func (t *Tracker) keyUsageLocked(id string, now time.Time, credentialRef func(st
 	for _, date := range dates {
 		usage.Daily = append(usage.Daily, DailyUsage{Date: date, Counters: *state.Daily[date]})
 	}
-	if len(state.Claude) == 0 && limit <= 0 {
+	if len(state.Claude) == 0 && limit <= 0 && !state.Window.open(now) {
 		return usage
 	}
 	claude, current, _ := t.claudeUsageLocked(state, now, credentialRef)
@@ -266,9 +268,9 @@ func (t *Tracker) keyUsageLocked(id string, now time.Time, credentialRef func(st
 }
 
 // claudeUsageLocked renders the Claude usage of one key. It also returns the
-// unrounded sum of current-window Pro units, which admission compares with the
-// key's limit, and the earliest open-window reset among the credentials with
-// current usage (zero when none). t.mu must be held.
+// unrounded Pro units used in the key's open allowance window, which admission
+// compares with the key's limit, and when that window ends (zero when none is
+// open). t.mu must be held.
 func (t *Tracker) claudeUsageLocked(state *keyState, now time.Time, credentialRef func(string) ClaudeCredentialRef) (*KeyClaudeUsage, float64, time.Time) {
 	claude := &KeyClaudeUsage{Credentials: make([]KeyClaudeCredentialUsage, 0, len(state.Claude))}
 	authIDs := make([]string, 0, len(state.Claude))
@@ -276,21 +278,24 @@ func (t *Tracker) claudeUsageLocked(state *keyState, now time.Time, credentialRe
 		authIDs = append(authIDs, authID)
 	}
 	sort.Strings(authIDs)
-	var current, total float64
+	var window *keyWindow
 	var resetsAt time.Time
+	if state.Window.open(now) {
+		window = state.Window
+		resetsAt = window.EndsAt
+		claude.WindowStartedAt = optionalTime(window.StartedAt)
+		claude.WindowResetsAt = optionalTime(window.EndsAt)
+		claude.LimitResetsAt = optionalTime(window.EndsAt)
+	}
+	var current, total float64
 	for _, authID := range authIDs {
 		share := state.Claude[authID]
 		entry := KeyClaudeCredentialUsage{ClaudeCredentialRef: credentialRef(authID)}
 		entry.TotalFraction = share.Total
 		entry.TotalProUnits = share.TotalProUnits + share.TotalUnpriced*entry.PlanProUnits
-		if credential := t.claude[authID]; credential.windowOpen(now) {
-			window := credential.currentShare(*share, now)
-			entry.CurrentFraction = window.Window
-			entry.CurrentProUnits = window.WindowProUnits + window.WindowUnpriced*entry.PlanProUnits
-			entry.WindowResetsAt = optionalTime(credential.ResetAt)
-			if window.Window > 0 && (resetsAt.IsZero() || credential.ResetAt.Before(resetsAt)) {
-				resetsAt = credential.ResetAt
-			}
+		if inWindow := window.share(authID); inWindow.Fraction > 0 {
+			entry.CurrentFraction = inWindow.Fraction
+			entry.CurrentProUnits = inWindow.proUnits(entry.PlanProUnits)
 		}
 		current += entry.CurrentProUnits
 		total += entry.TotalProUnits
@@ -302,7 +307,6 @@ func (t *Tracker) claudeUsageLocked(state *keyState, now time.Time, credentialRe
 	}
 	claude.CurrentProUnits = roundFraction(current)
 	claude.TotalProUnits = roundFraction(total)
-	claude.LimitResetsAt = optionalTime(resetsAt)
 	return claude, current, resetsAt
 }
 

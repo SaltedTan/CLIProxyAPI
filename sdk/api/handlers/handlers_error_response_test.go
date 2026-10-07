@@ -77,7 +77,7 @@ func TestWriteErrorResponseClientQuotaSetsRetryAfterWithoutPassthrough(t *testin
 
 	quota := &coreauth.ClientQuotaError{
 		Code:    coreauth.ErrorCodeClientKeyLimitReached,
-		Message: "client API key Claude allowance reached: 1.50 of 1.50 Pro units used this week; resets in 2d3h",
+		Message: "client API key Claude allowance reached: 1.50 of 1.50 Pro units used in the current 7-day window; resets in 2d3h",
 		ResetIn: 2*24*time.Hour + 3*time.Hour,
 	}
 	msg := executionErrorMessage(quota)

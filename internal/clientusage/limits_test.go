@@ -50,6 +50,12 @@ var claudeAuth = &coreauth.Auth{ID: "claude-1", Provider: "claude"}
 // current usage on claude-1 (plan unknown, so fractions are Pro units) in a window
 // that resets at resetAt. The utilizations are binary fractions so the attributed
 // amount is exact and "at the limit" can be tested.
+// testWindowEnd is when the allowance window limitedKeyTracker opens ends: its
+// first request starts one second after testNow.
+var testWindowEnd = testNow.Add(time.Second).Add(claudeWeeklyWindow)
+
+// limitedKeyTracker gives key-a 0.25 Pro units on claude-1 and returns the
+// credential's weekly reset, three days out, which the key's window does not follow.
 func limitedKeyTracker(t *testing.T, now *time.Time) (*Tracker, time.Time) {
 	t.Helper()
 	tracker := newTestTracker(now)
@@ -138,10 +144,10 @@ func TestAdmitComparesCurrentProUnitsWithLimit(t *testing.T) {
 	if quota.StatusCode() != 429 || quota.Code != coreauth.ErrorCodeClientKeyLimitReached {
 		t.Fatalf("quota error = %+v", quota)
 	}
-	if quota.ResetIn != resetAt.Sub(now) {
-		t.Fatalf("reset in = %s, want %s", quota.ResetIn, resetAt.Sub(now))
+	if quota.ResetIn != testWindowEnd.Sub(now) {
+		t.Fatalf("reset in = %s, want the end of the key's window %s", quota.ResetIn, testWindowEnd.Sub(now))
 	}
-	want := "client API key Claude allowance reached: 0.25 of 0.25 Pro units used this week; resets in 2d23h"
+	want := "client API key Claude allowance reached: 0.25 of 0.25 Pro units used in the current 7-day window; resets in 6d23h"
 	if quota.Error() != want {
 		t.Fatalf("message = %q, want %q", quota.Error(), want)
 	}
@@ -164,9 +170,13 @@ func TestAdmitComparesCurrentProUnitsWithLimit(t *testing.T) {
 	if key.Claude.RemainingProUnits == nil || *key.Claude.RemainingProUnits != 0 {
 		t.Fatalf("remaining = %v, want 0", key.Claude.RemainingProUnits)
 	}
-	if key.Claude.LimitResetsAt == nil || !key.Claude.LimitResetsAt.Equal(resetAt) {
-		t.Fatalf("limit resets at = %v, want %v", key.Claude.LimitResetsAt, resetAt)
+	if key.Claude.LimitResetsAt == nil || !key.Claude.LimitResetsAt.Equal(testWindowEnd) || !key.Claude.WindowResetsAt.Equal(testWindowEnd) {
+		t.Fatalf("limit resets at = %v, want %v", key.Claude.LimitResetsAt, testWindowEnd)
 	}
+	if key.Claude.WindowStartedAt == nil || !key.Claude.WindowStartedAt.Equal(testNow.Add(time.Second)) {
+		t.Fatalf("window started at = %v, want the first request", key.Claude.WindowStartedAt)
+	}
+	_ = resetAt
 
 	// Refusals on another day land in that day's bucket only.
 	now = testNow.Add(24 * time.Hour)
@@ -255,25 +265,41 @@ func TestAdmitReadmitsAfterWindowResetAndUsageReset(t *testing.T) {
 	ctx := requestContext("key-a")
 	refuse(t, tracker, ctx, claudeAuth)
 
-	// Once the weekly window passes, the open window is empty.
+	// The credential's weekly reset passes; the key's own window is still running.
 	now = resetAt.Add(time.Minute)
+	refuse(t, tracker, ctx, claudeAuth)
+
+	// Once the key's window ends there is no open window, so nothing counts.
+	now = testWindowEnd
 	if errAdmit := tracker.Admit(ctx, claudeAuth); errAdmit != nil {
-		t.Fatalf("an expired window must re-admit: %v", errAdmit)
+		t.Fatalf("an ended window must re-admit: %v", errAdmit)
 	}
-	if key := findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a")); key.Claude.LimitReached || key.Claude.LimitResetsAt != nil || *key.Claude.RemainingProUnits != 0.125 {
-		t.Fatalf("claude after window reset = %+v", key.Claude)
+	key := findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a"))
+	if key.Claude.LimitReached || key.Claude.CurrentProUnits != 0 || key.Claude.LimitResetsAt != nil || key.Claude.WindowStartedAt != nil || key.Claude.WindowResetsAt != nil || *key.Claude.RemainingProUnits != 0.125 {
+		t.Fatalf("claude after the window ended = %+v", key.Claude)
 	}
-	// Usage in the new window counts from zero and reaches the limit again.
+	if key.Claude.TotalProUnits != 0.25 || len(key.Claude.Credentials) != 1 || key.Claude.Credentials[0].CurrentProUnits != 0 || key.Claude.Credentials[0].TotalProUnits != 0.25 {
+		t.Fatalf("totals after the window ended = %+v", key.Claude)
+	}
+
+	// The next request opens the next window from its own start, not from the end
+	// of the last one, and usage in it counts from zero.
+	now = testWindowEnd.Add(3 * time.Hour)
 	seq := &claudeSeq{tracker: tracker, now: &now}
 	nextReset := resetAt.Add(claudeWeeklyWindow)
 	seq.send("key-a", "claude-1", claudeObs{0.0625, nextReset}, breakdown(100, 0, 0, 0, 0))
+	windowStart := testWindowEnd.Add(3*time.Hour + time.Second)
+	key = findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a"))
+	if key.Claude.WindowStartedAt == nil || !key.Claude.WindowStartedAt.Equal(windowStart) || !key.Claude.WindowResetsAt.Equal(windowStart.Add(claudeWeeklyWindow)) {
+		t.Fatalf("next window = %v..%v, want %v + 7d", key.Claude.WindowStartedAt, key.Claude.WindowResetsAt, windowStart)
+	}
 	if errAdmit := tracker.Admit(ctx, claudeAuth); errAdmit != nil {
 		t.Fatalf("below the limit in the new window must admit: %v", errAdmit)
 	}
 	seq.send("key-a", "claude-1", claudeObs{0.1875, nextReset}, breakdown(100, 0, 0, 0, 0))
 	quota := refuse(t, tracker, ctx, claudeAuth)
-	if quota.ResetIn != nextReset.Sub(now) {
-		t.Fatalf("reset in = %s, want the new window %s", quota.ResetIn, nextReset.Sub(now))
+	if want := windowStart.Add(claudeWeeklyWindow).Sub(now); quota.ResetIn != want {
+		t.Fatalf("reset in = %s, want the new window %s", quota.ResetIn, want)
 	}
 
 	// The usage reset override clears the key and re-admits it.
@@ -283,13 +309,92 @@ func TestAdmitReadmitsAfterWindowResetAndUsageReset(t *testing.T) {
 	if errAdmit := tracker.Admit(ctx, claudeAuth); errAdmit != nil {
 		t.Fatalf("a reset key must be admitted: %v", errAdmit)
 	}
-	key := findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a"))
+	key = findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a"))
 	if key.Totals.Blocked != 0 || key.Claude == nil || key.Claude.LimitReached || len(key.Claude.Credentials) != 0 {
 		t.Fatalf("reset key = %+v claude = %+v", key.Totals, key.Claude)
 	}
 }
 
-func TestAdmitUsesTheEarliestResetOfTheCredentialsInUse(t *testing.T) {
+func TestResetWindowKeepsHistory(t *testing.T) {
+	now := testNow
+	tracker, resetAt := limitedKeyTracker(t, &now)
+	tracker.SetLimits(map[string]float64{"key-a": 0.25})
+	ctx := requestContext("key-a")
+	refuse(t, tracker, ctx, claudeAuth)
+
+	if tracker.ResetWindow(KeyID("key-unknown")) {
+		t.Fatal("an unknown key must not be found")
+	}
+	if !tracker.ResetWindow(KeyID("key-a")) {
+		t.Fatal("reset window must find the key")
+	}
+	if errAdmit := tracker.Admit(ctx, claudeAuth); errAdmit != nil {
+		t.Fatalf("a key whose window was reset must be admitted: %v", errAdmit)
+	}
+	key := findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a"))
+	if key.Totals.Requests != 2 || key.Totals.Blocked != 1 || len(key.Daily) != 1 || key.Daily[0].Requests != 2 {
+		t.Fatalf("history must be kept: totals = %+v daily = %+v", key.Totals, key.Daily)
+	}
+	if key.Claude == nil || key.Claude.CurrentProUnits != 0 || key.Claude.TotalProUnits != 0.25 || key.Claude.LimitReached || *key.Claude.RemainingProUnits != 0.25 {
+		t.Fatalf("claude after the window reset = %+v", key.Claude)
+	}
+	if key.Claude.WindowStartedAt != nil || key.Claude.WindowResetsAt != nil || key.Claude.LimitResetsAt != nil {
+		t.Fatalf("no window must be open after a reset: %+v", key.Claude)
+	}
+	if len(key.Claude.Credentials) != 1 || key.Claude.Credentials[0].CurrentProUnits != 0 || key.Claude.Credentials[0].TotalProUnits != 0.25 {
+		t.Fatalf("credential totals must be kept: %+v", key.Claude.Credentials)
+	}
+
+	// The next request opens a fresh window at its own start. The increase its
+	// response carries is usage from before the reset and stays out of the window.
+	now = testNow.Add(time.Hour)
+	seq := &claudeSeq{tracker: tracker, now: &now}
+	seq.send("key-a", "claude-1", claudeObs{0.5, resetAt}, breakdown(100, 0, 0, 0, 0))
+	key = findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a"))
+	if key.Claude.WindowStartedAt == nil || !key.Claude.WindowStartedAt.Equal(testNow.Add(time.Hour+time.Second)) || key.Claude.CurrentProUnits != 0 || key.Claude.TotalProUnits != 0.375 {
+		t.Fatalf("claude after the first request of the new window = %+v", key.Claude)
+	}
+	seq.send("key-a", "claude-1", claudeObs{0.625, resetAt}, breakdown(100, 0, 0, 0, 0))
+	seq.send("key-a", "claude-1", claudeObs{0.75, resetAt}, breakdown(100, 0, 0, 0, 0))
+	quota := refuse(t, tracker, ctx, claudeAuth)
+	if want := testNow.Add(time.Hour + time.Second + claudeWeeklyWindow).Sub(now); quota.ResetIn != want {
+		t.Fatalf("reset in = %s, want %s", quota.ResetIn, want)
+	}
+
+	// An empty id resets every key's window.
+	if !tracker.ResetWindow("") {
+		t.Fatal("reset all windows must succeed")
+	}
+	if errAdmit := tracker.Admit(ctx, claudeAuth); errAdmit != nil {
+		t.Fatalf("after resetting every window the key must be admitted: %v", errAdmit)
+	}
+}
+
+func TestKeyWindowIsOpenedByClaudeRequestsOnly(t *testing.T) {
+	now := testNow
+	tracker := newTestTracker(&now)
+	tracker.HandleUsage(context.Background(), record("key-b", "gpt-5", breakdown(1, 0, 0, 1, 0)))
+	if key := findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-b")); key.Claude != nil {
+		t.Fatalf("a key without Claude usage has no window: %+v", key.Claude)
+	}
+	// A Claude request opens the window even before any usage is attributed to the key.
+	startedAt := testNow.Add(10 * time.Second)
+	now = startedAt.Add(time.Second)
+	tracker.HandleUsage(context.Background(), claudeRecord("key-b", "claude-1", startedAt, claudeObs{}, breakdown(1, 0, 0, 1, 0)))
+	key := findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-b"))
+	if key.Claude == nil || key.Claude.WindowStartedAt == nil || !key.Claude.WindowStartedAt.Equal(startedAt) || !key.Claude.WindowResetsAt.Equal(startedAt.Add(claudeWeeklyWindow)) {
+		t.Fatalf("window after the first Claude request = %+v", key.Claude)
+	}
+	if key.Claude.CurrentProUnits != 0 || key.Claude.LimitProUnits != nil || key.Claude.LimitReached || len(key.Claude.Credentials) != 0 {
+		t.Fatalf("an unlimited key with no attributed usage = %+v", key.Claude)
+	}
+	// Without a limit nothing is refused, whatever the window holds.
+	if errAdmit := tracker.Admit(requestContext("key-b"), claudeAuth); errAdmit != nil {
+		t.Fatalf("unlimited key: %v", errAdmit)
+	}
+}
+
+func TestAdmitFollowsTheKeyWindowNotTheCredentialWindows(t *testing.T) {
 	now := testNow
 	tracker := newTestTracker(&now)
 	tracker.SetCredentialResolver(maxPlan)
@@ -303,23 +408,29 @@ func TestAdmitUsesTheEarliestResetOfTheCredentialsInUse(t *testing.T) {
 	// 0.25 + 0.125 of a Max 20x plan is 3.75 Pro units.
 	tracker.SetLimits(map[string]float64{"key-a": 3.75})
 
+	// The window opened with the key's first request and ends seven days later,
+	// whatever the credentials' own weekly resets are.
 	quota := refuse(t, tracker, requestContext("key-a"), claudeAuth)
-	if quota.ResetIn != earlyReset.Sub(now) {
-		t.Fatalf("reset in = %s, want the earliest window %s", quota.ResetIn, earlyReset.Sub(now))
+	if quota.ResetIn != testWindowEnd.Sub(now) {
+		t.Fatalf("reset in = %s, want the key's window %s", quota.ResetIn, testWindowEnd.Sub(now))
 	}
 	if !strings.Contains(quota.Error(), "3.75 of 3.75 Pro units") {
 		t.Fatalf("message = %q", quota.Error())
 	}
 	key := findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a"))
-	if key.Claude.LimitResetsAt == nil || !key.Claude.LimitResetsAt.Equal(earlyReset) {
-		t.Fatalf("limit resets at = %v, want %v", key.Claude.LimitResetsAt, earlyReset)
+	if key.Claude.LimitResetsAt == nil || !key.Claude.LimitResetsAt.Equal(testWindowEnd) {
+		t.Fatalf("limit resets at = %v, want %v", key.Claude.LimitResetsAt, testWindowEnd)
 	}
-	// Once the early window closes, the late window is the next reset.
-	now = earlyReset.Add(time.Minute)
+	// Both credentials' weekly windows reset; the key's usage in its window is unchanged.
+	now = lateReset.Add(time.Minute)
 	key = findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a"))
-	if key.Claude.LimitResetsAt == nil || !key.Claude.LimitResetsAt.Equal(lateReset) || key.Claude.LimitReached {
-		t.Fatalf("claude after the early window = %+v", key.Claude)
+	if key.Claude.CurrentProUnits != 3.75 || !key.Claude.LimitReached || len(key.Claude.Credentials) != 2 {
+		t.Fatalf("claude after the credential resets = %+v", key.Claude)
 	}
+	if early, late := key.Claude.Credentials[0], key.Claude.Credentials[1]; early.AuthID != "claude-early" || early.CurrentProUnits != 1.25 || late.CurrentProUnits != 2.5 {
+		t.Fatalf("per credential usage in the window = %+v", key.Claude.Credentials)
+	}
+	refuse(t, tracker, requestContext("key-a"), claudeAuth)
 }
 
 func TestSnapshotReportsLimitsAndLimitOnlyKeys(t *testing.T) {
@@ -358,8 +469,8 @@ func TestSnapshotReportsLimitsAndLimitOnlyKeys(t *testing.T) {
 	if keyA.Claude == nil || *keyA.Claude.LimitProUnits != 0.5 || *keyA.Claude.RemainingProUnits != 0.25 || keyA.Claude.LimitReached {
 		t.Fatalf("key A claude = %+v", keyA.Claude)
 	}
-	if keyA.Claude.LimitResetsAt == nil || !keyA.Claude.LimitResetsAt.Equal(resetAt) {
-		t.Fatalf("key A limit resets at = %v", keyA.Claude.LimitResetsAt)
+	if keyA.Claude.LimitResetsAt == nil || !keyA.Claude.LimitResetsAt.Equal(testWindowEnd) || resetAt.After(testWindowEnd) {
+		t.Fatalf("key A limit resets at = %v, want the key's window %v", keyA.Claude.LimitResetsAt, testWindowEnd)
 	}
 	configured := snapshot.Keys[1]
 	if !configured.Configured || configured.Key != "conf...cret" || configured.Claude == nil || *configured.Claude.LimitProUnits != 3 || *configured.Claude.RemainingProUnits != 3 || len(configured.Claude.Credentials) != 0 {
@@ -383,10 +494,10 @@ func TestSnapshotReportsLimitsAndLimitOnlyKeys(t *testing.T) {
 		}
 	}
 
-	// A key with Claude usage but no limit reports when its usage resets.
+	// A key with Claude usage but no limit reports when its window resets.
 	tracker.SetLimits(nil)
 	keyA = findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a"))
-	if keyA.Claude == nil || keyA.Claude.LimitProUnits != nil || keyA.Claude.RemainingProUnits != nil || keyA.Claude.LimitReached || keyA.Claude.LimitResetsAt == nil {
+	if keyA.Claude == nil || keyA.Claude.LimitProUnits != nil || keyA.Claude.RemainingProUnits != nil || keyA.Claude.LimitReached || keyA.Claude.LimitResetsAt == nil || keyA.Claude.WindowResetsAt == nil {
 		t.Fatalf("key A without limit = %+v", keyA.Claude)
 	}
 }

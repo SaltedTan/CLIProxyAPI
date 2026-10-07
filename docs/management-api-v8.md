@@ -100,6 +100,7 @@ retain the corresponding business operation's fields.
 | `/observability/logs/requests/<id>` | GET | Get a request log. |
 | `/observability/usage/api-keys` | GET | Get upstream provider API-key usage. |
 | `/observability/usage/clients` | GET, DELETE | Get or reset usage per client API key (`access.api-keys`). |
+| `/observability/usage/clients/window/reset` | POST | End a client key's current Claude allowance window, keeping its history. |
 | `/observability/usage/queue` | GET | Get queued usage events. |
 | `/observability/routing` | GET | Get live routing state and recent credential selections. |
 | `/credentials` | GET, POST, DELETE | List, upload, or delete credential files. |
@@ -187,7 +188,8 @@ SHA-256, plus a masked `key` for keys still listed in `access.api-keys`. Add
 `access.api-key-names` to show a display `name`; names may be keyed by the full
 API key or by its `id`. Requests without a client key (when `access.api-keys` is
 empty) are grouped under the `anonymous` id. Add `access.api-key-limits` to cap
-a key's weekly Claude usage (see "Claude allowance per client key" below).
+a key's Claude usage per 7-day window (see "Claude allowance per client key"
+below).
 
 Usage is saved to `client-usage.json` next to the config file (or under
 `WRITABLE_PATH`) every minute and on shutdown, and restored on startup. A file that
@@ -220,10 +222,12 @@ process stops may be lost. Usage is not tracked in Home mode.
       "claude": {
         "current_pro_units": 0.84,
         "total_pro_units": 2.31,
+        "window_started_at": "2026-10-03T09:12:00Z",
+        "window_resets_at": "2026-10-10T09:12:00Z",
         "limit_pro_units": 1.5,
         "remaining_pro_units": 0.66,
         "limit_reached": false,
-        "limit_resets_at": "2026-10-09T15:00:00Z",
+        "limit_resets_at": "2026-10-10T09:12:00Z",
         "credentials": [
           {
             "auth_id": "claude-user@example.com.json",
@@ -232,7 +236,6 @@ process stops may be lost. Usage is not tracked in Home mode.
             "plan": "max_5x",
             "plan_pro_units": 2,
             "plan_source": "rate_limit_tier",
-            "window_resets_at": "2026-10-09T15:00:00Z",
             "current_fraction": 0.42,
             "current_pro_units": 0.84,
             "total_fraction": 1.155,
@@ -271,17 +274,23 @@ process stops may be lost. Usage is not tracked in Home mode.
 - `daily` covers the last 31 days, by the server's local date.
 - `claude` measures Claude subscription usage in Claude Pro units: `1.0` is one
   full weekly allowance of a Pro plan. A Team plan is worth 1.25 units, a Max 5x
-  plan 2 units, and a Max 20x plan 10 units per week. `current_*` covers each
-  credential's open weekly window; `total_*` accumulates across windows. Usage
-  is converted with the plan in effect when it was attributed, so a later plan
-  change does not rewrite history; usage attributed while the plan was unknown
-  uses the current plan. `claude` is present when the key has Claude usage or a
-  configured limit.
+  plan 2 units, and a Max 20x plan 10 units per week. `current_*` covers the
+  key's own 7-day window, like a subscription period: it opens at the key's
+  first Claude request, ends exactly seven days later, and the next window opens
+  at the key's next Claude request after that, so an idle key has no running
+  window and `current_*` is `0`. `window_started_at` and `window_resets_at` are
+  present while a window is open. The weekly resets of the credentials the key
+  uses do not touch it. `total_*` accumulates across windows. Usage is converted
+  with the plan in effect when it was attributed, so a later plan change does not
+  rewrite history; usage attributed while the plan was unknown uses the current
+  plan. `claude` is present when the key has Claude usage, an open window or a
+  configured limit. Each `credentials` entry gives the key's usage of that
+  credential inside the window (`current_*`) and since tracking began (`total_*`).
 - `limit_pro_units` and `remaining_pro_units` (`max(limit - current, 0)`) are
   present when the key has a configured, non-zero allowance. `limit_reached` is
-  always present and `false` without a limit. `limit_resets_at` is the earliest
-  `window_resets_at` among the key's credentials with current usage, present
-  whenever the key has current usage, with or without a limit.
+  always present and `false` without a limit. `limit_resets_at` equals
+  `window_resets_at` and is present whenever a window is open, with or without
+  a limit.
 - `claude_limits_supported` is `true` on backends that enforce
   `access.api-key-limits`; older backends omit it and the limit fields above.
 - Keys with a configured limit are listed even without usage and even when they
@@ -306,11 +315,20 @@ process stops may be lost. Usage is not tracked in Home mode.
 for an unknown id. `DELETE /observability/usage/clients?all=true` resets every
 key; a request with neither parameter is rejected with 400.
 
+`POST /observability/usage/clients/window/reset?id=<id>` ends one key's current
+Claude allowance window without deleting anything else: its `current_*` usage
+drops to `0`, it is admitted again, its next Claude request opens a fresh window,
+and `totals`, `daily` and the per-credential `total_*` values are kept.
+`?all=true` does this for every key; the same 404 and 400 rules apply.
+
 ### Claude allowance per client key
 
 `access.api-key-limits` caps each client key's Claude usage in Pro units per
-weekly window. Entries are keyed by the full API key or by its `id`; `0` or a
-missing entry means no limit. A full-key entry wins over an `id` entry, so a
+7-day window. The window is the key's own, as described above: it opens at the
+key's first Claude request, ends exactly seven days later, and the next one
+opens at the key's next Claude request, so a key is never held to the reset
+schedule of the credentials it happens to use. Entries are keyed by the full
+API key or by its `id`; `0` or a missing entry means no limit. A full-key entry wins over an `id` entry, so a
 full-key `0` lifts a limit set on the `id`. Requests without a client key use
 the `anonymous` entry. An entry is read as an `id` when it is 16 lowercase hex
 characters (or `anonymous`), unless it equals a key in `access.api-keys` or the
@@ -354,13 +372,13 @@ with a `Retry-After: <seconds>` header (`ceil(limit_resets_at - now)`, at least
 OpenAI-style endpoints receive
 
 ```json
-{"error":{"message":"client API key Claude allowance reached: 1.52 of 1.5 Pro units used this week; resets in 2d3h","type":"rate_limit_error","code":"rate_limit_exceeded"}}
+{"error":{"message":"client API key Claude allowance reached: 1.52 of 1.5 Pro units used in the current 7-day window; resets in 2d3h","type":"rate_limit_error","code":"rate_limit_exceeded"}}
 ```
 
 the Claude messages endpoint Anthropic's native envelope
 
 ```json
-{"type":"error","error":{"type":"rate_limit_error","message":"client API key Claude allowance reached: 1.52 of 1.5 Pro units used this week; resets in 2d3h"}}
+{"type":"error","error":{"type":"rate_limit_error","message":"client API key Claude allowance reached: 1.52 of 1.5 Pro units used in the current 7-day window; resets in 2d3h"}}
 ```
 
 and Gemini-style endpoints their usual shape with the same status and message.
@@ -372,7 +390,7 @@ headers and envelope, after which the proxy closes the socket; reconnect after
 `Retry-After`:
 
 ```json
-{"type":"error","status":429,"headers":{"Content-Type":"application/json","Retry-After":"5400"},"error":{"message":"client API key Claude allowance reached: 1.52 of 1.5 Pro units used this week; resets in 1h30m","type":"rate_limit_error","code":"rate_limit_exceeded"}}
+{"type":"error","status":429,"headers":{"Content-Type":"application/json","Retry-After":"5400"},"error":{"message":"client API key Claude allowance reached: 1.52 of 1.5 Pro units used in the current 7-day window; resets in 1h30m","type":"rate_limit_error","code":"rate_limit_exceeded"}}
 ```
 
 Refused requests
@@ -397,15 +415,21 @@ or a plugin executor serves it. The image generation stream's bootstrap
 heartbeat (`streaming.keepalive-seconds`) waits for the same point, so a
 refused image request is a plain JSON 429 rather than an SSE error.
 
-A key is admitted again as soon as its current usage is below the limit: when a
-credential's weekly window resets, when the limit is raised or removed, or when
-`DELETE /observability/usage/clients?id=<id>` resets the key.
+A key is admitted again as soon as its current usage is below the limit: when
+its window ends, when the limit is raised or removed, when
+`POST /observability/usage/clients/window/reset?id=<id>` ends the window early
+(keeping the key's history), or when `DELETE /observability/usage/clients?id=<id>`
+resets the key.
 
 Limitations: attribution is estimate-based (usage is split from the
 `Anthropic-Ratelimit-Unified-7d-Utilization` header deltas as described above),
-so a key's share is approximate; requests already in flight when the limit is
-reached complete and may overshoot it; usage not yet flushed at shutdown is
-lost; and limits are not enforced in Home mode, where usage is not tracked.
+so a key's share is approximate; an increase is charged to the window open when
+it is attributed, so the increase carried by the first request of a new window
+is left out of it (that usage predates the request), while usage from the end of
+a window that is only attributed after the next one opened counts toward the
+next one; requests already in flight when the limit is reached complete and may
+overshoot it; usage not yet flushed at shutdown is lost; and limits are not
+enforced in Home mode, where usage is not tracked.
 
 ## OAuth
 
