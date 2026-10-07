@@ -32,17 +32,17 @@ const (
 
 // CredentialInfo describes a Claude credential for usage reports.
 type CredentialInfo struct {
-	AuthIndex string
-	Label     string
+	AuthIndex string `json:"auth_index,omitempty"`
+	Label     string `json:"label,omitempty"`
 	// Plan is a known plan (pro, team, max_5x, max_20x), another plan name, or unknown.
-	Plan string
+	Plan string `json:"plan"`
 	// PlanProUnits is the weekly allowance in Claude Pro units
 	// (Pro 1, Team 1.25, Max 5x 2, Max 20x 10).
-	PlanProUnits float64
+	PlanProUnits float64 `json:"plan_pro_units"`
 	// PlanSource names where the allowance came from. Plans without a known
 	// allowance fall back to the credential weight, which also expresses relative
 	// plan size for quota-aware routing.
-	PlanSource string
+	PlanSource string `json:"plan_source"`
 }
 
 // CredentialInfoFromAuth resolves the report details of a credential. An explicit
