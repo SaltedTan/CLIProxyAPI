@@ -187,6 +187,45 @@ func TestAdmitComparesCurrentProUnitsWithLimit(t *testing.T) {
 	}
 }
 
+// TestLimitIsReachedAtTheReportedPrecision pins one rule for the report and
+// admission: the key is at its limit when current_pro_units, as reported to six
+// decimals, reaches it. A key shown at its limit is refused, a key shown under it
+// is admitted, and remaining_pro_units is 0 exactly when the limit is reached.
+func TestLimitIsReachedAtTheReportedPrecision(t *testing.T) {
+	cases := []struct {
+		name      string
+		increase  float64
+		current   float64
+		remaining float64
+		reached   bool
+	}{
+		{"rounds up to the limit", 0.2499996, 0.25, 0, true},
+		{"rounds down below the limit", 0.2499994, 0.249999, 0.000001, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			now := testNow
+			tracker := newTestTracker(&now)
+			seq := &claudeSeq{tracker: tracker, now: &now}
+			resetAt := testNow.Add(72 * time.Hour)
+			seq.send("key-a", "claude-1", claudeObs{0.125, resetAt}, breakdown(100, 0, 0, 0, 0))
+			seq.send("key-a", "claude-1", claudeObs{0.125 + tc.increase, resetAt}, breakdown(100, 0, 0, 0, 0))
+			tracker.SetLimits(map[string]float64{"key-a": 0.25})
+			claude := findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a")).Claude
+			if claude.RemainingProUnits == nil {
+				t.Fatal("remaining must be reported with a limit")
+			}
+			if claude.CurrentProUnits != tc.current || claude.LimitReached != tc.reached || *claude.RemainingProUnits != tc.remaining {
+				t.Fatalf("current = %v reached = %v remaining = %v, want %v %v %v", claude.CurrentProUnits, claude.LimitReached, *claude.RemainingProUnits, tc.current, tc.reached, tc.remaining)
+			}
+			errAdmit := tracker.Admit(requestContext("key-a"), claudeAuth)
+			if refused := errAdmit != nil; refused != tc.reached {
+				t.Fatalf("admission error = %v, want refused = %v like limit_reached", errAdmit, tc.reached)
+			}
+		})
+	}
+}
+
 func TestAdmitUnlimitedKeysAndLimitChanges(t *testing.T) {
 	now := testNow
 	tracker, _ := limitedKeyTracker(t, &now)

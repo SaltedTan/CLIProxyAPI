@@ -268,9 +268,9 @@ func (t *Tracker) keyUsageLocked(id string, now time.Time, credentialRef func(st
 }
 
 // claudeUsageLocked renders the Claude usage of one key. It also returns the
-// unrounded Pro units used in the key's open allowance window, which admission
-// compares with the key's limit, and when that window ends (zero when none is
-// open). t.mu must be held.
+// unrounded Pro units used in the key's open allowance window, which
+// limitReached compares with the key's limit, and when that window ends (zero
+// when none is open). t.mu must be held.
 func (t *Tracker) claudeUsageLocked(state *keyState, now time.Time, credentialRef func(string) ClaudeCredentialRef) (*KeyClaudeUsage, float64, time.Time) {
 	claude := &KeyClaudeUsage{Credentials: make([]KeyClaudeCredentialUsage, 0, len(state.Claude))}
 	authIDs := make([]string, 0, len(state.Claude))
@@ -316,10 +316,18 @@ func applyClaudeLimit(claude *KeyClaudeUsage, current, limit float64) {
 	if limit <= 0 {
 		return
 	}
-	remaining := roundFraction(math.Max(limit-current, 0))
+	remaining := roundFraction(math.Max(limit-roundFraction(current), 0))
 	claude.LimitProUnits = &limit
 	claude.RemainingProUnits = &remaining
-	claude.LimitReached = current >= limit
+	claude.LimitReached = limitReached(current, limit)
+}
+
+// limitReached is the one rule for a key's allowance, used by the report and by
+// admission: the key is at its limit when its current usage, rounded to the six
+// decimals the report shows, reaches the limit. A key shown at its limit is
+// therefore refused, and a key shown under it is admitted.
+func limitReached(current, limit float64) bool {
+	return roundFraction(current) >= limit
 }
 
 // windowOpen reports whether the last observed weekly window has not reset yet.

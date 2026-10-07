@@ -288,7 +288,10 @@ process stops may be lost. Usage is not tracked in Home mode.
   credential inside the window (`current_*`) and since tracking began (`total_*`).
 - `limit_pro_units` and `remaining_pro_units` (`max(limit - current, 0)`) are
   present when the key has a configured, non-zero allowance. `limit_reached` is
-  always present and `false` without a limit. `limit_resets_at` equals
+  always present and `false` without a limit. It is `true` exactly when
+  `current_pro_units`, as reported (rounded to six decimals), is at least
+  `limit_pro_units`; admission uses the same comparison, so the proxy refuses
+  the key's Claude requests exactly when the report says the limit is reached. `limit_resets_at` equals
   `window_resets_at` and is present whenever a window is open, with or without
   a limit.
 - `claude_limits_supported` is `true` on backends that enforce

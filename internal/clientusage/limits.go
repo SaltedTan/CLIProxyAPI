@@ -18,9 +18,8 @@ import (
 // keyWindow): it opens at the key's first Claude request and ends 7 days later. The
 // tracker compares the Pro units attributed to the key inside that window, from the
 // weekly utilization headers, with the cap before a Claude credential is used, and
-// refuses the request with a 429 once the cap is reached. The comparison uses the
-// same arithmetic as the usage report so what the dashboard shows is what is
-// enforced. The attribution is an estimate, requests in flight when the cap is
+// refuses the request with a 429 once the cap is reached. The comparison is the
+// report's (limitReached), so what the dashboard shows is what is enforced. The attribution is an estimate, requests in flight when the cap is
 // reached still complete, and nothing is enforced in Home mode.
 
 // clientQuotaUnknownReset is the recovery hint when no open window is known.
@@ -192,7 +191,7 @@ func (t *Tracker) Admit(ctx context.Context, auth *coreauth.Auth) error {
 		_, current, resetsAt = t.claudeUsageLocked(state, now, t.credentialRefLocked(t.resolve))
 	}
 	t.mu.Unlock()
-	if current < limit {
+	if !limitReached(current, limit) {
 		if log.IsLevelEnabled(log.DebugLevel) {
 			log.Debugf("client usage: key %s admitted to Claude with %s of %s Pro units used", keyID, formatProUnits(current), formatProUnits(limit))
 		}
