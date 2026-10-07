@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -388,5 +389,119 @@ func TestClientQuotaErrorHeadersAndRetryAfter(t *testing.T) {
 	}
 	if (&ClientQuotaError{}).Error() == "" {
 		t.Fatal("an empty message must still produce an error text")
+	}
+}
+
+// recordingPolicy refuses claude and records refusals the conductor returns.
+type recordingPolicy struct {
+	admissionTestPolicy
+	recorded []error
+}
+
+func (p *recordingPolicy) RecordRefusal(_ context.Context, refusal error) {
+	p.mu.Lock()
+	p.recorded = append(p.recorded, refusal)
+	p.mu.Unlock()
+}
+
+func (p *recordingPolicy) recordedCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.recorded)
+}
+
+func TestAdmissionRecordsARefusalOnlyWhenItIsReturned(t *testing.T) {
+	for _, kind := range []string{"execute", "stream"} {
+		t.Run(kind, func(t *testing.T) {
+			manager := NewManager(nil, nil, nil)
+			manager.SetRetryConfig(3, 0, 0)
+			model := "admission-record-" + kind
+			claude := &admissionTestExecutor{identifier: "claude"}
+			codex := &admissionTestExecutor{identifier: "codex"}
+			manager.RegisterExecutor(claude)
+			manager.RegisterExecutor(codex)
+			registerAdmissionAuth(t, manager, "record-claude-1-"+kind, "claude", model)
+			registerAdmissionAuth(t, manager, "record-claude-2-"+kind, "claude", model)
+			registerAdmissionAuth(t, manager, "record-codex-"+kind, "codex", model)
+			policy := &recordingPolicy{admissionTestPolicy: admissionTestPolicy{refuse: map[string]*ClientQuotaError{"claude": claudeQuotaRefusal()}}}
+			manager.SetAdmissionPolicy(policy)
+
+			run := func(providers []string) error {
+				if kind == "execute" {
+					_, errExecute := manager.Execute(context.Background(), providers, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+					return errExecute
+				}
+				result, errStream := manager.ExecuteStream(context.Background(), providers, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Stream: true})
+				if result != nil {
+					for range result.Chunks {
+					}
+				}
+				return errStream
+			}
+			if errRun := run([]string{"claude", "codex"}); errRun != nil {
+				t.Fatalf("fallback error = %v", errRun)
+			}
+			if got := policy.recordedCount(); got != 0 {
+				t.Fatalf("recorded %d refusals for a request served by another provider, want 0", got)
+			}
+			errRun := run([]string{"claude"})
+			var quota *ClientQuotaError
+			if !errors.As(errRun, &quota) {
+				t.Fatalf("error = %v, want the refusal", errRun)
+			}
+			if got := policy.recordedCount(); got != 1 || policy.recorded[0] != errRun {
+				t.Fatalf("recorded = %v (%d), want the returned refusal exactly once", policy.recorded, got)
+			}
+		})
+	}
+}
+
+func TestAdmissionRefusalDoesNotHideAnEarlierUpstreamError(t *testing.T) {
+	for _, kind := range []string{"execute", "stream"} {
+		t.Run(kind, func(t *testing.T) {
+			manager := NewManager(nil, nil, nil)
+			manager.SetRetryConfig(2, 0, 0)
+			model := "admission-upstream-precedence-" + kind
+			claude := &admissionTestExecutor{identifier: "claude"}
+			codex := &admissionTestExecutor{identifier: "codex", executeErr: &Error{HTTPStatus: http.StatusInternalServerError, Message: "upstream failed"}}
+			manager.RegisterExecutor(claude)
+			manager.RegisterExecutor(codex)
+			registerAdmissionAuth(t, manager, "precedence-claude-"+kind, "claude", model)
+			// Cooling stays on: after the 500 the codex credential is out of the next
+			// retry round, which then meets only the cached Claude refusal.
+			registry.GetGlobalRegistry().RegisterClient("precedence-codex-"+kind, "codex", []*registry.ModelInfo{{ID: model}})
+			t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient("precedence-codex-" + kind) })
+			if _, errRegister := manager.Register(context.Background(), &Auth{ID: "precedence-codex-" + kind, Provider: "codex", Status: StatusActive}); errRegister != nil {
+				t.Fatal(errRegister)
+			}
+			policy := &admissionTestPolicy{refuse: map[string]*ClientQuotaError{"claude": claudeQuotaRefusal()}}
+			manager.SetAdmissionPolicy(policy)
+
+			var errRun error
+			if kind == "execute" {
+				_, errRun = manager.Execute(context.Background(), []string{"claude", "codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+			} else {
+				var result *cliproxyexecutor.StreamResult
+				result, errRun = manager.ExecuteStream(context.Background(), []string{"claude", "codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Stream: true})
+				if result != nil {
+					for range result.Chunks {
+					}
+				}
+			}
+			var quota *ClientQuotaError
+			if errors.As(errRun, &quota) {
+				t.Fatalf("error = %v, want the upstream failure from the first round", errRun)
+			}
+			// The usual exhausted-credentials error, carrying the upstream failure.
+			if statusCodeFromError(errRun) != http.StatusServiceUnavailable || !strings.Contains(errRun.Error(), "upstream failed") {
+				t.Fatalf("error = %v (status %d), want the cooled-down credential error with the upstream 500", errRun, statusCodeFromError(errRun))
+			}
+			if got := codex.ids(kind); len(got) != 1 {
+				t.Fatalf("codex calls = %v, want one (cooled down afterwards)", got)
+			}
+			if got := claude.ids(kind); len(got) != 0 {
+				t.Fatalf("refused provider was called: %v", got)
+			}
+		})
 	}
 }

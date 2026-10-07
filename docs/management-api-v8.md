@@ -310,11 +310,17 @@ key; a request with neither parameter is rejected with 400.
 
 `access.api-key-limits` caps each client key's Claude usage in Pro units per
 weekly window. Entries are keyed by the full API key or by its `id`; `0` or a
-missing entry means no limit. A full-key entry wins over an `id` entry, and
-requests without a client key use the `anonymous` entry. Limits take effect on
-every configuration reload (file changes and management writes) without a
-restart. Negative, NaN or infinite values are rejected: the file fails to load
-and management writes return `400 invalid_config`; error messages mask the key.
+missing entry means no limit. A full-key entry wins over an `id` entry, so a
+full-key `0` lifts a limit set on the `id`. Requests without a client key use
+the `anonymous` entry. An entry is read as an `id` when it is 16 lowercase hex
+characters (or `anonymous`), unless it equals a key in `access.api-keys` or the
+key it spells has usage; a real key that happens to look like an `id` is
+therefore still reported under its own `id`, masked. Keys with a limit are
+tracked even when the usage tracker is at its capacity of 1024 keys. Limits take
+effect on every configuration reload (file changes and management writes)
+without a restart. Negative, NaN or infinite values are rejected: the file fails
+to load and management writes return `400 invalid_config`; error messages mask
+the key.
 
 When a key's `current_pro_units` reaches its limit, the proxy refuses that key's
 requests to every Claude credential, OAuth and API-key alike, before any
@@ -322,18 +328,28 @@ upstream connection is made. Other providers keep serving the key, and
 count-tokens requests are never refused. The refusal is `429 Too Many Requests`
 with a `Retry-After: <seconds>` header (`ceil(limit_resets_at - now)`, at least
 `1`; `60` when no reset time is known), sent regardless of
-`passthrough-headers`. The body is the endpoint's usual error envelope. OpenAI-
-and Claude-style endpoints receive
+`passthrough-headers`. The body is the endpoint's usual error envelope.
+OpenAI-style endpoints receive
 
 ```json
 {"error":{"message":"client API key Claude allowance reached: 1.52 of 1.5 Pro units used this week; resets in 2d3h","type":"rate_limit_error","code":"rate_limit_exceeded"}}
+```
+
+the Claude messages endpoint Anthropic's native envelope
+
+```json
+{"type":"error","error":{"type":"rate_limit_error","message":"client API key Claude allowance reached: 1.52 of 1.5 Pro units used this week; resets in 2d3h"}}
 ```
 
 and Gemini-style endpoints their usual shape with the same status and message.
 The message never contains the raw key. Streaming requests receive the same
 JSON body before any stream opens, never an SSE error event. Refused requests
 increment `blocked` only: they are not counted as `requests` or `failed`,
-publish no usage record and do not cool down any credential.
+publish no usage record and do not cool down any credential. A request that is
+refused on Claude but served by another provider is not blocked and is not
+counted; `blocked` counts only requests the proxy answered with the 429. When a
+request fails upstream on another provider and a retry round then finds only
+the Claude refusal, the upstream failure is reported, not the 429.
 
 A key is admitted again as soon as its current usage is below the limit: when a
 credential's weekly window resets, when the limit is raised or removed, or when

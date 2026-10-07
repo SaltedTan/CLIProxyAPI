@@ -75,9 +75,8 @@ func maskClientKey(key string) string {
 		return key[:4] + "..." + key[len(key)-4:]
 	case len(key) > 4:
 		return key[:2] + "..." + key[len(key)-2:]
-	case len(key) > 2:
-		return key[:1] + "..." + key[len(key)-1:]
 	default:
-		return key
+		// Too short to show any part of it.
+		return "***"
 	}
 }

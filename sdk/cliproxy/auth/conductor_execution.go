@@ -511,7 +511,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, preferredExecutionAttemptError(lastErr, upstreamErr)
 			}
-			if errRefused := admission.refused(); errRefused != nil {
+			if errRefused := admission.finalRefusal(ctx); errRefused != nil {
 				return cliproxyexecutor.Response{}, errRefused
 			}
 			return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
@@ -527,7 +527,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return cliproxyexecutor.Response{}, preferredExecutionAttemptError(lastErr, upstreamErr)
 			}
-			if errRefused := admission.refused(); errRefused != nil {
+			if errRefused := admission.finalRefusal(ctx); errRefused != nil {
 				return cliproxyexecutor.Response{}, errRefused
 			}
 			return cliproxyexecutor.Response{}, errPick
@@ -559,6 +559,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
+		admission.markAttempted()
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
@@ -968,7 +969,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				}
 				return nil, preferredErr
 			}
-			if errRefused := admission.refused(); errRefused != nil {
+			if errRefused := admission.finalRefusal(ctx); errRefused != nil {
 				return nil, errRefused
 			}
 			return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
@@ -1008,7 +1009,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				}
 				return nil, preferredErr
 			}
-			if errRefused := admission.refused(); errRefused != nil {
+			if errRefused := admission.finalRefusal(ctx); errRefused != nil {
 				return nil, errRefused
 			}
 			return nil, errPick
@@ -1117,6 +1118,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
+		admission.markAttempted()
 		var errPrepare error
 		if selection != nil {
 			auth, errPrepare = m.prepareHomeRequestAuth(execCtx, executor, selection)

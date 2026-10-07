@@ -2,6 +2,7 @@ package clientusage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -24,9 +25,10 @@ import (
 const clientQuotaUnknownReset = time.Minute
 
 // SetLimits replaces the Claude allowance per client key, in Pro units per weekly
-// window, keyed by full API key or key ID. Keys are trimmed; entries that are not
-// positive finite numbers mean no limit and are dropped. Limits take effect on the
-// next admission check, so a raised or removed limit re-admits a key immediately.
+// window, keyed by full API key or key ID. Keys are trimmed; negative and non-finite
+// entries are dropped. A 0 means no limit and is kept, because a full-key 0 takes
+// precedence over an ID entry for the same key. Limits take effect on the next
+// admission check, so a raised or removed limit re-admits a key immediately.
 func (t *Tracker) SetLimits(limits map[string]float64) {
 	if t == nil {
 		return
@@ -34,7 +36,7 @@ func (t *Tracker) SetLimits(limits map[string]float64) {
 	cleaned := make(map[string]float64, len(limits))
 	for key, limit := range limits {
 		key = strings.TrimSpace(key)
-		if key == "" || math.IsNaN(limit) || math.IsInf(limit, 0) || limit <= 0 {
+		if key == "" || math.IsNaN(limit) || math.IsInf(limit, 0) || limit < 0 {
 			continue
 		}
 		cleaned[key] = limit
@@ -46,20 +48,30 @@ func (t *Tracker) SetLimits(limits map[string]float64) {
 }
 
 // limitForLocked resolves the Claude allowance of a client key: an entry for the
-// full key wins over one for its ID; requests without a key use the anonymous ID.
-// t.mu must be held.
+// full key wins over one for its ID, including a full-key 0 that lifts the limit;
+// requests without a key use the anonymous ID. t.mu must be held.
 func (t *Tracker) limitForLocked(apiKey string) (float64, bool) {
 	if len(t.limits) == 0 {
 		return 0, false
 	}
 	apiKey = strings.TrimSpace(apiKey)
+	limit, ok := 0.0, false
 	if apiKey != "" {
-		if limit, ok := t.limits[apiKey]; ok {
-			return limit, true
-		}
+		limit, ok = t.limits[apiKey]
 	}
-	limit, ok := t.limits[KeyID(apiKey)]
-	return limit, ok
+	if !ok {
+		limit, ok = t.limits[KeyID(apiKey)]
+	}
+	if !ok || limit <= 0 {
+		return 0, false
+	}
+	return limit, true
+}
+
+// limitedLocked reports whether the client key has a Claude allowance. t.mu must be held.
+func (t *Tracker) limitedLocked(apiKey string) bool {
+	_, ok := t.limitForLocked(apiKey)
+	return ok
 }
 
 // keyLimit is a limit indexed by key ID for reports; APIKey is set when the limit
@@ -69,23 +81,49 @@ type keyLimit struct {
 	APIKey string
 }
 
-// limitsByIDLocked indexes the configured limits by key ID. An entry that looks
-// like a key ID is reported under that ID; any other entry is a full key and is
-// reported under its ID, taking precedence over an ID entry for the same key.
-// t.mu must be held.
-func (t *Tracker) limitsByIDLocked() map[string]keyLimit {
+// limitsByIDLocked indexes the configured limits by key ID for the report. ID
+// entries are reported under that ID; full-key entries are reported under the key's
+// ID and take precedence, a full-key 0 lifting an ID entry's limit. configured is
+// the set of keys in access.api-keys, used to tell IDs from keys. t.mu must be held.
+func (t *Tracker) limitsByIDLocked(configured map[string]struct{}) map[string]keyLimit {
 	index := make(map[string]keyLimit, len(t.limits))
 	for entry, limit := range t.limits {
-		if isKeyID(entry) {
-			if existing, ok := index[entry]; ok && existing.APIKey != "" {
-				continue
-			}
+		if limit > 0 && t.isKeyIDLocked(entry, configured) {
 			index[entry] = keyLimit{Limit: limit}
+		}
+	}
+	for entry, limit := range t.limits {
+		if t.isKeyIDLocked(entry, configured) {
 			continue
 		}
-		index[KeyID(entry)] = keyLimit{Limit: limit, APIKey: entry}
+		id := KeyID(entry)
+		if limit > 0 {
+			index[id] = keyLimit{Limit: limit, APIKey: entry}
+		} else {
+			delete(index, id)
+		}
 	}
 	return index
+}
+
+// isKeyIDLocked reports whether a limits entry names a key by ID rather than by full
+// key. Known identities decide first, so a real key that happens to look like an ID
+// is never reported as one: an entry equal to a configured key, or whose own ID has
+// usage, is a full key. Otherwise the shape decides (see isKeyID). t.mu must be held.
+func (t *Tracker) isKeyIDLocked(entry string, configured map[string]struct{}) bool {
+	if _, ok := configured[entry]; ok {
+		return false
+	}
+	if !isKeyID(entry) {
+		return false
+	}
+	if _, ok := t.keys[entry]; ok {
+		return true
+	}
+	if _, ok := t.keys[KeyID(entry)]; ok {
+		return false
+	}
+	return true
 }
 
 // isKeyID reports whether value has the shape of a key ID (16 lowercase hex digits)
@@ -108,10 +146,11 @@ func isKeyID(value string) bool {
 
 // Admit implements coreauth.AdmissionPolicy. Claude credentials (OAuth and API key
 // alike) are refused for a client key whose current Pro units reached its limit;
-// other providers and keys without a limit are always admitted. A refusal counts as
-// blocked on the key's totals and on today's daily bucket, and returns a
+// other providers and keys without a limit are always admitted. The refusal is a
 // *coreauth.ClientQuotaError whose ResetIn is the time to the earliest open-window
-// reset among the credentials the key used (one minute when unknown).
+// reset among the credentials the key used (one minute when unknown). Deciding does
+// not count: the conductor may still serve the request through another provider and
+// calls RecordRefusal only when it returns the refusal to the client.
 func (t *Tracker) Admit(ctx context.Context, auth *coreauth.Auth) error {
 	if t == nil || auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
 		return nil
@@ -133,20 +172,13 @@ func (t *Tracker) Admit(ctx context.Context, auth *coreauth.Auth) error {
 	if state != nil && len(state.Claude) > 0 {
 		_, current, resetsAt = t.claudeUsageLocked(state, now, t.credentialRefLocked(t.resolve))
 	}
+	t.mu.Unlock()
 	if current < limit {
-		t.mu.Unlock()
 		if log.IsLevelEnabled(log.DebugLevel) {
 			log.Debugf("client usage: key %s admitted to Claude with %s of %s Pro units used", keyID, formatProUnits(current), formatProUnits(limit))
 		}
 		return nil
 	}
-	// current >= limit > 0 implies the key has attributed usage, so state is set.
-	if state != nil {
-		state.Totals.Blocked++
-		state.dayCounters(now.In(t.location)).Blocked++
-		t.dirty = true
-	}
-	t.mu.Unlock()
 
 	resetIn := clientQuotaUnknownReset
 	if !resetsAt.IsZero() {
@@ -155,16 +187,41 @@ func (t *Tracker) Admit(ctx context.Context, auth *coreauth.Auth) error {
 			resetIn = time.Second
 		}
 	}
-	fields := log.Fields{"key_id": keyID, "used_pro_units": formatProUnits(current), "limit_pro_units": formatProUnits(limit)}
-	if !resetsAt.IsZero() {
-		fields["resets_at"] = resetsAt.UTC().Format(time.RFC3339)
+	if log.IsLevelEnabled(log.DebugLevel) {
+		log.Debugf("client usage: key %s is over its Claude allowance (%s of %s Pro units), credential refused", keyID, formatProUnits(current), formatProUnits(limit))
 	}
-	log.WithFields(fields).Info("client usage: Claude allowance reached, request refused")
 	return &coreauth.ClientQuotaError{
 		Code:    coreauth.ErrorCodeClientKeyLimitReached,
 		Message: fmt.Sprintf("client API key Claude allowance reached: %s of %s Pro units used this week; resets in %s", formatProUnits(current), formatProUnits(limit), formatResetDuration(resetIn)),
 		ResetIn: resetIn,
 	}
+}
+
+// RecordRefusal implements coreauth.RefusalRecorder. The conductor calls it once when
+// a refusal from Admit becomes the request's result, so a request served by another
+// provider is never counted. The refusal counts as blocked on the key's totals and on
+// today's daily bucket, and is logged by key id.
+func (t *Tracker) RecordRefusal(ctx context.Context, refusal error) {
+	var quota *coreauth.ClientQuotaError
+	if t == nil || !errors.As(refusal, &quota) || quota == nil {
+		return
+	}
+	keyID := KeyID(apiKeyFromContext(ctx))
+	now := t.now()
+	t.mu.Lock()
+	// The key was refused because it has attributed usage; it has no state only when
+	// it was reset in the meantime, and then there is nothing to count against.
+	if state := t.keys[keyID]; state != nil {
+		state.Totals.Blocked++
+		state.dayCounters(now.In(t.location)).Blocked++
+		t.dirty = true
+	}
+	t.mu.Unlock()
+	// The key id is part of the message: the server's log format prints no fields.
+	log.WithFields(log.Fields{
+		"key_id":      keyID,
+		"retry_after": quota.RetryAfter().String(),
+	}).Infof("client usage: key %s refused, Claude allowance reached: %s", keyID, quota.Error())
 }
 
 // apiKeyFromContext returns the client API key of the request, read from the gin

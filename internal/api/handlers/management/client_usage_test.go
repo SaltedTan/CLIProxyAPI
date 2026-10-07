@@ -127,13 +127,16 @@ func TestClientUsageEndpoints(t *testing.T) {
 	// A refused request shows up as blocked without touching requests or failed.
 	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ginCtx.Set("userApiKey", "laptop-key-0001")
+	requestCtx := context.WithValue(context.Background(), "gin", ginCtx)
 	var quota *coreauth.ClientQuotaError
-	if errAdmit := h.clientUsage.Admit(context.WithValue(context.Background(), "gin", ginCtx), &coreauth.Auth{ID: "claude-max", Provider: "claude"}); !errors.As(errAdmit, &quota) {
+	if errAdmit := h.clientUsage.Admit(requestCtx, &coreauth.Auth{ID: "claude-max", Provider: "claude"}); !errors.As(errAdmit, &quota) {
 		t.Fatalf("admit error = %v, want a client quota error", errAdmit)
 	}
 	if strings.Contains(quota.Error(), "laptop-key-0001") {
 		t.Fatalf("refusal message leaks the key: %s", quota.Error())
 	}
+	// The conductor records the refusal when it returns it to the client.
+	h.clientUsage.RecordRefusal(requestCtx, quota)
 	snapshot = get()
 	laptop = snapshot.Keys[0]
 	if laptop.Totals.Blocked != 1 || laptop.Totals.Requests != 2 || laptop.Totals.Failed != 0 || len(laptop.Daily) != 1 || laptop.Daily[0].Blocked != 1 {

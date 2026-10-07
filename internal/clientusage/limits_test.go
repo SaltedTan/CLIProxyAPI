@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -15,7 +17,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -65,6 +69,15 @@ func mustRefuse(t *testing.T, err error) *coreauth.ClientQuotaError {
 	return quota
 }
 
+// refuse asserts that the request is refused and records the refusal the way the
+// conductor does when it returns it to the client.
+func refuse(t *testing.T, tracker *Tracker, ctx context.Context, auth *coreauth.Auth) *coreauth.ClientQuotaError {
+	t.Helper()
+	quota := mustRefuse(t, tracker.Admit(ctx, auth))
+	tracker.RecordRefusal(ctx, quota)
+	return quota
+}
+
 func TestSetLimitsResolvesByFullKeyThenID(t *testing.T) {
 	tracker := NewTracker()
 	tracker.SetLimits(map[string]float64{
@@ -75,6 +88,8 @@ func TestSetLimitsResolvesByFullKeyThenID(t *testing.T) {
 		" key-c ":      2,
 		"":             3,
 		"zero":         0,
+		"key-z":        0,
+		KeyID("key-z"): 0.125,
 		"negative":     -1,
 		"nan":          math.NaN(),
 		"inf":          math.Inf(1),
@@ -91,6 +106,7 @@ func TestSetLimitsResolvesByFullKeyThenID(t *testing.T) {
 		{"", 0.1, true},
 		{"key-c", 2, true},
 		{"zero", 0, false},
+		{"key-z", 0, false}, // a full-key 0 lifts the id entry's limit
 		{"negative", 0, false},
 		{"nan", 0, false},
 		{"inf", 0, false},
@@ -102,7 +118,8 @@ func TestSetLimitsResolvesByFullKeyThenID(t *testing.T) {
 			t.Fatalf("limitFor(%q) = %v, %v; want %v, %v", tc.apiKey, limit, ok, tc.limit, tc.ok)
 		}
 	}
-	if len(tracker.limits) != 5 {
+	// Zero entries are kept for precedence; empty keys and invalid values are not.
+	if len(tracker.limits) != 8 {
 		t.Fatalf("limits = %v, want only valid entries", tracker.limits)
 	}
 }
@@ -117,7 +134,7 @@ func TestAdmitComparesCurrentProUnitsWithLimit(t *testing.T) {
 		t.Fatalf("below the limit must be admitted: %v", errAdmit)
 	}
 	tracker.SetLimits(map[string]float64{"key-a": 0.25})
-	quota := mustRefuse(t, tracker.Admit(ctx, claudeAuth))
+	quota := refuse(t, tracker, ctx, claudeAuth)
 	if quota.StatusCode() != 429 || quota.Code != coreauth.ErrorCodeClientKeyLimitReached {
 		t.Fatalf("quota error = %+v", quota)
 	}
@@ -132,7 +149,7 @@ func TestAdmitComparesCurrentProUnitsWithLimit(t *testing.T) {
 		t.Fatal("message must not contain the raw key")
 	}
 	tracker.SetLimits(map[string]float64{KeyID("key-a"): 0.125})
-	mustRefuse(t, tracker.Admit(ctx, claudeAuth))
+	refuse(t, tracker, ctx, claudeAuth)
 
 	key := findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a"))
 	if key.Totals.Blocked != 2 || key.Totals.Requests != 2 || key.Totals.Failed != 0 {
@@ -153,7 +170,7 @@ func TestAdmitComparesCurrentProUnitsWithLimit(t *testing.T) {
 
 	// Refusals on another day land in that day's bucket only.
 	now = testNow.Add(24 * time.Hour)
-	mustRefuse(t, tracker.Admit(ctx, claudeAuth))
+	refuse(t, tracker, ctx, claudeAuth)
 	key = findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a"))
 	if key.Totals.Blocked != 3 || len(key.Daily) != 2 || key.Daily[1].Date != "2026-10-08" || key.Daily[1].Blocked != 1 || key.Daily[0].Blocked != 2 {
 		t.Fatalf("totals = %+v daily = %+v", key.Totals, key.Daily)
@@ -177,7 +194,7 @@ func TestAdmitUnlimitedKeysAndLimitChanges(t *testing.T) {
 		t.Fatalf("a limit on another key must admit: %v", errAdmit)
 	}
 	tracker.SetLimits(map[string]float64{"key-a": 0.2})
-	mustRefuse(t, tracker.Admit(ctx, claudeAuth))
+	refuse(t, tracker, ctx, claudeAuth)
 	tracker.SetLimits(map[string]float64{"key-a": 0.3})
 	if errAdmit := tracker.Admit(ctx, claudeAuth); errAdmit != nil {
 		t.Fatalf("a raised limit must re-admit: %v", errAdmit)
@@ -187,7 +204,7 @@ func TestAdmitUnlimitedKeysAndLimitChanges(t *testing.T) {
 		t.Fatalf("a removed limit must re-admit: %v", errAdmit)
 	}
 	tracker.SetLimits(map[string]float64{"key-a": 0.05})
-	mustRefuse(t, tracker.Admit(ctx, claudeAuth))
+	refuse(t, tracker, ctx, claudeAuth)
 	if key := findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a")); key.Totals.Blocked != 2 {
 		t.Fatalf("blocked = %d, want one per refusal", key.Totals.Blocked)
 	}
@@ -205,7 +222,7 @@ func TestAdmitOnlyAppliesToClaudeWithAClientKey(t *testing.T) {
 		{ID: "oauth", Provider: "Claude", Attributes: map[string]string{"auth_kind": "oauth"}},
 		{ID: "api-key", Provider: " claude ", Attributes: map[string]string{"api_key": "sk-fake"}},
 	} {
-		mustRefuse(t, tracker.Admit(requestContext("key-a"), auth))
+		refuse(t, tracker, requestContext("key-a"), auth)
 	}
 	if errAdmit := tracker.Admit(context.Background(), claudeAuth); errAdmit != nil {
 		t.Fatalf("a request without a gin context is anonymous and has no limit: %v", errAdmit)
@@ -224,8 +241,8 @@ func TestAdmitOnlyAppliesToClaudeWithAClientKey(t *testing.T) {
 	seq.send("", "claude-1", claudeObs{0.375, resetAt}, breakdown(100, 0, 0, 0, 0))
 	seq.send("", "claude-1", claudeObs{0.625, resetAt}, breakdown(100, 0, 0, 0, 0))
 	tracker.SetLimits(map[string]float64{AnonymousKeyID: 0.125})
-	mustRefuse(t, tracker.Admit(context.Background(), claudeAuth))
-	mustRefuse(t, tracker.Admit(requestContext(""), claudeAuth))
+	refuse(t, tracker, context.Background(), claudeAuth)
+	refuse(t, tracker, requestContext(""), claudeAuth)
 	if key := findKey(t, tracker.Snapshot(SnapshotOptions{}), AnonymousKeyID); key.Totals.Blocked != 2 {
 		t.Fatalf("anonymous blocked = %d, want 2", key.Totals.Blocked)
 	}
@@ -236,7 +253,7 @@ func TestAdmitReadmitsAfterWindowResetAndUsageReset(t *testing.T) {
 	tracker, resetAt := limitedKeyTracker(t, &now)
 	tracker.SetLimits(map[string]float64{"key-a": 0.125})
 	ctx := requestContext("key-a")
-	mustRefuse(t, tracker.Admit(ctx, claudeAuth))
+	refuse(t, tracker, ctx, claudeAuth)
 
 	// Once the weekly window passes, the open window is empty.
 	now = resetAt.Add(time.Minute)
@@ -254,7 +271,7 @@ func TestAdmitReadmitsAfterWindowResetAndUsageReset(t *testing.T) {
 		t.Fatalf("below the limit in the new window must admit: %v", errAdmit)
 	}
 	seq.send("key-a", "claude-1", claudeObs{0.1875, nextReset}, breakdown(100, 0, 0, 0, 0))
-	quota := mustRefuse(t, tracker.Admit(ctx, claudeAuth))
+	quota := refuse(t, tracker, ctx, claudeAuth)
 	if quota.ResetIn != nextReset.Sub(now) {
 		t.Fatalf("reset in = %s, want the new window %s", quota.ResetIn, nextReset.Sub(now))
 	}
@@ -286,7 +303,7 @@ func TestAdmitUsesTheEarliestResetOfTheCredentialsInUse(t *testing.T) {
 	// 0.25 + 0.125 of a Max 20x plan is 3.75 Pro units.
 	tracker.SetLimits(map[string]float64{"key-a": 3.75})
 
-	quota := mustRefuse(t, tracker.Admit(requestContext("key-a"), claudeAuth))
+	quota := refuse(t, tracker, requestContext("key-a"), claudeAuth)
 	if quota.ResetIn != earlyReset.Sub(now) {
 		t.Fatalf("reset in = %s, want the earliest window %s", quota.ResetIn, earlyReset.Sub(now))
 	}
@@ -382,7 +399,7 @@ func TestSnapshotJSONNeverContainsRawKeys(t *testing.T) {
 	seq.send("laptop-secret-key", "claude-1", claudeObs{0.125, resetAt}, breakdown(100, 0, 0, 0, 0))
 	seq.send("laptop-secret-key", "claude-1", claudeObs{0.375, resetAt}, breakdown(100, 0, 0, 0, 0))
 	tracker.SetLimits(map[string]float64{"laptop-secret-key": 0.1, "limit-only-secret": 1})
-	mustRefuse(t, tracker.Admit(requestContext("laptop-secret-key"), claudeAuth))
+	refuse(t, tracker, requestContext("laptop-secret-key"), claudeAuth)
 
 	data, errMarshal := json.Marshal(tracker.Snapshot(SnapshotOptions{APIKeys: []string{"laptop-secret-key"}, APIKeyNames: map[string]string{"laptop-secret-key": "Laptop"}}))
 	if errMarshal != nil {
@@ -434,7 +451,7 @@ func TestBlockedPersistsAndOlderStateLoadsWithZero(t *testing.T) {
 	seq.send("secret-key", "claude-1", claudeObs{0.125, resetAt}, breakdown(100, 0, 0, 0, 0))
 	seq.send("secret-key", "claude-1", claudeObs{0.375, resetAt}, breakdown(100, 0, 0, 0, 0))
 	tracker.SetLimits(map[string]float64{"secret-key": 0.1})
-	mustRefuse(t, tracker.Admit(requestContext("secret-key"), claudeAuth))
+	refuse(t, tracker, requestContext("secret-key"), claudeAuth)
 	if errFlush := tracker.Flush(); errFlush != nil {
 		t.Fatal(errFlush)
 	}
@@ -459,7 +476,7 @@ func TestBlockedPersistsAndOlderStateLoadsWithZero(t *testing.T) {
 		t.Fatalf("limits must not be restored from state: %v", errAdmit)
 	}
 	restarted.SetLimits(map[string]float64{"secret-key": 0.1})
-	mustRefuse(t, restarted.Admit(requestContext("secret-key"), claudeAuth))
+	refuse(t, restarted, requestContext("secret-key"), claudeAuth)
 
 	legacy := filepath.Join(t.TempDir(), StateFileName)
 	content := `{"version":1,"since":"2026-10-01T08:00:00Z","saved_at":"2026-10-07T11:00:00Z","keys":{"` + KeyID("old-key") + `":{"totals":{"requests":3,"failed":1,"tokens":{"input_tokens":10,"output_tokens":5,"reasoning_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0,"total_tokens":15}},"daily":{"2026-10-07":{"requests":3,"failed":1,"tokens":{"total_tokens":15}}},"first_used_at":"2026-10-07T10:00:00Z","last_used_at":"2026-10-07T10:30:00Z"}},"claude_credentials":{}}`
@@ -491,7 +508,8 @@ func TestAdmitIsSafeForConcurrentUse(t *testing.T) {
 		go func(worker int) {
 			defer wg.Done()
 			for j := 0; j < 50; j++ {
-				if tracker.Admit(ctx, claudeAuth) != nil {
+				if errAdmit := tracker.Admit(ctx, claudeAuth); errAdmit != nil {
+					tracker.RecordRefusal(ctx, errAdmit)
 					refusals[worker]++
 				}
 				if j%10 == 0 {
@@ -540,5 +558,246 @@ func TestIsKeyID(t *testing.T) {
 		if isKeyID(value) {
 			t.Fatalf("%q must not be treated as a key id", value)
 		}
+	}
+}
+
+func TestZeroFullKeyEntryLiftsAnIDLimit(t *testing.T) {
+	now := testNow
+	tracker, _ := limitedKeyTracker(t, &now)
+	ctx := requestContext("key-a")
+	// The full-key entry wins over the id entry even when it says "no limit".
+	tracker.SetLimits(map[string]float64{"key-a": 0, KeyID("key-a"): 0.125})
+	if errAdmit := tracker.Admit(ctx, claudeAuth); errAdmit != nil {
+		t.Fatalf("a full-key 0 must lift the id limit: %v", errAdmit)
+	}
+	key := findKey(t, tracker.Snapshot(SnapshotOptions{APIKeys: []string{"key-a"}}), KeyID("key-a"))
+	if key.Claude == nil || key.Claude.LimitProUnits != nil || key.Claude.LimitReached {
+		t.Fatalf("claude = %+v, want no limit reported", key.Claude)
+	}
+	// The other way round the id entry still applies.
+	tracker.SetLimits(map[string]float64{KeyID("key-a"): 0.125})
+	mustRefuse(t, tracker.Admit(ctx, claudeAuth))
+}
+
+func TestSnapshotNeverShowsARealKeyThatLooksLikeAnID(t *testing.T) {
+	// A real client key of exactly 16 lowercase hex characters.
+	const hexKey = "0123456789abcdef"
+	now := testNow
+	tracker := newTestTracker(&now)
+	tracker.SetLimits(map[string]float64{hexKey: 0.125})
+
+	assertHidden := func(opts SnapshotOptions, label string) {
+		t.Helper()
+		snapshot := tracker.Snapshot(opts)
+		data, errMarshal := json.Marshal(snapshot)
+		if errMarshal != nil {
+			t.Fatal(errMarshal)
+		}
+		if strings.Contains(string(data), hexKey) {
+			t.Fatalf("%s: snapshot shows the raw key: %s", label, data)
+		}
+		key := findKey(t, snapshot, KeyID(hexKey))
+		if key.Claude == nil || key.Claude.LimitProUnits == nil || *key.Claude.LimitProUnits != 0.125 {
+			t.Fatalf("%s: the key's own row carries no limit: %+v", label, key.Claude)
+		}
+		if key.Key != "0123...cdef" {
+			t.Fatalf("%s: masked key = %q", label, key.Key)
+		}
+	}
+	// Known because it is configured.
+	assertHidden(SnapshotOptions{APIKeys: []string{hexKey}}, "configured")
+	// Known because it has been used.
+	seq := &claudeSeq{tracker: tracker, now: &now}
+	resetAt := testNow.Add(72 * time.Hour)
+	seq.send(hexKey, "claude-1", claudeObs{0.125, resetAt}, breakdown(100, 0, 0, 0, 0))
+	seq.send(hexKey, "claude-1", claudeObs{0.375, resetAt}, breakdown(100, 0, 0, 0, 0))
+	assertHidden(SnapshotOptions{}, "used")
+	mustRefuse(t, tracker.Admit(requestContext(hexKey), claudeAuth))
+	key := findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID(hexKey))
+	if !key.Claude.LimitReached {
+		t.Fatalf("claude = %+v, want the limit reached on the key's own row", key.Claude)
+	}
+}
+
+func TestLimitedKeysAreTrackedBeyondTheCapacity(t *testing.T) {
+	now := testNow
+	tracker := newTestTracker(&now)
+	for i := 0; i < maxTrackedKeys; i++ {
+		tracker.HandleUsage(context.Background(), record(fmt.Sprintf("filler-%d", i), "gpt-5", breakdown(1, 0, 0, 1, 0)))
+	}
+	tracker.SetLimits(map[string]float64{"key-late": 0.125})
+	seq := &claudeSeq{tracker: tracker, now: &now}
+	resetAt := testNow.Add(72 * time.Hour)
+	seq.send("key-late", "claude-1", claudeObs{0.125, resetAt}, breakdown(100, 0, 0, 0, 0))
+	seq.send("key-late", "claude-1", claudeObs{0.375, resetAt}, breakdown(100, 0, 0, 0, 0))
+	quota := mustRefuse(t, tracker.Admit(requestContext("key-late"), claudeAuth))
+	if !strings.Contains(quota.Error(), "0.25 of 0.12 Pro units") {
+		t.Fatalf("message = %q", quota.Error())
+	}
+	key := findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-late"))
+	if key.Totals.Requests != 2 || key.Claude == nil || !key.Claude.LimitReached {
+		t.Fatalf("limited key beyond the cap = %+v claude = %+v", key.Totals, key.Claude)
+	}
+	// Keys without a limit are still capped.
+	tracker.HandleUsage(context.Background(), record("key-unlimited", "gpt-5", breakdown(1, 0, 0, 1, 0)))
+	for _, entry := range tracker.Snapshot(SnapshotOptions{}).Keys {
+		if entry.ID == KeyID("key-unlimited") {
+			t.Fatal("an unlimited key beyond the cap must not be tracked")
+		}
+	}
+}
+
+func TestRecordRefusalCountsOnlyRefusalsReturnedToTheClient(t *testing.T) {
+	now := testNow
+	tracker, _ := limitedKeyTracker(t, &now)
+	tracker.SetLimits(map[string]float64{"key-a": 0.125})
+	ctx := requestContext("key-a")
+	// Deciding is not counting: the conductor may still serve the request elsewhere.
+	refusal := mustRefuse(t, tracker.Admit(ctx, claudeAuth))
+	mustRefuse(t, tracker.Admit(ctx, claudeAuth))
+	if key := findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a")); key.Totals.Blocked != 0 {
+		t.Fatalf("blocked = %d after admission decisions, want 0", key.Totals.Blocked)
+	}
+	var logged bytes.Buffer
+	log.SetOutput(&logged)
+	tracker.RecordRefusal(ctx, refusal)
+	tracker.RecordRefusal(ctx, errors.New("not a refusal"))
+	tracker.RecordRefusal(ctx, nil)
+	log.SetOutput(io.Discard)
+	key := findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a"))
+	if key.Totals.Blocked != 1 || len(key.Daily) != 1 || key.Daily[0].Blocked != 1 || key.Totals.Requests != 2 {
+		t.Fatalf("totals = %+v daily = %+v, want exactly one blocked", key.Totals, key.Daily)
+	}
+	// One info line per recorded refusal, naming the key by id in the message itself.
+	lines := strings.Count(logged.String(), "refused, Claude allowance reached")
+	if lines != 1 || !strings.Contains(logged.String(), "key "+KeyID("key-a")+" refused") || strings.Contains(logged.String(), "key-a") {
+		t.Fatalf("log = %q, want one refusal line by key id", logged.String())
+	}
+	// A key reset between the decision and the record has nothing to count.
+	tracker.Reset(KeyID("key-a"))
+	tracker.RecordRefusal(ctx, refusal)
+	for _, entry := range tracker.Snapshot(SnapshotOptions{}).Keys {
+		if entry.ID == KeyID("key-a") && entry.Totals.Blocked != 0 {
+			t.Fatalf("blocked after reset = %d", entry.Totals.Blocked)
+		}
+	}
+}
+
+// stubExecutor serves one provider and records how often it was called.
+type stubExecutor struct {
+	provider string
+	mu       sync.Mutex
+	calls    int
+}
+
+func (e *stubExecutor) Identifier() string { return e.provider }
+
+func (e *stubExecutor) Execute(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.mu.Lock()
+	e.calls++
+	e.mu.Unlock()
+	return cliproxyexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
+}
+
+func (e *stubExecutor) ExecuteStream(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	e.mu.Lock()
+	e.calls++
+	e.mu.Unlock()
+	chunks := make(chan cliproxyexecutor.StreamChunk, 1)
+	chunks <- cliproxyexecutor.StreamChunk{Payload: []byte("data: {}\n\n")}
+	close(chunks)
+	return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func (*stubExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+
+func (*stubExecutor) CountTokens(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{Payload: []byte(`{"input_tokens":1}`)}, nil
+}
+
+func (*stubExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *stubExecutor) count() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.calls
+}
+
+func registerStubAuth(t *testing.T, manager *coreauth.Manager, id, provider, model string) {
+	t.Helper()
+	registry.GetGlobalRegistry().RegisterClient(id, provider, []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+	if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       id,
+		Provider: provider,
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"disable_cooling": true},
+	}); errRegister != nil {
+		t.Fatalf("register %s: %v", id, errRegister)
+	}
+}
+
+func TestConductorCountsBlockedOnlyWhenTheRefusalIsReturned(t *testing.T) {
+	for _, kind := range []string{"execute", "stream"} {
+		t.Run(kind, func(t *testing.T) {
+			now := testNow
+			tracker, _ := limitedKeyTracker(t, &now)
+			tracker.SetLimits(map[string]float64{"key-a": 0.125})
+			manager := coreauth.NewManager(nil, nil, nil)
+			// Retry rounds must not count a refusal more than once.
+			manager.SetRetryConfig(2, 0, 0)
+			manager.SetAdmissionPolicy(tracker)
+			model := "blocked-accounting-" + kind
+			claude := &stubExecutor{provider: "claude"}
+			codex := &stubExecutor{provider: "codex"}
+			manager.RegisterExecutor(claude)
+			manager.RegisterExecutor(codex)
+			registerStubAuth(t, manager, "blocked-claude-1-"+kind, "claude", model)
+			registerStubAuth(t, manager, "blocked-claude-2-"+kind, "claude", model)
+			registerStubAuth(t, manager, "blocked-codex-"+kind, "codex", model)
+
+			run := func(providers []string) error {
+				ctx := requestContext("key-a")
+				if kind == "execute" {
+					_, errExecute := manager.Execute(ctx, providers, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+					return errExecute
+				}
+				result, errStream := manager.ExecuteStream(ctx, providers, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Stream: true})
+				if result != nil {
+					for range result.Chunks {
+					}
+				}
+				return errStream
+			}
+			blocked := func() int64 {
+				return findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a")).Totals.Blocked
+			}
+			// Served by another provider: refused on Claude, but not a blocked request.
+			if errRun := run([]string{"claude", "codex"}); errRun != nil {
+				t.Fatalf("fallback error = %v", errRun)
+			}
+			if claude.count() != 0 || codex.count() != 1 {
+				t.Fatalf("calls: claude=%d codex=%d", claude.count(), codex.count())
+			}
+			if got := blocked(); got != 0 {
+				t.Fatalf("blocked = %d after a served fallback, want 0", got)
+			}
+			// Refused everywhere: counted exactly once despite two credentials and retry rounds.
+			errRun := run([]string{"claude"})
+			var quota *coreauth.ClientQuotaError
+			if !errors.As(errRun, &quota) {
+				t.Fatalf("error = %v, want the refusal", errRun)
+			}
+			if got := blocked(); got != 1 {
+				t.Fatalf("blocked = %d after a refused request, want 1", got)
+			}
+			if claude.count() != 0 {
+				t.Fatalf("claude was called %d times", claude.count())
+			}
+		})
 	}
 }

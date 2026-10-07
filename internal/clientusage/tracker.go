@@ -213,7 +213,8 @@ func (t *Tracker) HandleUsage(_ context.Context, record coreusage.Record) {
 		t.since = now
 	}
 	state := t.keys[keyID]
-	if state == nil && len(t.keys) < maxTrackedKeys {
+	// Keys with a Claude allowance are always tracked, past the cap, so it is enforced.
+	if state == nil && (len(t.keys) < maxTrackedKeys || t.limitedLocked(record.APIKey)) {
 		state = &keyState{FirstUsedAt: at}
 		t.keys[keyID] = state
 	}

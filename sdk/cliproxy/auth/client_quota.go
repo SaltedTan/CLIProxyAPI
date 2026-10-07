@@ -23,6 +23,13 @@ type AdmissionPolicy interface {
 	Admit(ctx context.Context, auth *Auth) error
 }
 
+// RefusalRecorder is implemented by admission policies that account for a refusal
+// only once the conductor returns it to the client. A request refused by one
+// provider and served by another is not recorded.
+type RefusalRecorder interface {
+	RecordRefusal(ctx context.Context, refusal error)
+}
+
 type admissionPolicyHolder struct {
 	policy AdmissionPolicy
 }
@@ -131,11 +138,14 @@ func retryAfterSeconds(retryAfter time.Duration) int64 {
 // admissionCache evaluates the admission policy once per request and provider.
 // The decision depends only on the client key and the credential's provider, so the
 // result is reused for every other candidate of that provider, including across
-// retry rounds, and a refusal is counted once per request.
+// retry rounds. It also remembers whether the request reached an upstream, so a
+// refusal is returned, and recorded with the policy, only for requests that never did.
 type admissionCache struct {
 	policy    AdmissionPolicy
 	decisions map[string]error
 	refusal   error
+	attempted bool
+	recorded  bool
 }
 
 // newAdmissionCache returns nil when no policy is installed or Home mode is on,
@@ -168,10 +178,26 @@ func (c *admissionCache) admit(ctx context.Context, auth *Auth) error {
 	return decision
 }
 
-// refused returns the first refusal recorded for this request, if any.
-func (c *admissionCache) refused() error {
-	if c == nil {
+// markAttempted notes that the request went on to an upstream attempt. From then on
+// the outcome of that attempt, not a refusal, is the request's result.
+func (c *admissionCache) markAttempted() {
+	if c != nil {
+		c.attempted = true
+	}
+}
+
+// finalRefusal returns the request's refusal when every candidate was refused and no
+// upstream attempt was made in any round, recording it with the policy exactly once.
+// It returns nil otherwise, so an earlier upstream outcome is reported instead.
+func (c *admissionCache) finalRefusal(ctx context.Context) error {
+	if c == nil || c.refusal == nil || c.attempted {
 		return nil
+	}
+	if !c.recorded {
+		c.recorded = true
+		if recorder, ok := c.policy.(RefusalRecorder); ok {
+			recorder.RecordRefusal(ctx, c.refusal)
+		}
 	}
 	return c.refusal
 }

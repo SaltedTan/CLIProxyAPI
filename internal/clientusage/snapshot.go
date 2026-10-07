@@ -120,7 +120,13 @@ func (t *Tracker) Snapshot(opts SnapshotOptions) Snapshot {
 		resolve = t.resolve
 	}
 	credentialRef := t.credentialRefLocked(resolve)
-	limits := t.limitsByIDLocked()
+	configured := make(map[string]struct{}, len(opts.APIKeys))
+	for _, apiKey := range opts.APIKeys {
+		if apiKey = strings.TrimSpace(apiKey); apiKey != "" {
+			configured[apiKey] = struct{}{}
+		}
+	}
+	limits := t.limitsByIDLocked(configured)
 
 	seen := make(map[string]struct{}, len(opts.APIKeys))
 	for _, apiKey := range opts.APIKeys {
