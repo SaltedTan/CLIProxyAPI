@@ -41,6 +41,12 @@ type ClaudeTokenStorage struct {
 	// OrganizationName is the display name returned by OAuth.
 	OrganizationName string `json:"organization_name,omitempty"`
 
+	// OrganizationType is the subscription plan reported by the OAuth profile.
+	OrganizationType string `json:"organization_type,omitempty"`
+
+	// RateLimitTier is the rate limit tier reported by the OAuth profile.
+	RateLimitTier string `json:"rate_limit_tier,omitempty"`
+
 	// DeviceIDs contains the single device identity assigned to this credential.
 	DeviceIDs []string `json:"claude_device_ids,omitempty"`
 

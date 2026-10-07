@@ -165,6 +165,12 @@ type OAuthProfile struct {
 	Organization struct {
 		UUID string `json:"uuid"`
 		Name string `json:"name"`
+		// OrganizationType is the subscription plan, e.g. "claude_pro",
+		// "claude_max", "claude_team" or "claude_enterprise".
+		OrganizationType string `json:"organization_type"`
+		// RateLimitTier distinguishes plan multipliers, e.g.
+		// "default_claude_max_5x" or "default_claude_max_20x".
+		RateLimitTier string `json:"rate_limit_tier"`
 	} `json:"organization"`
 }
 
@@ -464,6 +470,8 @@ func (o *ClaudeAuth) ExchangeCodeForTokens(ctx context.Context, code, state stri
 		if value := strings.TrimSpace(profile.Organization.Name); value != "" {
 			tokenData.OrganizationName = value
 		}
+		tokenData.OrganizationType = strings.TrimSpace(profile.Organization.OrganizationType)
+		tokenData.RateLimitTier = strings.TrimSpace(profile.Organization.RateLimitTier)
 	}
 
 	// Create auth bundle.
@@ -597,6 +605,10 @@ func (o *ClaudeAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken
 	tokenData.AccountUUID = profile.Account.UUID
 	tokenData.OrganizationUUID = profile.Organization.UUID
 	tokenData.OrganizationName = profile.Organization.Name
+	// The plan tier rides on the profile response refresh already fetches, so
+	// plan changes are picked up without an extra control-plane request.
+	tokenData.OrganizationType = strings.TrimSpace(profile.Organization.OrganizationType)
+	tokenData.RateLimitTier = strings.TrimSpace(profile.Organization.RateLimitTier)
 	return tokenData, nil
 }
 
@@ -618,6 +630,8 @@ func (o *ClaudeAuth) CreateTokenStorage(bundle *ClaudeAuthBundle) *ClaudeTokenSt
 		AccountUUID:      bundle.TokenData.AccountUUID,
 		OrganizationUUID: bundle.TokenData.OrganizationUUID,
 		OrganizationName: bundle.TokenData.OrganizationName,
+		OrganizationType: bundle.TokenData.OrganizationType,
+		RateLimitTier:    bundle.TokenData.RateLimitTier,
 		DeviceIDs:        append([]string(nil), bundle.DeviceIDs...),
 		Expire:           bundle.TokenData.Expire,
 	}
@@ -687,6 +701,12 @@ func (o *ClaudeAuth) UpdateTokenStorage(storage *ClaudeTokenStorage, tokenData *
 	}
 	if tokenData.OrganizationName != "" {
 		storage.OrganizationName = tokenData.OrganizationName
+	}
+	if tokenData.OrganizationType != "" {
+		storage.OrganizationType = tokenData.OrganizationType
+	}
+	if tokenData.RateLimitTier != "" {
+		storage.RateLimitTier = tokenData.RateLimitTier
 	}
 	storage.Expire = tokenData.Expire
 }

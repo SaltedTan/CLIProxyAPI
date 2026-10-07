@@ -173,6 +173,108 @@ func TestSaveTokenRecord_PreservesExistingAuthFileSettings(t *testing.T) {
 	}
 }
 
+func TestSaveTokenRecord_ClaudeReloginPlanTier(t *testing.T) {
+	testCases := []struct {
+		name     string
+		newType  string
+		newTier  string
+		wantType string
+		wantTier string
+	}{
+		{
+			name:     "profile reports new plan",
+			newType:  "claude_max",
+			newTier:  "default_claude_max_20x",
+			wantType: "claude_max",
+			wantTier: "default_claude_max_20x",
+		},
+		{
+			name:     "profile omits plan keeps stored plan",
+			wantType: "claude_pro",
+			wantTier: "default_claude_ai",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			authDir := t.TempDir()
+			fileName := claude.CredentialFileName("user@example.com", "organization-a", "account-a")
+			filePath := filepath.Join(authDir, fileName)
+			existing := map[string]any{
+				"type":              "claude",
+				"email":             "user@example.com",
+				"organization_uuid": "organization-a",
+				"account_uuid":      "account-a",
+				"access_token":      "old-token",
+				"refresh_token":     "old-refresh",
+				"organization_type": "claude_pro",
+				"rate_limit_tier":   "default_claude_ai",
+				"prefix":            "team",
+			}
+			raw, errMarshal := json.Marshal(existing)
+			if errMarshal != nil {
+				t.Fatalf("marshal existing credential: %v", errMarshal)
+			}
+			if errWrite := os.WriteFile(filePath, raw, 0o600); errWrite != nil {
+				t.Fatalf("write existing credential: %v", errWrite)
+			}
+
+			tokenStorage := &claude.ClaudeTokenStorage{
+				AccessToken:      "new-token",
+				RefreshToken:     "new-refresh",
+				Email:            "user@example.com",
+				OrganizationUUID: "organization-a",
+				AccountUUID:      "account-a",
+				OrganizationType: testCase.newType,
+				RateLimitTier:    testCase.newTier,
+				Expire:           "2026-12-31T23:59:59Z",
+			}
+			metadata := map[string]any{
+				"email":             tokenStorage.Email,
+				"organization_uuid": tokenStorage.OrganizationUUID,
+				"account_uuid":      tokenStorage.AccountUUID,
+			}
+			if tokenStorage.OrganizationType != "" {
+				metadata["organization_type"] = tokenStorage.OrganizationType
+			}
+			if tokenStorage.RateLimitTier != "" {
+				metadata["rate_limit_tier"] = tokenStorage.RateLimitTier
+			}
+			record := &coreauth.Auth{
+				ID:       fileName,
+				Provider: "claude",
+				FileName: fileName,
+				Storage:  tokenStorage,
+				Metadata: metadata,
+			}
+
+			h := NewHandler(&config.Config{AuthDir: authDir}, "", nil)
+			if _, errSave := h.saveTokenRecord(context.Background(), record); errSave != nil {
+				t.Fatalf("saveTokenRecord error: %v", errSave)
+			}
+
+			savedRaw, errRead := os.ReadFile(filePath)
+			if errRead != nil {
+				t.Fatalf("read saved credential: %v", errRead)
+			}
+			var saved map[string]any
+			if errUnmarshal := json.Unmarshal(savedRaw, &saved); errUnmarshal != nil {
+				t.Fatalf("unmarshal saved credential: %v", errUnmarshal)
+			}
+			for key, want := range map[string]any{
+				"access_token":      "new-token",
+				"organization_type": testCase.wantType,
+				"rate_limit_tier":   testCase.wantTier,
+				"prefix":            "team",
+			} {
+				if got := saved[key]; got != want {
+					t.Errorf("%s = %#v, want %#v", key, got, want)
+				}
+			}
+		})
+	}
+}
+
 func TestSaveTokenRecord_MigratesMatchingLegacyClaudeCredential(t *testing.T) {
 	authDir := t.TempDir()
 	legacyFileName := "claude-user@example.com.json"

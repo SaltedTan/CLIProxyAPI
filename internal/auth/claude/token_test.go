@@ -57,3 +57,44 @@ func TestSaveTokenToFile_PreservesCustomMetadata(t *testing.T) {
 		t.Errorf("weight = %v, want 5", saved["weight"])
 	}
 }
+
+func TestSaveTokenToFile_PersistsPlanTierAtRoot(t *testing.T) {
+	tempDir := t.TempDir()
+
+	readSaved := func(t *testing.T, storage *ClaudeTokenStorage, name string) map[string]any {
+		t.Helper()
+		authFilePath := filepath.Join(tempDir, name)
+		if errSave := storage.SaveTokenToFile(authFilePath); errSave != nil {
+			t.Fatalf("SaveTokenToFile() error = %v", errSave)
+		}
+		savedRaw, errRead := os.ReadFile(authFilePath)
+		if errRead != nil {
+			t.Fatalf("os.ReadFile error = %v", errRead)
+		}
+		var saved map[string]any
+		if errUnmarshal := json.Unmarshal(savedRaw, &saved); errUnmarshal != nil {
+			t.Fatalf("json.Unmarshal error = %v", errUnmarshal)
+		}
+		return saved
+	}
+
+	saved := readSaved(t, &ClaudeTokenStorage{
+		Email:            "user@example.com",
+		AccessToken:      "access",
+		OrganizationType: "claude_max",
+		RateLimitTier:    "default_claude_max_20x",
+	}, "claude-plan.json")
+	if saved["organization_type"] != "claude_max" {
+		t.Errorf("organization_type = %v, want claude_max", saved["organization_type"])
+	}
+	if saved["rate_limit_tier"] != "default_claude_max_20x" {
+		t.Errorf("rate_limit_tier = %v, want default_claude_max_20x", saved["rate_limit_tier"])
+	}
+
+	saved = readSaved(t, &ClaudeTokenStorage{Email: "user@example.com", AccessToken: "access"}, "claude-no-plan.json")
+	for _, key := range []string{"organization_type", "rate_limit_tier"} {
+		if _, exists := saved[key]; exists {
+			t.Errorf("%s = %v, want omitted when empty", key, saved[key])
+		}
+	}
+}

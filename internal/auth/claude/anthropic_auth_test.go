@@ -91,7 +91,7 @@ func TestExchangeCodeForTokensPersistsUpstreamAccountAndDevicePool(t *testing.T)
 				case ProfileURL:
 					return jsonResponse(req, `{
 						"account":{"uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","email":"user@example.com"},
-						"organization":{"uuid":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","name":"Example Org"}
+						"organization":{"uuid":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","name":"Example Org","organization_type":"claude_max","rate_limit_tier":"default_claude_max_5x"}
 					}`), nil
 				case RolesURL:
 					return jsonResponse(req, `{"roles":[]}`), nil
@@ -116,9 +116,15 @@ func TestExchangeCodeForTokensPersistsUpstreamAccountAndDevicePool(t *testing.T)
 	if len(bundle.DeviceIDs) != ClaudeDevicePoolSize {
 		t.Fatalf("device pool length = %d, want %d", len(bundle.DeviceIDs), ClaudeDevicePoolSize)
 	}
+	if bundle.TokenData.OrganizationType != "claude_max" || bundle.TokenData.RateLimitTier != "default_claude_max_5x" {
+		t.Fatalf("plan tier = %q/%q, want profile plan tier", bundle.TokenData.OrganizationType, bundle.TokenData.RateLimitTier)
+	}
 	storage := auth.CreateTokenStorage(bundle)
 	if storage.AccountUUID != bundle.TokenData.AccountUUID || storage.OrganizationUUID != bundle.TokenData.OrganizationUUID {
 		t.Fatalf("storage account identity = %#v, want bundle identity", storage)
+	}
+	if storage.OrganizationType != "claude_max" || storage.RateLimitTier != "default_claude_max_5x" {
+		t.Fatalf("storage plan tier = %q/%q, want bundle plan tier", storage.OrganizationType, storage.RateLimitTier)
 	}
 	if len(storage.DeviceIDs) != ClaudeDevicePoolSize {
 		t.Fatalf("storage device pool length = %d, want %d", len(storage.DeviceIDs), ClaudeDevicePoolSize)
@@ -258,6 +264,9 @@ func TestExchangeCodeForTokensSurvivesCompanionLookupFailure(t *testing.T) {
 	}
 	if bundle.TokenData.OrganizationName != "Token Org" {
 		t.Fatalf("organization = %q, want token-response organization", bundle.TokenData.OrganizationName)
+	}
+	if bundle.TokenData.OrganizationType != "" || bundle.TokenData.RateLimitTier != "" {
+		t.Fatalf("plan tier = %q/%q, want empty without a profile response", bundle.TokenData.OrganizationType, bundle.TokenData.RateLimitTier)
 	}
 }
 
@@ -584,7 +593,12 @@ func TestFetchOAuthProfile(t *testing.T) {
 					StatusCode: http.StatusOK,
 					Body: io.NopCloser(strings.NewReader(`{
 						"account":{"uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","email":"user@example.com"},
-						"organization":{"uuid":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","name":"Example Org"}
+						"organization":{
+							"uuid":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+							"name":"Example Org",
+							"organization_type":"claude_max",
+							"rate_limit_tier":"default_claude_max_20x"
+						}
 					}`)),
 					Header:  make(http.Header),
 					Request: req,
@@ -603,6 +617,47 @@ func TestFetchOAuthProfile(t *testing.T) {
 	if profile.Organization.UUID != "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" || profile.Organization.Name != "Example Org" {
 		t.Fatalf("organization = %#v, want upstream profile organization", profile.Organization)
 	}
+	if profile.Organization.OrganizationType != "claude_max" || profile.Organization.RateLimitTier != "default_claude_max_20x" {
+		t.Fatalf("organization plan = %#v, want upstream profile plan tier", profile.Organization)
+	}
+}
+
+func TestRefreshTokensCarriesPlanTierWithoutExtraRequests(t *testing.T) {
+	resetClaudeRefreshState()
+	defer resetClaudeRefreshState()
+
+	var requests []string
+	auth := &ClaudeAuth{
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				requests = append(requests, req.URL.String())
+				switch req.URL.String() {
+				case RefreshTokenURL:
+					return jsonResponse(req, `{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}`), nil
+				case ProfileURL:
+					return jsonResponse(req, `{
+						"account":{"uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","email":"user@example.com"},
+						"organization":{"uuid":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","name":"Example Org","organization_type":" claude_pro ","rate_limit_tier":" default_claude_ai "}
+					}`), nil
+				default:
+					t.Fatalf("unexpected OAuth request URL %s", req.URL)
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	tokenData, errRefresh := auth.RefreshTokens(t.Context(), "plan-tier-refresh")
+	if errRefresh != nil {
+		t.Fatalf("RefreshTokens() error = %v", errRefresh)
+	}
+	wantRequests := []string{RefreshTokenURL, ProfileURL}
+	if len(requests) != len(wantRequests) || requests[0] != wantRequests[0] || requests[1] != wantRequests[1] {
+		t.Fatalf("refresh requests = %v, want %v", requests, wantRequests)
+	}
+	if tokenData.OrganizationType != "claude_pro" || tokenData.RateLimitTier != "default_claude_ai" {
+		t.Fatalf("plan tier = %q/%q, want trimmed profile plan tier", tokenData.OrganizationType, tokenData.RateLimitTier)
+	}
 }
 
 func TestUpdateTokenStoragePreservesAccountWhenRefreshOmitsIt(t *testing.T) {
@@ -611,6 +666,8 @@ func TestUpdateTokenStoragePreservesAccountWhenRefreshOmitsIt(t *testing.T) {
 		AccountUUID:      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
 		OrganizationUUID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
 		OrganizationName: "Example Org",
+		OrganizationType: "claude_max",
+		RateLimitTier:    "default_claude_max_5x",
 	}
 	(&ClaudeAuth{}).UpdateTokenStorage(storage, &ClaudeTokenData{
 		AccessToken:  "new-access",
@@ -626,5 +683,18 @@ func TestUpdateTokenStoragePreservesAccountWhenRefreshOmitsIt(t *testing.T) {
 	}
 	if storage.OrganizationUUID != "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" || storage.OrganizationName != "Example Org" {
 		t.Fatalf("organization = %q/%q, want preserved", storage.OrganizationUUID, storage.OrganizationName)
+	}
+	if storage.OrganizationType != "claude_max" || storage.RateLimitTier != "default_claude_max_5x" {
+		t.Fatalf("plan tier = %q/%q, want preserved", storage.OrganizationType, storage.RateLimitTier)
+	}
+
+	(&ClaudeAuth{}).UpdateTokenStorage(storage, &ClaudeTokenData{
+		AccessToken:      "newer-access",
+		RefreshToken:     "newer-refresh",
+		OrganizationType: "claude_max",
+		RateLimitTier:    "default_claude_max_20x",
+	})
+	if storage.RateLimitTier != "default_claude_max_20x" {
+		t.Fatalf("rate limit tier = %q, want updated tier", storage.RateLimitTier)
 	}
 }

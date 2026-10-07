@@ -19,6 +19,8 @@ const (
 
 type claudeOAuthProfileFetcher func(context.Context, *cliproxyauth.Auth, string) (*claudeauth.OAuthProfile, error)
 
+type claudeTokenRefresher func(context.Context, *cliproxyauth.Auth, string) (*claudeauth.ClaudeTokenData, error)
+
 func (e *ClaudeExecutor) ShouldPrepareRequestAuth(auth *cliproxyauth.Auth) bool {
 	apiKey, _ := claudeCreds(auth)
 	if !isClaudeOAuthToken(apiKey) || auth == nil {
@@ -126,6 +128,8 @@ func (e *ClaudeExecutor) PrepareRequestAuth(ctx context.Context, auth *cliproxya
 	claudeauth.StoreMetadataString(&auth.Metadata, "email", profile.Account.Email)
 	claudeauth.StoreMetadataString(&auth.Metadata, "organization_uuid", profile.Organization.UUID)
 	claudeauth.StoreMetadataString(&auth.Metadata, "organization_name", profile.Organization.Name)
+	claudeauth.StoreMetadataString(&auth.Metadata, "organization_type", profile.Organization.OrganizationType)
+	claudeauth.StoreMetadataString(&auth.Metadata, "rate_limit_tier", profile.Organization.RateLimitTier)
 	claudeauth.StoreMetadataString(&auth.Metadata, claudeAccountProfileCheckedAtKey, time.Now().UTC().Format(time.RFC3339))
 	return auth, nil
 }
@@ -161,8 +165,7 @@ func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
 	if refreshToken == "" {
 		return auth, nil
 	}
-	svc := claudeauth.NewClaudeAuthWithProxyURL(e.cfg, auth.ProxyURL)
-	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
+	td, err := e.refreshClaudeTokens(ctx, auth, refreshToken)
 	if err != nil {
 		return nil, err
 	}
@@ -175,8 +178,18 @@ func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
 	claudeauth.StoreMetadataString(&auth.Metadata, "account_uuid", td.AccountUUID)
 	claudeauth.StoreMetadataString(&auth.Metadata, "organization_uuid", td.OrganizationUUID)
 	claudeauth.StoreMetadataString(&auth.Metadata, "organization_name", td.OrganizationName)
+	claudeauth.StoreMetadataString(&auth.Metadata, "organization_type", td.OrganizationType)
+	claudeauth.StoreMetadataString(&auth.Metadata, "rate_limit_tier", td.RateLimitTier)
 	claudeauth.StoreMetadataValue(&auth.Metadata, "expired", td.Expire)
 	claudeauth.StoreMetadataValue(&auth.Metadata, "type", "claude")
 	claudeauth.StoreMetadataValue(&auth.Metadata, "last_refresh", time.Now().Format(time.RFC3339))
 	return auth, nil
+}
+
+func (e *ClaudeExecutor) refreshClaudeTokens(ctx context.Context, auth *cliproxyauth.Auth, refreshToken string) (*claudeauth.ClaudeTokenData, error) {
+	if e.tokenRefresher != nil {
+		return e.tokenRefresher(ctx, auth, refreshToken)
+	}
+	svc := claudeauth.NewClaudeAuthWithProxyURL(e.cfg, auth.ProxyURL)
+	return svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 }

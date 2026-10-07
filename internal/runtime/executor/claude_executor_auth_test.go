@@ -88,6 +88,8 @@ func TestClaudeExecutorPrepareRequestAuthPopulatesCredentialIdentity(t *testing.
 		profile.Account.Email = "user@example.com"
 		profile.Organization.UUID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 		profile.Organization.Name = "Example Org"
+		profile.Organization.OrganizationType = "claude_max"
+		profile.Organization.RateLimitTier = "default_claude_max_5x"
 		return profile, nil
 	}
 	auth := &cliproxyauth.Auth{
@@ -114,6 +116,12 @@ func TestClaudeExecutorPrepareRequestAuthPopulatesCredentialIdentity(t *testing.
 	}
 	if got := prepared.Metadata["organization_uuid"]; got != "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" {
 		t.Fatalf("organization_uuid = %#v, want upstream profile organization", got)
+	}
+	if got := prepared.Metadata["organization_type"]; got != "claude_max" {
+		t.Fatalf("organization_type = %#v, want upstream profile plan", got)
+	}
+	if got := prepared.Metadata["rate_limit_tier"]; got != "default_claude_max_5x" {
+		t.Fatalf("rate_limit_tier = %#v, want upstream profile tier", got)
 	}
 	if executor.ShouldPrepareRequestAuth(prepared) {
 		t.Fatal("ShouldPrepareRequestAuth() = true after identity was populated")
@@ -342,5 +350,79 @@ func TestClaudeExecutorPrepareRequestAuthEmptyAccountUUIDInProfileFallback(t *te
 	}
 	if executor.ShouldPrepareRequestAuth(prepared) {
 		t.Fatal("ShouldPrepareRequestAuth() = true after identity was populated")
+	}
+}
+
+func TestClaudeExecutorRefreshPlanTierMetadata(t *testing.T) {
+	testCases := []struct {
+		name     string
+		refresh  claudeauth.ClaudeTokenData
+		wantType string
+		wantTier string
+	}{
+		{
+			name:     "profile lookup failed keeps stored tier",
+			refresh:  claudeauth.ClaudeTokenData{AccessToken: "new-access", RefreshToken: "new-refresh"},
+			wantType: "claude_max",
+			wantTier: "default_claude_max_5x",
+		},
+		{
+			name: "profile reports new tier",
+			refresh: claudeauth.ClaudeTokenData{
+				AccessToken:      "new-access",
+				RefreshToken:     "new-refresh",
+				OrganizationType: "claude_max",
+				RateLimitTier:    "default_claude_max_20x",
+			},
+			wantType: "claude_max",
+			wantTier: "default_claude_max_20x",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			executor := NewClaudeExecutor(&config.Config{})
+			refreshCalls := 0
+			executor.tokenRefresher = func(_ context.Context, _ *cliproxyauth.Auth, refreshToken string) (*claudeauth.ClaudeTokenData, error) {
+				refreshCalls++
+				if refreshToken != "old-refresh" {
+					t.Fatalf("refresh token = %q, want stored refresh token", refreshToken)
+				}
+				td := testCase.refresh
+				return &td, nil
+			}
+			auth := &cliproxyauth.Auth{
+				ID:       "claude-plan-tier",
+				Provider: "claude",
+				Metadata: map[string]any{
+					"type":              "claude",
+					"access_token":      "old-access",
+					"refresh_token":     "old-refresh",
+					"organization_name": "Example Org",
+					"organization_type": "claude_max",
+					"rate_limit_tier":   "default_claude_max_5x",
+				},
+			}
+
+			refreshed, errRefresh := executor.Refresh(context.Background(), auth)
+			if errRefresh != nil {
+				t.Fatalf("Refresh() error = %v", errRefresh)
+			}
+			if refreshCalls != 1 {
+				t.Fatalf("refresh calls = %d, want 1", refreshCalls)
+			}
+			if got := refreshed.Metadata["access_token"]; got != "new-access" {
+				t.Fatalf("access_token = %#v, want refreshed token", got)
+			}
+			if got := refreshed.Metadata["organization_name"]; got != "Example Org" {
+				t.Fatalf("organization_name = %#v, want preserved", got)
+			}
+			if got := refreshed.Metadata["organization_type"]; got != testCase.wantType {
+				t.Fatalf("organization_type = %#v, want %q", got, testCase.wantType)
+			}
+			if got := refreshed.Metadata["rate_limit_tier"]; got != testCase.wantTier {
+				t.Fatalf("rate_limit_tier = %#v, want %q", got, testCase.wantTier)
+			}
+		})
 	}
 }
