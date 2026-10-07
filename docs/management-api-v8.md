@@ -381,11 +381,16 @@ the document names in a client key map or in `access.api-keys` and aliases
 elsewhere, as a section, provider or field name, is masked in the diagnostic
 that names it and in the warning logged when a write comments out an unknown
 section. Every configuration error a load, a parse, a layout normalization or a
-v8 validation returns also masks each such key wherever it appears, ignoring
-case, so a value a validator prints (`invalid trusted-proxies entry "fi...ey"`)
-is masked too; a key that equals a word in the message masks that word as well.
-Diagnostics name the map (`api-key-limits` or `api-key-names`) and the line,
-never the keys above it.
+v8 validation returns also masks each such key wherever it appears (as
+written, trimmed, lower- or uppercased, or escaped; a `!!binary` list entry by
+the bytes it encodes), so a value a validator prints
+(`invalid trusted-proxies entry "fi...ey"`) is masked too; a key that equals a
+word in the message masks that word as well, and a masked key whose ends would
+show another key is masked whole. Warnings logged while a configuration is
+parsed or saved are not covered: a validator that logs an offending value (a
+payload parameter name, for example) can print a client key aliased into its
+field. Diagnostics name the map (`api-key-limits` or `api-key-names`) and the
+line, never the keys above it.
 
 When a key's `current_pro_units` reaches its limit, the proxy refuses that key's
 requests to every Claude credential, OAuth and API-key alike, before any

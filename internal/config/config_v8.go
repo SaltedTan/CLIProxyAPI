@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"reflect"
@@ -206,21 +207,20 @@ func (keys clientKeySet) maskUnknownFields(err error) error {
 }
 
 // maskText masks every occurrence of a client key in text that is not part of a
-// longer word, ignoring case, as written, trimmed or escaped by %q: validators
-// print an offending value, sometimes normalized, and that value can be a client
-// key the operator aliased into their field.
+// longer word, in any of clientKeyForms, ignoring case: validators print an
+// offending value, sometimes normalized, and that value can be a client key the
+// operator aliased into their field.
 func (keys clientKeySet) maskText(text string) string {
 	seen := make(map[string]struct{})
 	var forms []string
 	for key := range keys {
-		for _, form := range []string{key, strings.TrimSpace(key)} {
-			quoted := strconv.Quote(form)
-			for _, form := range []string{form, quoted[1 : len(quoted)-1]} {
-				if _, dup := seen[form]; form != "" && !dup {
-					seen[form] = struct{}{}
-					forms = append(forms, regexp.QuoteMeta(form))
-				}
+		for _, form := range clientKeyForms(key) {
+			// A pattern must be UTF-8; the %q form covers other bytes.
+			if _, dup := seen[form]; form == "" || dup || !utf8.ValidString(form) {
+				continue
 			}
+			seen[form] = struct{}{}
+			forms = append(forms, regexp.QuoteMeta(form))
 		}
 	}
 	if len(forms) == 0 {
@@ -234,16 +234,43 @@ func (keys clientKeySet) maskText(text string) string {
 	}
 	var out strings.Builder
 	last := 0
-	for _, match := range pattern.FindAllStringIndex(text, -1) {
-		if !standsAlone(text, match[0], match[1]) {
-			continue
+	for _, match := range keyMatches(pattern, text) {
+		masked := maskClientKey(text[match[0]:match[1]])
+		// The ends a masked key keeps must not show another key.
+		if len(keyMatches(pattern, masked)) > 0 {
+			masked = "***"
 		}
 		out.WriteString(text[last:match[0]])
-		out.WriteString(maskClientKey(text[match[0]:match[1]]))
+		out.WriteString(masked)
 		last = match[1]
 	}
 	out.WriteString(text[last:])
 	return out.String()
+}
+
+// clientKeyForms returns the ways a diagnostic can print key: as written or
+// trimmed, lowercased or uppercased (Go's case-insensitive matching does not
+// fold every case mapping, such as İ to i), each also escaped by %q.
+func clientKeyForms(key string) []string {
+	var forms []string
+	for _, trimmed := range []string{key, strings.TrimSpace(key)} {
+		for _, cased := range []string{trimmed, strings.ToLower(trimmed), strings.ToUpper(trimmed)} {
+			quoted := strconv.Quote(cased)
+			forms = append(forms, cased, quoted[1:len(quoted)-1])
+		}
+	}
+	return forms
+}
+
+// keyMatches returns the matches of pattern in text that stand alone.
+func keyMatches(pattern *regexp.Regexp, text string) [][]int {
+	var matches [][]int
+	for _, match := range pattern.FindAllStringIndex(text, -1) {
+		if standsAlone(text, match[0], match[1]) {
+			matches = append(matches, match)
+		}
+	}
+	return matches
 }
 
 // standsAlone reports whether text[start:end] does not continue a word on
@@ -345,8 +372,16 @@ func collectClientKeyList(list *yaml.Node, keys clientKeySet) {
 		return
 	}
 	for _, entry := range list.Content {
-		if scalar := scalarKeyNode(entry); scalar != nil {
-			keys[scalar.Value] = struct{}{}
+		scalar := scalarKeyNode(entry)
+		if scalar == nil {
+			continue
+		}
+		keys[scalar.Value] = struct{}{}
+		// A !!binary entry configures the bytes it encodes.
+		if scalar.Tag == "!!binary" {
+			if decoded, err := base64.StdEncoding.DecodeString(scalar.Value); err == nil {
+				keys[string(decoded)] = struct{}{}
+			}
 		}
 	}
 }

@@ -624,6 +624,47 @@ func TestClientKeyInThePrivateIPFlagIsMasked(t *testing.T) {
 	}
 }
 
+// TestClientKeyMaskingCoversEveryFormOfTheKey covers keys the final masking pass
+// must still recognize: a !!binary list entry (the key is the bytes it encodes),
+// a key whose lowercase form Go's case-insensitive matching does not fold (İ),
+// and a key whose masked ends are another, shorter key.
+func TestClientKeyMaskingCoversEveryFormOfTheKey(t *testing.T) {
+	cases := map[string]struct {
+		raw    string
+		hidden []string
+	}{
+		"binary entry": {
+			"config-version: 8\naccess:\n  api-keys: [&client !!binary Zml4dHVyZS1jbGllbnQtb25l]\nserver: {trusted-proxies: [*client]}\n",
+			[]string{"fixture-client-one"},
+		},
+		"binary entry beside a key that is not UTF-8": {
+			"config-version: 8\naccess:\n  api-keys: [!!binary /w==, &client " + aliasedClientKey + "]\nserver: {trusted-proxies: [*client]}\n",
+			[]string{aliasedClientKey},
+		},
+		"lowercased beyond case folding": {
+			"config-version: 8\naccess:\n  api-key-limits: {&client Fİxture-K1: 1}\nmultimedia: {disable-image-generation: *client}\n",
+			[]string{strings.ToLower("Fİxture-K1")},
+		},
+		"masked ends that are another key": {
+			"config-version: 8\naccess:\n  api-keys: [&client fixture-client-key, fixt]\nserver: {trusted-proxies: [*client]}\n",
+			[]string{"fixture-client-key", "fixt"},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := ParseConfigBytes([]byte(tc.raw))
+			if err == nil {
+				t.Fatal("ParseConfigBytes accepted the document")
+			}
+			for _, hidden := range tc.hidden {
+				if strings.Contains(strings.ToLower(err.Error()), strings.ToLower(hidden)) {
+					t.Fatalf("error shows %q: %q", hidden, err)
+				}
+			}
+		})
+	}
+}
+
 // TestAliasedClientKeySectionWarningIsMasked covers the warning logged when a
 // write comments out an unknown section: a client key aliased as the section
 // name must appear masked there too.
