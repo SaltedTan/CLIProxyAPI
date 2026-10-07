@@ -88,8 +88,9 @@ access:
     - "your-api-key-1"
     - "your-api-key-2"
     - "your-api-key-3"
-  # Optional display names for client API keys, used by usage reports.
-  # Keys are the full API key strings listed above.
+  # Optional display names for client API keys, shown by the per-key usage report
+  # (GET /v8/management/observability/usage/clients). Keys are the full API key
+  # strings listed above, or the key ids shown in that report.
   # api-key-names:
   #   "your-api-key-1": "MacBook"
   #   "your-api-key-2": "Desktop"

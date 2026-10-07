@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clientusage"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
@@ -57,6 +58,9 @@ func (s *Service) Run(ctx context.Context) error {
 	if homeEnabled {
 		forceHomeRuntimeConfig(s.cfg)
 		redisqueue.SetUsageStatisticsEnabled(true)
+	} else {
+		// Home aggregates usage itself and disables the local management API.
+		startClientUsageTracking(ctx, s.configPath, s.coreManager)
 	}
 
 	defer func() {
@@ -365,8 +369,31 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		}
 
 		usage.StopDefault()
+		if errFlush := clientusage.Default().Flush(); errFlush != nil {
+			log.Warnf("client usage: %v", errFlush)
+		}
 	})
 	return shutdownErr
+}
+
+// startClientUsageTracking restores persisted per client API key usage and keeps
+// aggregating and saving it until ctx is done.
+func startClientUsageTracking(ctx context.Context, configPath string, manager *coreauth.Manager) {
+	tracker := clientusage.Default()
+	if errOpen := tracker.Open(clientusage.ResolveStatePath(configPath)); errOpen != nil {
+		log.Warnf("client usage: %v", errOpen)
+	}
+	if manager != nil {
+		tracker.SetCredentialResolver(func(authID string) (clientusage.CredentialInfo, bool) {
+			auth, ok := manager.GetByID(authID)
+			if !ok || auth == nil {
+				return clientusage.CredentialInfo{}, false
+			}
+			return clientusage.CredentialInfoFromAuth(auth), true
+		})
+	}
+	usage.RegisterNamedPlugin(clientusage.PluginName, tracker)
+	go tracker.Run(ctx)
 }
 
 func (s *Service) ensureAuthDir() error {

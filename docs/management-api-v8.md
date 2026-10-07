@@ -97,7 +97,8 @@ retain the corresponding business operation's fields.
 | `/observability/logs/errors` | GET | List error-log files. |
 | `/observability/logs/errors/<name>` | GET | Download an error-log file. |
 | `/observability/logs/requests/<id>` | GET | Get a request log. |
-| `/observability/usage/api-keys` | GET | Get API-key usage. |
+| `/observability/usage/api-keys` | GET | Get upstream provider API-key usage. |
+| `/observability/usage/clients` | GET, DELETE | Get or reset usage per client API key (`access.api-keys`). |
 | `/observability/usage/queue` | GET | Get queued usage events. |
 | `/observability/routing` | GET | Get live routing state and recent credential selections. |
 | `/credentials` | GET, POST, DELETE | List, upload, or delete credential files. |
@@ -175,6 +176,114 @@ node. State is in memory only and resets when the process restarts.
 - `session` is a short hash for correlating decisions; raw session IDs are not
   exposed. `transport` is set for Codex attempts (`websocket` or `http`).
 - `recent` holds the latest 100 selections, newest first.
+
+## Client API key usage
+
+`GET /observability/usage/clients` reports how much each client API key (for
+example, one key per device) has used the proxy. Raw keys are never returned or
+stored: each key is identified by `id`, the first 16 hex characters of its
+SHA-256, plus a masked `key` for keys still listed in `access.api-keys`. Add
+`access.api-key-names` to show a display `name`; names may be keyed by the full
+API key or by its `id`. Requests without a client key (when `access.api-keys` is
+empty) are grouped under the `anonymous` id.
+
+Usage is saved to `client-usage.json` next to the config file (or under
+`WRITABLE_PATH`) every minute and on shutdown, and restored on startup. A file that
+cannot be read as usage state is renamed to `client-usage.json.invalid-<unix nanoseconds>`
+and tracking starts fresh. Records still queued for the usage plugins when the
+process stops may be lost. Usage is not tracked in Home mode.
+
+```json
+{
+  "generated_at": "2026-10-07T12:00:00Z",
+  "since": "2026-10-01T08:00:00Z",
+  "keys": [
+    {
+      "id": "3f9a1c2b7d4e5f60",
+      "name": "MacBook",
+      "key": "sk-m...9f3k",
+      "configured": true,
+      "first_used_at": "2026-10-01T08:05:00Z",
+      "last_used_at": "2026-10-07T11:59:00Z",
+      "totals": {
+        "requests": 412, "failed": 6,
+        "tokens": {
+          "input_tokens": 9100000, "output_tokens": 310000, "reasoning_tokens": 42000,
+          "cache_read_tokens": 8200000, "cache_write_tokens": 600000, "total_tokens": 9410000
+        }
+      },
+      "models": { "claude-sonnet-4-5": { "requests": 400, "failed": 5, "tokens": { "total_tokens": 9300000 } } },
+      "daily": [ { "date": "2026-10-07", "requests": 51, "failed": 0, "tokens": { "total_tokens": 1200000 } } ],
+      "claude": {
+        "current_pro_units": 0.84,
+        "total_pro_units": 2.31,
+        "credentials": [
+          {
+            "auth_id": "claude-user@example.com.json",
+            "auth_index": "a1b2c3d4e5f6a7b8",
+            "label": "user@example.com",
+            "plan": "max_5x",
+            "plan_pro_units": 2,
+            "plan_source": "rate_limit_tier",
+            "window_resets_at": "2026-10-09T15:00:00Z",
+            "current_fraction": 0.42,
+            "current_pro_units": 0.84,
+            "total_fraction": 1.155,
+            "total_pro_units": 2.31
+          }
+        ]
+      }
+    }
+  ],
+  "claude_credentials": [
+    {
+      "auth_id": "claude-user@example.com.json",
+      "auth_index": "a1b2c3d4e5f6a7b8",
+      "label": "user@example.com",
+      "plan": "max_5x",
+      "plan_pro_units": 2,
+      "plan_source": "rate_limit_tier",
+      "weekly_utilization": 0.61,
+      "window_resets_at": "2026-10-09T15:00:00Z",
+      "observed_at": "2026-10-07T11:59:00Z",
+      "unattributed_current_fraction": 0.03,
+      "unattributed_total_fraction": 0.05
+    }
+  ]
+}
+```
+
+- `requests` counts successful upstream responses, so a request retried on
+  another credential counts once; `failed` counts failed upstream attempts,
+  including ones that were retried. Token fields do not overlap except that
+  `input_tokens` includes cache reads and writes, and `output_tokens` includes
+  reasoning.
+- `daily` covers the last 31 days, by the server's local date.
+- `claude` measures Claude subscription usage in Claude Pro units: `1.0` is one
+  full weekly allowance of a Pro plan. A Max 5x plan is worth 2 units and a Max
+  20x plan 10 units per week. `current_*` covers each credential's open weekly
+  window; `total_*` accumulates across windows. Usage is converted with the
+  plan in effect when it was attributed, so a later plan change does not rewrite
+  history; usage attributed while the plan was unknown uses the current plan.
+- Claude credentials report weekly usage as a fraction of their own plan limit
+  (`Anthropic-Ratelimit-Unified-7d-Utilization`). Each increase is split between
+  the client keys that used the credential since the previous increase, by
+  API-price-weighted tokens. Usage made outside the proxy (for example on
+  claude.ai) before the next proxy response is therefore counted toward those
+  keys; increases with no proxy usage pending, and usage of reset keys, are
+  reported as `unattributed_*` on the credential. Pending usage from before a
+  weekly reset is not charged for the new window. The first response after
+  tracking starts is a baseline and is not attributed, and a drop in utilization
+  (limits reset or rescaled) starts a new baseline.
+- `plan` comes from the credential's `plan_type` field when set (`pro`,
+  `max_5x`, or `max_20x`; set it with `PATCH /credentials/fields`), otherwise
+  from the plan Claude reports at login and token refresh (`rate_limit_tier`,
+  `organization_type`). Plans without a known allowance (for example `team`) use
+  the credential `weight` as their allowance, defaulting to 1.
+
+`DELETE /observability/usage/clients?id=<id>` resets one key and returns 404
+for an unknown id. `DELETE /observability/usage/clients?all=true` resets every
+key; a request with neither parameter is rejected with 400.
 
 ## OAuth
 

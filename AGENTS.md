@@ -35,7 +35,7 @@ go build -o test-output ./cmd/server && rm test-output # Verify compile (REQUIRE
 - `internal/cache/` — Request signature caching
 - `internal/watcher/` — Config hot-reload and watchers
 - `internal/wsrelay/` — WebSocket relay sessions
-- `internal/usage/` — Usage and token accounting
+- `internal/clientusage/` — Per client API key usage aggregation (usage plugin + persistence)
 - `internal/home/` — CLIProxyAPIHome control plane integration (bootstrap, RESP communication, dispatch coordination)
 - `internal/tui/` — Bubbletea terminal UI (`--tui`, `--standalone`)
 - `sdk/cliproxy/` — Embeddable SDK entry (service/builder/watchers/pipeline)

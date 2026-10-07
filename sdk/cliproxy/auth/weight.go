@@ -47,3 +47,9 @@ func ApplyAuthWeightMetadata(auth *Auth, metadata map[string]any) error {
 	auth.Attributes[AttributeWeight] = strconv.FormatInt(weight, 10)
 	return nil
 }
+
+// AuthWeight returns the effective credential weight used for routing: the explicit
+// attribute or metadata weight, or the default weight when none is set.
+func AuthWeight(auth *Auth) int64 {
+	return authWeight(auth)
+}
