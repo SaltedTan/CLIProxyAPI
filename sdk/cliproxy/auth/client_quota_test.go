@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -593,5 +594,73 @@ func TestAdmissionCacheIsSafeForConcurrentCallsOnOneScope(t *testing.T) {
 	}
 	if got := len(claude.ids("execute")); got != 8 {
 		t.Fatalf("upstream calls = %d, want 8", got)
+	}
+}
+
+// gatedAdmissionPolicy parks its first Admit call until released and counts calls.
+type gatedAdmissionPolicy struct {
+	mu      sync.Mutex
+	calls   int
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (p *gatedAdmissionPolicy) Admit(context.Context, *Auth) error {
+	p.mu.Lock()
+	p.calls++
+	first := p.calls == 1
+	p.mu.Unlock()
+	if first {
+		close(p.entered)
+		<-p.release
+	}
+	return nil
+}
+
+func (p *gatedAdmissionPolicy) callCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls
+}
+
+// TestAdmissionConsultsThePolicyOncePerProviderOnOneScope pins that two calls
+// sharing a scope and a provider consult the policy once: the second waits for
+// the decision in progress instead of asking again. The final call count is the
+// assertion; the yields only give the second call room to reach the cache while
+// the first is still inside the policy.
+func TestAdmissionConsultsThePolicyOncePerProviderOnOneScope(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	manager.SetRetryConfig(0, 0, 0)
+	const model = "admission-scope-once"
+	claude := &admissionTestExecutor{identifier: "claude"}
+	manager.RegisterExecutor(claude)
+	registerAdmissionAuth(t, manager, "admission-scope-once-claude", "claude", model)
+	policy := &gatedAdmissionPolicy{entered: make(chan struct{}), release: make(chan struct{})}
+	manager.SetAdmissionPolicy(policy)
+	ctx := WithRequestAdmission(context.Background())
+	run := func() error {
+		_, err := manager.Execute(ctx, []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+		return err
+	}
+	first := make(chan error, 1)
+	go func() { first <- run() }()
+	<-policy.entered
+	second := make(chan error, 1)
+	go func() { second <- run() }()
+	for i := 0; i < 1000; i++ {
+		runtime.Gosched()
+	}
+	close(policy.release)
+	if err := <-first; err != nil {
+		t.Fatalf("first Execute() error = %v", err)
+	}
+	if err := <-second; err != nil {
+		t.Fatalf("second Execute() error = %v", err)
+	}
+	if got := policy.callCount(); got != 1 {
+		t.Fatalf("policy consulted %d times for one provider on one scope, want 1", got)
+	}
+	if got := len(claude.ids("execute")); got != 2 {
+		t.Fatalf("upstream calls = %d, want 2", got)
 	}
 }

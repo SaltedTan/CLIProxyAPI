@@ -34,8 +34,9 @@ func ProjectV8ConfigAliases(root *yaml.Node, path string) {
 }
 
 // CheckClientKeyMapWrite rejects a management write whose body, placed at the
-// given path, defines a client key more than once. It runs on the incoming
-// document, before a patch merge could collapse the duplicate into one entry.
+// given path, defines a client key more than once or with a non-plain key. It
+// runs on the incoming document, before a patch merge could collapse the
+// duplicate into one entry.
 func CheckClientKeyMapWrite(parts []string, update *yaml.Node) error {
 	if update == nil {
 		return nil

@@ -140,11 +140,16 @@ func SaveConfigPreserveCommentsUpdateNestedScalar(configFile string, path []stri
 	if root.Kind != yaml.DocumentNode || len(root.Content) == 0 {
 		return fmt.Errorf("invalid yaml document structure")
 	}
+	// Client key maps are checked first so a duplicate is reported masked rather
+	// than named by the generic decoder below.
+	if err = checkClientKeyMapDuplicates(root.Content[0]); err != nil {
+		return err
+	}
 	// Resolve aliases and merge keys before updating a path. Otherwise replacing
 	// an alias with a mapping drops inherited siblings or mutates a shared anchor.
 	var decoded map[string]any
 	if err = root.Decode(&decoded); err != nil {
-		return err
+		return maskDecoderError(err)
 	}
 	root.Content[0] = expandConfigAliases(root.Content[0])
 	node := root.Content[0]

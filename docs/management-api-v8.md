@@ -332,8 +332,8 @@ counts as the key it resolves to. Entries must be plain scalar keys: compound
 keys and explicitly tagged keys are rejected. Any key, value or anchor name the
 YAML parser or decoder itself reports (a duplicated or non-scalar key, a tagged
 scalar its tag does not fit, an unknown or self-referencing anchor) is masked
-the same way, with line numbers kept, and diagnostic paths mask every segment
-that is a client key.
+the same way, with line numbers kept. Diagnostics name the map
+(`api-key-limits` or `api-key-names`) and the line, never the keys above it.
 
 When a key's `current_pro_units` reaches its limit, the proxy refuses that key's
 requests to every Claude credential, OAuth and API-key alike, before any

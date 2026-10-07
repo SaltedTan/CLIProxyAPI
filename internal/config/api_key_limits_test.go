@@ -183,17 +183,25 @@ func TestGenericDuplicateKeyErrorsAreMasked(t *testing.T) {
 }
 
 // TestClientKeyDiagnosticsNeverNameAncestorKeys covers a malformed value under a
-// client key that itself holds a client key map: the diagnostic path masks the
-// ancestor key.
+// client key that itself holds a client key map: the diagnostic names no
+// ancestor, whether the map is reached under its own path or, first, through
+// the anchor an alias later makes a limits map.
 func TestClientKeyDiagnosticsNeverNameAncestorKeys(t *testing.T) {
 	const key = "fixture-client-key-1"
-	raw := "config-version: 8\naccess:\n  api-key-limits:\n    " + key + ":\n      api-key-limits:\n        x: 1\n        x: 2\n"
-	_, err := ParseConfigBytes([]byte(raw))
-	if err == nil {
-		t.Fatal("ParseConfigBytes accepted a duplicated entry")
+	cases := map[string]string{
+		"nested under the limits map":            "config-version: 8\naccess:\n  api-key-limits:\n    " + key + ":\n      api-key-limits:\n        x: 1\n        x: 2\n",
+		"anchored under an unrelated path first": "config-version: 8\nx: &limits\n  " + key + ":\n    api-key-limits:\n      x: 1\n      x: 2\naccess:\n  api-key-limits: *limits\n",
 	}
-	if strings.Contains(err.Error(), key) || !strings.Contains(err.Error(), "fixt...ey-1") {
-		t.Fatalf("ParseConfigBytes error = %q, want the ancestor key masked as fixt...ey-1", err)
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := ParseConfigBytes([]byte(raw))
+			if err == nil {
+				t.Fatal("ParseConfigBytes accepted a duplicated entry")
+			}
+			if strings.Contains(err.Error(), key) || !strings.Contains(err.Error(), "api-key-limits") || !strings.Contains(err.Error(), "line ") {
+				t.Fatalf("ParseConfigBytes error = %q, want the map name and line without the ancestor key", err)
+			}
+		})
 	}
 }
 
@@ -264,6 +272,7 @@ func TestTaggedKeysAndUnknownAnchorsAreMasked(t *testing.T) {
 	cases := map[string]string{
 		"tagged key in the limits map":     "config-version: 8\naccess:\n  api-key-limits:\n    !!int " + key + ": 1\n",
 		"tagged key in an unrelated map":   "config-version: 8\nx-unrelated:\n  !!int " + key + ": 1\n",
+		"tagged key with a backtick":       "config-version: 8\nx-unrelated:\n  !!int \"fixture`" + key + "\": 1\n",
 		"unknown anchor in the limits map": "config-version: 8\naccess:\n  api-key-limits:\n    *" + key + ": 1\n",
 	}
 	for name, raw := range cases {
@@ -290,5 +299,23 @@ func TestTaggedKeysAndUnknownAnchorsAreMasked(t *testing.T) {
 				t.Fatalf("LoadConfig error echoes the key: %q", errLoad)
 			}
 		})
+	}
+}
+
+// TestNestedScalarSaveMasksDuplicateClientKeys covers the public nested-scalar
+// saver, which decodes the whole file before updating one value.
+func TestNestedScalarSaveMasksDuplicateClientKeys(t *testing.T) {
+	const key = "fixture-client-key-1"
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	raw := "config-version: 8\nserver:\n  port: 19090\naccess:\n  api-key-limits:\n    " + key + ": 1\n    " + key + ": 2\n"
+	if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	err := SaveConfigPreserveCommentsUpdateNestedScalar(path, []string{"server", "port"}, "19091")
+	if err == nil {
+		t.Fatal("the nested scalar saver accepted a duplicated client key")
+	}
+	if strings.Contains(err.Error(), key) || !strings.Contains(err.Error(), "fixt...ey-1") {
+		t.Fatalf("error = %q, want the key masked", err)
 	}
 }

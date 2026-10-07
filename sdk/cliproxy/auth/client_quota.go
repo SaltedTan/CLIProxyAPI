@@ -147,10 +147,17 @@ type admissionCache struct {
 	// mu guards the fields below: calls sharing a request scope are normally
 	// sequential, but the cache must stay consistent if a caller overlaps them.
 	mu        sync.Mutex
-	decisions map[string]error
+	decisions map[string]*admissionDecision
 	refusal   error
 	attempted bool
 	recorded  bool
+}
+
+// admissionDecision is one provider's decision, published before the policy is
+// consulted so that an overlapping call waits for it instead of asking again.
+type admissionDecision struct {
+	done chan struct{}
+	err  error
 }
 
 // admissionScope carries one client request's admission across the conductor
@@ -189,7 +196,7 @@ func (m *Manager) newAdmissionCache(ctx context.Context) *admissionCache {
 		return nil
 	}
 	fresh := func() *admissionCache {
-		return &admissionCache{holder: holder, policy: holder.policy, decisions: make(map[string]error)}
+		return &admissionCache{holder: holder, policy: holder.policy, decisions: make(map[string]*admissionDecision)}
 	}
 	scope, _ := ctx.Value(admissionScopeKey{}).(*admissionScope)
 	if scope == nil {
@@ -211,21 +218,23 @@ func (c *admissionCache) admit(ctx context.Context, auth *Auth) error {
 	provider := canonicalSchedulingProvider(auth.Provider)
 	c.mu.Lock()
 	decision, ok := c.decisions[provider]
-	c.mu.Unlock()
 	if ok {
-		return decision
+		c.mu.Unlock()
+		<-decision.done
+		return decision.err
 	}
-	decision = c.policy.Admit(ctx, auth)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if earlier, raced := c.decisions[provider]; raced {
-		return earlier
-	}
+	decision = &admissionDecision{done: make(chan struct{})}
 	c.decisions[provider] = decision
-	if decision != nil && c.refusal == nil {
-		c.refusal = decision
+	c.mu.Unlock()
+	// The policy runs outside the lock; it may take the tracker's own locks.
+	decision.err = c.policy.Admit(ctx, auth)
+	c.mu.Lock()
+	if decision.err != nil && c.refusal == nil {
+		c.refusal = decision.err
 	}
-	return decision
+	c.mu.Unlock()
+	close(decision.done)
+	return decision.err
 }
 
 // markAttempted notes that the request went on to an upstream attempt. From then on
