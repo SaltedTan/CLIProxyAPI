@@ -363,9 +363,13 @@ counts as the key it resolves to. Entries must be plain scalar keys: compound
 keys and explicitly tagged keys are rejected. Any key, value or anchor name the
 YAML parser or decoder itself reports (a duplicated or non-scalar key, a tagged
 scalar its tag does not fit, an unknown or self-referencing anchor) is masked
-the same way, with line numbers kept, as is the decoder's conversion error for
-an allowance value. Diagnostics name the map (`api-key-limits` or
-`api-key-names`) and the line, never the keys above it.
+the same way, with line numbers kept, as is the value in any conversion error
+the decoder reports (``cannot unmarshal !!str `fi...ey` into int``). A client key
+the document names in a client key map or in `access.api-keys` and aliases
+elsewhere, as a section, provider or field name, is masked in the diagnostic
+that names it and in the warning logged when a write comments out an unknown
+section. Diagnostics name the map (`api-key-limits` or `api-key-names`) and the
+line, never the keys above it.
 
 When a key's `current_pro_units` reaches its limit, the proxy refuses that key's
 requests to every Claude credential, OAuth and API-key alike, before any

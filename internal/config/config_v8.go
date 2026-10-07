@@ -166,10 +166,41 @@ var (
 	unknownAnchorPattern       = regexp.MustCompile(`unknown anchor '([^']*)' referenced`)
 	// The scalar may itself contain backticks or newlines: capture up to the last one.
 	taggedScalarPattern = regexp.MustCompile("(?s)cannot decode (\\S+) `(.*)` as a")
-	// A value that does not convert to an allowance is printed by the decoder
-	// (truncated to seven characters); several such lines may follow each other.
-	unmarshalTargetPattern = regexp.MustCompile("(?s)cannot unmarshal (\\S+) `(.*?)` into (float64|map\\[string\\]float64|map\\[string\\]string)")
+	// A value that does not convert to its destination type is printed by the
+	// decoder (truncated to seven characters). It may be a client key aliased
+	// into any typed field; several such lines may follow each other.
+	unmarshalTargetPattern = regexp.MustCompile("(?sm)cannot unmarshal (\\S+) `(.*?)` into ([^`\\n]+)$")
+	// The strict decoder names a field its destination type does not have.
+	unknownFieldPattern = regexp.MustCompile("(?s)field (.*?) not found in type ")
 )
+
+// clientKeySet holds the client keys a document names in its client key maps
+// and client key lists. The operator can alias such a key elsewhere, where it
+// becomes a section, provider or field name; diagnostics naming one mask it.
+type clientKeySet map[string]struct{}
+
+// mask returns name masked when it is one of the client keys, unchanged otherwise.
+func (keys clientKeySet) mask(name string) string {
+	if _, ok := keys[name]; ok {
+		return maskClientKey(name)
+	}
+	return name
+}
+
+// maskUnknownFields masks the client keys the strict decoder names as unknown fields.
+func (keys clientKeySet) maskUnknownFields(err error) error {
+	if err == nil {
+		return nil
+	}
+	message := err.Error()
+	masked := unknownFieldPattern.ReplaceAllStringFunc(message, func(match string) string {
+		return "field " + keys.mask(unknownFieldPattern.FindStringSubmatch(match)[1]) + " not found in type "
+	})
+	if masked == message {
+		return err
+	}
+	return errors.New(masked)
+}
 
 // validateClientKeyMaps rejects a client key map (api-key-limits, api-key-names)
 // that is not a mapping, and any duplicated, non-plain or, for an allowance,
@@ -179,10 +210,19 @@ var (
 // the map and the line. It also keeps an empty flow-style value an explicit
 // null so that re-encoding the document preserves "no limit".
 func validateClientKeyMaps(root *yaml.Node) error {
-	return walkClientKeyMaps(root, make(map[*yaml.Node]struct{}))
+	_, err := clientKeysOf(root)
+	return err
 }
 
-func walkClientKeyMaps(node *yaml.Node, seen map[*yaml.Node]struct{}) error {
+// clientKeysOf runs the checks of validateClientKeyMaps and returns the client
+// keys the document names: the entries of its client key maps and lists.
+func clientKeysOf(root *yaml.Node) (clientKeySet, error) {
+	keys := make(clientKeySet)
+	err := walkClientKeyMaps(root, make(map[*yaml.Node]struct{}), keys)
+	return keys, err
+}
+
+func walkClientKeyMaps(node *yaml.Node, seen map[*yaml.Node]struct{}, keys clientKeySet) error {
 	node = resolveAliasNode(node, seen)
 	if node == nil {
 		return nil
@@ -194,7 +234,7 @@ func walkClientKeyMaps(node *yaml.Node, seen map[*yaml.Node]struct{}) error {
 	switch node.Kind {
 	case yaml.DocumentNode, yaml.SequenceNode:
 		for _, child := range node.Content {
-			if err := walkClientKeyMaps(child, seen); err != nil {
+			if err := walkClientKeyMaps(child, seen, keys); err != nil {
 				return err
 			}
 		}
@@ -205,17 +245,35 @@ func walkClientKeyMaps(node *yaml.Node, seen map[*yaml.Node]struct{}) error {
 				// Entries of a client key map are client keys whatever their
 				// text, never configuration fields: the walk checks them and
 				// does not descend into them.
-				if err := checkClientKeyMapEntries(node, node.Content[i+1], name); err != nil {
+				if err := checkClientKeyMapEntries(node, node.Content[i+1], name, keys); err != nil {
 					return err
 				}
 				continue
 			}
-			if err := walkClientKeyMaps(node.Content[i+1], seen); err != nil {
+			if name == "api-keys" {
+				collectClientKeyList(node.Content[i+1], keys)
+			}
+			if err := walkClientKeyMaps(node.Content[i+1], seen, keys); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// collectClientKeyList adds the entries of a client key list to keys. Only the
+// list form of api-keys holds client keys; the v8 map of that name holds
+// upstream credentials.
+func collectClientKeyList(list *yaml.Node, keys clientKeySet) {
+	list = resolveAliasNode(list, make(map[*yaml.Node]struct{}))
+	if list == nil || list.Kind != yaml.SequenceNode {
+		return
+	}
+	for _, entry := range list.Content {
+		if scalar := scalarKeyNode(entry); scalar != nil {
+			keys[scalar.Value] = struct{}{}
+		}
+	}
 }
 
 // scalarKey returns the scalar a mapping key decodes to, following aliases, and
@@ -252,8 +310,8 @@ func mapKeyName(key *yaml.Node) string {
 // decoder would otherwise print), is defined twice within one of its mappings,
 // or has a value the decoder would reject, printing it: values must be plain
 // scalars, and allowances numbers or empty. Alias keys are compared by the
-// scalar they resolve to.
-func checkClientKeyMapEntries(parent, mapping *yaml.Node, name string) error {
+// scalar they resolve to. Each entry's key is added to keys.
+func checkClientKeyMapEntries(parent, mapping *yaml.Node, name string, keys clientKeySet) error {
 	// The map itself must be a mapping or empty: the decoder would otherwise
 	// print a scalar found there, which may well be a client key.
 	container := resolveAliasNode(mapping, make(map[*yaml.Node]struct{}))
@@ -277,6 +335,7 @@ func checkClientKeyMapEntries(parent, mapping *yaml.Node, name string) error {
 				return fmt.Errorf("%s: entry %s is defined more than once (line %d)", name, maskClientKey(key), line)
 			}
 			seen[key] = struct{}{}
+			keys[key] = struct{}{}
 			value := scalarKeyNode(node.Content[i+1])
 			if value == nil || value.Style&yaml.TaggedStyle != 0 {
 				return fmt.Errorf("%s: entry at line %d must have a plain scalar value", name, line)
@@ -527,23 +586,31 @@ func (cfg *Config) UnmarshalYAML(node *yaml.Node) error {
 }
 
 func flattenV8(node *yaml.Node) (*yaml.Node, error) {
+	root, _, err := flattenV8WithClientKeys(node)
+	return root, err
+}
+
+// flattenV8WithClientKeys is flattenV8 that also returns the client keys the
+// document names, which callers mask in their own diagnostics.
+func flattenV8WithClientKeys(node *yaml.Node) (*yaml.Node, clientKeySet, error) {
 	if node.Kind != yaml.MappingNode {
-		return nil, fmt.Errorf("config must be a mapping")
+		return nil, nil, fmt.Errorf("config must be a mapping")
 	}
 	// Maps keyed by client API keys are checked first so a duplicate is reported
 	// masked; the generic decoder below would name the key in its error.
-	if err := validateClientKeyMaps(node); err != nil {
-		return nil, err
+	keys, err := clientKeysOf(node)
+	if err != nil {
+		return nil, nil, err
 	}
 	// Decode once before transformation to reject duplicate keys even when a
 	// winning v8 value would otherwise hide the malformed legacy subtree.
 	var shape map[string]any
 	if err := node.Decode(&shape); err != nil {
-		return nil, maskDecoderError(err)
+		return nil, nil, maskDecoderError(err)
 	}
 	node = expandConfigAliases(node)
 	if _, err := normalizeV8PrivateIPAlias(node, true); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	for _, path := range append(append([]configPath(nil), v8Paths...), v8Aliases...) {
 		parts := strings.Split(path.current, ".")
@@ -557,7 +624,7 @@ func flattenV8(node *yaml.Node) (*yaml.Node, error) {
 				break
 			}
 			if parent.Kind != yaml.MappingNode {
-				return nil, fmt.Errorf("%s must be a mapping", strings.Join(parts[:i], "."))
+				return nil, nil, fmt.Errorf("%s must be a mapping", strings.Join(parts[:i], "."))
 			}
 		}
 	}
@@ -576,7 +643,7 @@ func flattenV8(node *yaml.Node) (*yaml.Node, error) {
 			continue
 		}
 		if value.Tag != "!!null" && value.Kind != yaml.MappingNode {
-			return nil, fmt.Errorf("%s must be a mapping", path.old)
+			return nil, nil, fmt.Errorf("%s must be a mapping", path.old)
 		}
 		if value.Tag != "!!null" && len(value.Content) != 0 {
 			continue
@@ -589,7 +656,7 @@ func flattenV8(node *yaml.Node) (*yaml.Node, error) {
 		deleteYAMLPath(root, path.old)
 	}
 	if version := yamlPath(root, "config-version"); version != nil && (version.Tag != "!!int" || version.Value != "8") {
-		return nil, fmt.Errorf("unsupported config-version (expected 8)")
+		return nil, nil, fmt.Errorf("unsupported config-version (expected 8)")
 	}
 	// The v8 upstream map reuses the legacy client-key field name.
 	if keys := yamlPath(root, "api-keys"); keys != nil && keys.Kind == yaml.MappingNode {
@@ -604,14 +671,14 @@ func flattenV8(node *yaml.Node) (*yaml.Node, error) {
 	}
 	for _, family := range v8KeyFamilies {
 		if groups := yamlPath(node, "api-keys."+family.current); groups != nil {
-			keys, err := expandV8Groups(groups, family.current)
+			entries, err := expandV8Groups(groups, family.current, keys)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
-			setYAMLPath(root, family.old, keys)
+			setYAMLPath(root, family.old, entries)
 		}
 	}
-	return root, nil
+	return root, keys, nil
 }
 
 var sharedKeyFields = map[string]bool{
@@ -620,7 +687,7 @@ var sharedKeyFields = map[string]bool{
 	"request-retry": true, "request-scoped-errors": true,
 }
 
-func expandV8Groups(groups *yaml.Node, provider string) (*yaml.Node, error) {
+func expandV8Groups(groups *yaml.Node, provider string, clientKeys clientKeySet) (*yaml.Node, error) {
 	if groups.Kind != yaml.SequenceNode {
 		return nil, fmt.Errorf("api-keys.%s must be a list", provider)
 	}
@@ -653,7 +720,7 @@ func expandV8Groups(groups *yaml.Node, provider string) (*yaml.Node, error) {
 		for i := 0; i < len(group.Content); i += 2 {
 			field := group.Content[i].Value
 			if field != "name" && field != "base-url" && field != "keys" && !sharedKeyFields[field] {
-				return nil, fmt.Errorf("api-keys.%s: unsupported group field %s", provider, field)
+				return nil, fmt.Errorf("api-keys.%s: unsupported group field %s", provider, clientKeys.mask(field))
 			}
 		}
 		for _, key := range keys.Content {
@@ -729,7 +796,8 @@ func NormalizeConfigLayout(data []byte, migrate bool) ([]byte, bool, error) {
 		return nil, false, fmt.Errorf("empty config")
 	}
 	root := doc.Content[0]
-	if _, err := flattenV8(root); err != nil {
+	_, keys, err := flattenV8WithClientKeys(root)
+	if err != nil {
 		return nil, false, err
 	}
 	root = expandConfigAliases(root)
@@ -787,7 +855,7 @@ func NormalizeConfigLayout(data []byte, migrate bool) ([]byte, bool, error) {
 	if migrate {
 		// Existing unknown fields are ignored by the runtime. Retain their
 		// contents as comments while keeping new v8 writes strictly validated.
-		if err := commentUnknownV8Sections(root); err != nil {
+		if err := commentUnknownV8Sections(root, keys); err != nil {
 			return nil, false, err
 		}
 		setYAMLPath(root, "config-version", &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: "8"})
@@ -870,8 +938,8 @@ func warnUnrecognizedV8Section(section string) {
 	log.Warn(msg)
 }
 
-func commentUnknownV8Sections(root *yaml.Node) error {
-	if err := commentUnknownV8Fields(root, root, v8AllowedRoots(), ""); err != nil {
+func commentUnknownV8Sections(root *yaml.Node, keys clientKeySet) error {
+	if err := commentUnknownV8Fields(root, root, v8AllowedRoots(), "", keys); err != nil {
 		return err
 	}
 
@@ -923,7 +991,7 @@ func commentUnknownV8Sections(root *yaml.Node) error {
 		if node == nil || node.Kind != yaml.MappingNode || children[path] == nil {
 			return nil
 		}
-		if err := commentUnknownV8Fields(node, root, children[path], path); err != nil {
+		if err := commentUnknownV8Fields(node, root, children[path], path, keys); err != nil {
 			return err
 		}
 		for i := 0; i+1 < len(node.Content); i += 2 {
@@ -942,7 +1010,10 @@ func commentUnknownV8Sections(root *yaml.Node) error {
 	return nil
 }
 
-func commentUnknownV8Fields(node *yaml.Node, archive *yaml.Node, allowed map[string]bool, path string) error {
+// commentUnknownV8Fields archives the fields of node that allowed does not name
+// as comments. The archive keeps their text; the warning masks a field named
+// like one of the client keys.
+func commentUnknownV8Fields(node *yaml.Node, archive *yaml.Node, allowed map[string]bool, path string, keys clientKeySet) error {
 	var comments []string
 	for i := 0; i+1 < len(node.Content); {
 		key := node.Content[i].Value
@@ -950,11 +1021,11 @@ func commentUnknownV8Fields(node *yaml.Node, archive *yaml.Node, allowed map[str
 			i += 2
 			continue
 		}
-		section := key
+		section, display := key, keys.mask(key)
 		if path != "" {
-			section = path + "." + key
+			section, display = path+"."+key, path+"."+display
 		}
-		warnUnrecognizedV8Section(section)
+		warnUnrecognizedV8Section(display)
 		keyNode := *node.Content[i]
 		keyNode.Value = section
 		entry := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map", Content: []*yaml.Node{&keyNode, node.Content[i+1]}}
@@ -1126,7 +1197,7 @@ func ValidateV8Config(data []byte) error {
 		return fmt.Errorf("empty config")
 	}
 	root := doc.Content[0]
-	flat, err := flattenV8(root)
+	flat, keys, err := flattenV8WithClientKeys(root)
 	if err != nil {
 		return err
 	}
@@ -1139,7 +1210,7 @@ func ValidateV8Config(data []byte) error {
 	}
 	for i := 0; i < len(root.Content); i += 2 {
 		if key := root.Content[i].Value; !allowedRoots[key] {
-			return fmt.Errorf("unknown v8 configuration section %s", key)
+			return fmt.Errorf("unknown v8 configuration section %s", keys.mask(key))
 		}
 	}
 	if groups := yamlPath(root, "api-keys"); groups != nil && groups.Kind == yaml.MappingNode {
@@ -1152,7 +1223,7 @@ func ValidateV8Config(data []byte) error {
 				}
 			}
 			if !found {
-				return fmt.Errorf("unknown API-key provider %s", groups.Content[i].Value)
+				return fmt.Errorf("unknown API-key provider %s", keys.mask(groups.Content[i].Value))
 			}
 		}
 	}
@@ -1176,7 +1247,7 @@ func ValidateV8Config(data []byte) error {
 	decoder.KnownFields(true)
 	var cfg legacyConfig
 	if err = decoder.Decode(&cfg); err != nil {
-		return maskDecoderError(err)
+		return keys.maskUnknownFields(maskDecoderError(err))
 	}
 	// Client key allowances are the only v8 values with a semantic range check
 	// here; ParseConfigBytes runs first in management writes and must not turn

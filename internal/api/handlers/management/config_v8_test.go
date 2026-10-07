@@ -1042,3 +1042,54 @@ func TestConfigV8AcceptsValidClientKeyMapShapes(t *testing.T) {
 		})
 	}
 }
+
+// TestConfigV8MasksAliasedClientKeysOutsideTheirMaps covers YAML writes that
+// alias a client key outside the client key maps (issue #2): a conversion the
+// parser rejects (422) and a section, provider or field validation rejects
+// (400). The response masks the key and the file stays unchanged.
+func TestConfigV8MasksAliasedClientKeysOutsideTheirMaps(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	// Ten characters: the YAML decoder prints such values whole.
+	const key = "fixture-k1"
+	raw := "config-version: 8\naccess:\n  api-keys: [fixture-key-laptop]\napi-keys:\n  codex: []\n"
+	cases := []struct {
+		name, body, want string
+		status           int
+	}{
+		{"into a typed field", "config-version: 8\naccess:\n  api-key-limits: {&client " + key + ": 1}\nserver: {port: *client}\n", "line 4: cannot unmarshal", http.StatusUnprocessableEntity},
+		{"as a section", "config-version: 8\naccess:\n  api-key-limits: {&client " + key + ": 1}\n*client : 1\n", "unknown v8 configuration section", http.StatusBadRequest},
+		{"as a nested field", "config-version: 8\naccess:\n  api-key-limits: {&client " + key + ": 1}\nrouting: {*client : 1}\n", "not found in type", http.StatusBadRequest},
+		{"as a provider", "config-version: 8\naccess:\n  api-key-limits: {&client " + key + ": 1}\napi-keys: {*client : []}\n", "unknown API-key provider", http.StatusBadRequest},
+		{"as a group field", "config-version: 8\naccess:\n  api-keys: [&client " + key + "]\napi-keys: {claude: [{name: a, keys: [], *client : 1}]}\n", "unsupported group field", http.StatusUnprocessableEntity},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.LoadConfig(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := &Handler{cfg: cfg, configFilePath: path}
+			router := gin.New()
+			router.PUT("/v8/management/config.yaml", h.ConfigV8)
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPut, "/v8/management/config.yaml", strings.NewReader(tc.body)))
+			if recorder.Code != tc.status || !strings.Contains(recorder.Body.String(), tc.want) {
+				t.Fatalf("status = %d body = %s, want %d with %q", recorder.Code, recorder.Body.String(), tc.status, tc.want)
+			}
+			if strings.Contains(recorder.Body.String(), key) {
+				t.Fatalf("response echoes the raw key: %s", recorder.Body.String())
+			}
+			saved, errRead := os.ReadFile(path)
+			if errRead != nil {
+				t.Fatal(errRead)
+			}
+			if string(saved) != raw {
+				t.Fatalf("rejected write reached the file:\n%s", saved)
+			}
+		})
+	}
+}

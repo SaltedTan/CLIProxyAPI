@@ -491,3 +491,79 @@ func TestFlowStyleEmptyAllowanceSurvivesReencoding(t *testing.T) {
 		check(t, path)
 	})
 }
+
+// aliasedClientKey is ten characters long: the YAML decoder prints values of up
+// to ten characters whole, so an unmasked diagnostic would contain all of it.
+const aliasedClientKey = "fixture-k1"
+
+// aliasedClientKeyDocuments anchor a client key in a client key map or the
+// client key list and alias it elsewhere, keyed by the diagnostic validation
+// reports for them.
+var aliasedClientKeyDocuments = map[string]struct{ raw, want string }{
+	"into a typed field":         {"config-version: 8\naccess:\n  api-key-limits: {&client " + aliasedClientKey + ": 1}\nserver: {port: *client}\n", "into int"},
+	"into a list field":          {"config-version: 8\naccess:\n  api-key-names: {&client " + aliasedClientKey + ": laptop}\nserver: {trusted-proxies: *client}\n", "into []string"},
+	"as a section":               {"config-version: 8\naccess:\n  api-key-limits: {&client " + aliasedClientKey + ": 1}\n*client : 1\n", "unknown v8 configuration section"},
+	"as a section from the list": {"config-version: 8\naccess:\n  api-keys: [&client " + aliasedClientKey + "]\n*client : 1\n", "unknown v8 configuration section"},
+	"as a nested field":          {"config-version: 8\naccess:\n  api-key-limits: {&client " + aliasedClientKey + ": 1}\nrouting: {*client : 1}\n", "not found in type"},
+	"as a provider":              {"config-version: 8\naccess:\n  api-key-limits: {&client " + aliasedClientKey + ": 1}\napi-keys: {*client : []}\n", "unknown API-key provider"},
+	"as a group field":           {"config-version: 8\naccess:\n  api-key-limits: {&client " + aliasedClientKey + ": 1}\napi-keys: {claude: [{name: a, keys: [], *client : 1}]}\n", "unsupported group field"},
+}
+
+// TestAliasedClientKeysAreMaskedOutsideTheirMaps covers a client key the
+// operator aliases outside the client key maps (issue #2): the decoder prints a
+// value it cannot convert and validation names an unknown section, provider or
+// field. Each rejection must mask the key and keep its line number.
+func TestAliasedClientKeysAreMaskedOutsideTheirMaps(t *testing.T) {
+	for name, doc := range aliasedClientKeyDocuments {
+		t.Run(name, func(t *testing.T) {
+			errValidate := ValidateV8Config([]byte(doc.raw))
+			if errValidate == nil || !strings.Contains(errValidate.Error(), doc.want) {
+				t.Fatalf("ValidateV8Config error = %v, want %q", errValidate, doc.want)
+			}
+			if strings.Contains(errValidate.Error(), aliasedClientKey) {
+				t.Fatalf("ValidateV8Config error echoes the key: %q", errValidate)
+			}
+			if !strings.Contains(errValidate.Error(), maskClientKey(aliasedClientKey)) {
+				t.Fatalf("ValidateV8Config error = %q, want the masked key", errValidate)
+			}
+			_, errParse := ParseConfigBytes([]byte(doc.raw))
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(doc.raw), 0600); err != nil {
+				t.Fatal(err)
+			}
+			_, errLoad := LoadConfig(path)
+			for label, err := range map[string]error{"ParseConfigBytes": errParse, "LoadConfig": errLoad} {
+				if err != nil && strings.Contains(err.Error(), aliasedClientKey) {
+					t.Fatalf("%s error echoes the key: %q", label, err)
+				}
+				if strings.HasPrefix(doc.want, "into ") && (err == nil || !strings.Contains(err.Error(), "line 3: cannot unmarshal")) {
+					t.Fatalf("%s error = %v, want the conversion rejected at line 3", label, err)
+				}
+			}
+			if saved, errRead := os.ReadFile(path); errRead != nil || string(saved) != doc.raw {
+				t.Fatalf("LoadConfig changed the file: %v\n%s", errRead, saved)
+			}
+		})
+	}
+}
+
+// TestAliasedClientKeySectionWarningIsMasked covers the warning logged when a
+// write comments out an unknown section: a client key aliased as the section
+// name must appear masked there too.
+func TestAliasedClientKeySectionWarningIsMasked(t *testing.T) {
+	var warnings []string
+	SetV8MigrationWarnFunc(func(_ string, msg string) { warnings = append(warnings, msg) })
+	t.Cleanup(func() { SetV8MigrationWarnFunc(nil) })
+	for _, name := range []string{"as a section", "as a nested field"} {
+		warnings = nil
+		if _, _, err := NormalizeConfigLayout([]byte(aliasedClientKeyDocuments[name].raw), true); err != nil {
+			t.Fatalf("%s: NormalizeConfigLayout: %v", name, err)
+		}
+		if len(warnings) != 1 || !strings.Contains(warnings[0], "commented out") {
+			t.Fatalf("%s: warnings = %q, want one commented-out section", name, warnings)
+		}
+		if strings.Contains(warnings[0], aliasedClientKey) || !strings.Contains(warnings[0], maskClientKey(aliasedClientKey)) {
+			t.Fatalf("%s: warning = %q, want the key masked", name, warnings[0])
+		}
+	}
+}
