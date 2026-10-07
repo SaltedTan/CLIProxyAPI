@@ -1836,6 +1836,46 @@ func TestHomeEnabledHidesManagementEndpointsAndControlPanel(t *testing.T) {
 	})
 }
 
+func TestManagementControlPanelRevalidatesOnEveryLoad(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
+	staticDir := t.TempDir()
+	t.Setenv("MANAGEMENT_STATIC_PATH", staticDir)
+	if err := os.WriteFile(filepath.Join(staticDir, "management.html"), []byte("<html>management app</html>"), 0o600); err != nil {
+		t.Fatalf("failed to write management asset: %v", err)
+	}
+	server := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/management.html", nil)
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "management app") {
+		t.Fatalf("management panel body missing: %s", rr.Body.String())
+	}
+	// Browsers must ask the server before reusing a cached copy of the panel.
+	if got := rr.Header().Get("Cache-Control"); got != "no-cache" {
+		t.Fatalf("Cache-Control = %q, want no-cache", got)
+	}
+	lastModified := rr.Header().Get("Last-Modified")
+	if lastModified == "" {
+		t.Fatal("Last-Modified header missing; revalidation needs it")
+	}
+
+	// An unchanged file revalidates cheaply instead of being sent again.
+	req = httptest.NewRequest(http.MethodGet, "/management.html", nil)
+	req.Header.Set("If-Modified-Since", lastModified)
+	rr = httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotModified {
+		t.Fatalf("revalidation status = %d, want %d", rr.Code, http.StatusNotModified)
+	}
+	if rr.Body.Len() != 0 {
+		t.Fatalf("304 body length = %d, want 0", rr.Body.Len())
+	}
+}
+
 func TestExampleAPIKeySafeModeShowsWarningAndKeepsManagement(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
 	staticDir := t.TempDir()

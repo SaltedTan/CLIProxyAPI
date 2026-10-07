@@ -334,5 +334,9 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		}
 	}
 
+	// The panel is a single self-contained file replaced in place on deploy. Without
+	// this, browsers may reuse a cached copy for hours after it changed; with it they
+	// revalidate on every load, which is a 304 while the file is unchanged.
+	c.Header("Cache-Control", "no-cache")
 	c.File(filePath)
 }
