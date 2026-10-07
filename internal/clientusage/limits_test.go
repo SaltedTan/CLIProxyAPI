@@ -1129,3 +1129,77 @@ func TestExpiredWindowIsDroppedOnLoad(t *testing.T) {
 		t.Fatalf("the next request must open a window: %+v", key.Claude)
 	}
 }
+
+// TestPendingWeightFromBeforeTheWindowStaysOutOfIt covers usage attributed after a
+// key's next window opened to requests from its previous window: the share still
+// counts in the totals, but only the share of requests inside the open window
+// counts toward it, also when one increase covers requests of both periods.
+func TestPendingWeightFromBeforeTheWindowStaysOutOfIt(t *testing.T) {
+	now := testNow
+	tracker := newTestTracker(&now)
+	send := func(apiKey, authID string, startedAt time.Time, obs claudeObs) {
+		now = startedAt.Add(time.Second)
+		tracker.HandleUsage(context.Background(), claudeRecord(apiKey, authID, startedAt, obs, breakdown(100, 0, 0, 0, 0)))
+	}
+	// key-a's first window opens on claude-2, which reports no quota headers.
+	first := testNow
+	end := first.Add(claudeWeeklyWindow)
+	resetAt := end.Add(72 * time.Hour)
+	send("key-a", "claude-2", first, claudeObs{})
+	// Shortly before the window ends key-a uses claude-3 and claude-1 (their
+	// baseline readings); no increase follows before the window ends.
+	send("key-a", "claude-3", end.Add(-2*time.Minute), claudeObs{0.125, resetAt})
+	send("key-a", "claude-1", end.Add(-time.Minute), claudeObs{0.125, resetAt})
+	// After the window ended, key-a's next request opens the next window elsewhere.
+	next := end.Add(time.Hour)
+	send("key-a", "claude-2", next, claudeObs{})
+
+	// key-b's response on claude-1 carries the increase key-a's last request of the
+	// previous window caused: it belongs to that window, not to the open one.
+	send("key-b", "claude-1", end.Add(2*time.Hour), claudeObs{0.25, resetAt})
+	key := findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a")).Claude
+	if key.WindowStartedAt == nil || !key.WindowStartedAt.Equal(next) {
+		t.Fatalf("window = %+v, want the one opened at %s", key, next)
+	}
+	approx(t, "current after a late increase from the previous window", key.CurrentProUnits, 0)
+	approx(t, "total after a late increase from the previous window", key.TotalProUnits, 0.125)
+
+	// One increase on claude-3 covers key-a's request from the previous window and
+	// an equal one from the open window: half of key-a's share counts toward it.
+	send("key-a", "claude-3", end.Add(3*time.Hour), claudeObs{0.125, resetAt})
+	send("key-b", "claude-3", end.Add(4*time.Hour), claudeObs{0.375, resetAt})
+	key = findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a")).Claude
+	approx(t, "current after a mixed increase", key.CurrentProUnits, 0.125)
+	approx(t, "total after a mixed increase", key.TotalProUnits, 0.375)
+}
+
+// TestPendingWeightFromBeforeAWindowResetStaysOutOfTheNextWindow covers a request
+// that started before the key's window was reset and whose usage is attributed
+// after the key's next window opened: it counts in the totals only.
+func TestPendingWeightFromBeforeAWindowResetStaysOutOfTheNextWindow(t *testing.T) {
+	now := testNow
+	tracker, resetAt := limitedKeyTracker(t, &now)
+	startedBefore := now.Add(-time.Minute)
+	now = now.Add(time.Hour)
+	if !tracker.ResetWindow(KeyID("key-a")) {
+		t.Fatal("reset window must find the key")
+	}
+	// The pre-reset request's record arrives after the reset; no increase yet.
+	now = now.Add(time.Second)
+	tracker.HandleUsage(context.Background(), claudeRecord("key-a", "claude-1", startedBefore, claudeObs{0.375, resetAt}, breakdown(100, 0, 0, 0, 0)))
+	// The key's next request opens the next window; no increase yet either.
+	startedAfter := now.Add(time.Second)
+	now = startedAfter.Add(time.Second)
+	tracker.HandleUsage(context.Background(), claudeRecord("key-a", "claude-1", startedAfter, claudeObs{0.375, resetAt}, breakdown(100, 0, 0, 0, 0)))
+	// key-b's response attributes the weight of three equal requests of key-a: the
+	// last one of the previous window, the pre-reset one and the first of the next
+	// window. Only the last third counts toward the window.
+	now = now.Add(time.Second)
+	tracker.HandleUsage(context.Background(), claudeRecord("key-b", "claude-1", now.Add(-time.Second), claudeObs{0.625, resetAt}, breakdown(100, 0, 0, 0, 0)))
+	key := findKey(t, tracker.Snapshot(SnapshotOptions{}), KeyID("key-a")).Claude
+	if key.WindowStartedAt == nil || !key.WindowStartedAt.Equal(startedAfter) {
+		t.Fatalf("window = %+v, want the one opened at %s", key, startedAfter)
+	}
+	approx(t, "current", key.CurrentProUnits, 0.25/3)
+	approx(t, "total", key.TotalProUnits, 0.5)
+}

@@ -32,6 +32,11 @@ func (w *keyWindow) open(now time.Time) bool {
 	return w != nil && now.Before(w.EndsAt)
 }
 
+// contains reports whether a request that started at at belongs to the window.
+func (w *keyWindow) contains(at time.Time) bool {
+	return w.open(at) && !at.Before(w.StartedAt)
+}
+
 // add charges usage of one credential to the window.
 func (w *keyWindow) add(authID string, amount float64, plan CredentialInfo, priced bool) {
 	if w.Credentials == nil {
@@ -69,22 +74,24 @@ func (s windowShare) proUnits(planProUnits float64) float64 {
 // a request that started inside the open window keeps it, however late its usage
 // is processed. Requests that started before the key's window floor (a reset of
 // the window, or the end of the previous window) belong to a period that is over
-// and open nothing: their usage counts in the totals only.
-func (k *keyState) openWindow(at time.Time) {
+// and open nothing: their usage counts in the totals only. It reports whether a
+// new window opened.
+func (k *keyState) openWindow(at time.Time) bool {
 	if at.Before(k.WindowFloor) {
-		return
+		return false
 	}
 	if k.Window.open(at) {
 		if at.Before(k.Window.StartedAt) {
 			k.Window.StartedAt = at
 			k.Window.EndsAt = at.Add(claudeWeeklyWindow)
 		}
-		return
+		return false
 	}
 	if k.Window != nil && k.Window.EndsAt.After(k.WindowFloor) {
 		k.WindowFloor = k.Window.EndsAt
 	}
 	k.Window = &keyWindow{StartedAt: at, EndsAt: at.Add(claudeWeeklyWindow)}
+	return true
 }
 
 // closeWindow ends the key's window at now: the next request that starts after

@@ -322,7 +322,9 @@ and `totals`, `daily` and the per-credential `total_*` values are kept.
 `?all=true` does this for every key; the same 404 and 400 rules apply. After
 either reset, a request of the key that had started before the reset opens no
 window when its response is processed: only a request started after the reset
-does. A window starts at the earliest request of its period even when responses
+does. Usage attributed to such a request, or to a request from the key's
+previous window, after the next window opened counts in `total_*` only. A
+window starts at the earliest request of its period even when responses
 are processed out of order, and a window that had ended when the state was
 saved stays over after a restart, whatever the clock says.
 
@@ -432,13 +434,14 @@ resets the key.
 
 Limitations: attribution is estimate-based (usage is split from the
 `Anthropic-Ratelimit-Unified-7d-Utilization` header deltas as described above),
-so a key's share is approximate; an increase is charged to the window open when
-it is attributed, so the increase carried by the first request of a new window
-is left out of it (that usage predates the request), while usage from the end of
-a window that is only attributed after the next one opened counts toward the
-next one; requests already in flight when the limit is reached complete and may
-overshoot it; usage not yet flushed at shutdown is lost; and limits are not
-enforced in Home mode, where usage is not tracked.
+so a key's share is approximate; of a key's share of an increase, only the part
+from its requests inside its window (by their API-price weight) counts toward
+that window, and only while the window is open, so the increase carried by the
+first request of a new window is left out of it (that usage predates the
+request), and usage of requests from before the window that is attributed after
+it opened counts in the totals only; requests already in flight when the limit
+is reached complete and may overshoot it; usage not yet flushed at shutdown is
+lost; and limits are not enforced in Home mode, where usage is not tracked.
 
 ## OAuth
 

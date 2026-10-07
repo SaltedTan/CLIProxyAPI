@@ -72,9 +72,12 @@ func (s *claudeShare) add(amount float64, epoch int64, plan CredentialInfo, pric
 }
 
 // pendingWeight is the cost weight a key put on a credential since the last increase.
+// Outside is the part of it from requests outside the key's current allowance window:
+// requests queued before that window opened, and requests that opened none.
 type pendingWeight struct {
-	Weight float64   `json:"weight"`
-	LastAt time.Time `json:"last_at"`
+	Weight  float64   `json:"weight"`
+	Outside float64   `json:"outside,omitempty"`
+	LastAt  time.Time `json:"last_at"`
 }
 
 // claudeCredential tracks the weekly window of one Claude credential.
@@ -156,19 +159,20 @@ func claudeAuthID(record coreusage.Record) string {
 }
 
 // observeClaudeLocked updates the weekly window of the record's credential and
-// queues the record's weight for the next increase. requestAt is when the request
-// started (zero when unknown); plan describes the credential when resolved.
-// t.mu must be held.
-func (t *Tracker) observeClaudeLocked(keyID string, record coreusage.Record, breakdown coreusage.TokenBreakdown, requestAt, now time.Time, plan *CredentialInfo) {
+// returns the credential, on which the caller queues the record's weight for the
+// next increase; nil when the credential has no baseline yet. requestAt is when
+// the request started (zero when unknown); plan describes the credential when
+// resolved. t.mu must be held.
+func (t *Tracker) observeClaudeLocked(record coreusage.Record, requestAt, now time.Time, plan *CredentialInfo) *claudeCredential {
 	authID := claudeAuthID(record)
 	if authID == "" {
-		return
+		return nil
 	}
 	observation, observed := parseClaudeWeeklyObservation(record.ResponseHeaders, now)
 	credential := t.claude[authID]
 	if credential == nil {
 		if !observed {
-			return
+			return nil
 		}
 		// The first observation is a baseline: usage before it cannot be attributed.
 		credential = &claudeCredential{
@@ -189,21 +193,27 @@ func (t *Tracker) observeClaudeLocked(keyID string, record coreusage.Record, bre
 	if index := strings.TrimSpace(record.AuthIndex); index != "" {
 		credential.AuthIndex = index
 	}
-	if credential.Pending == nil {
-		credential.Pending = make(map[string]*pendingWeight)
+	return credential
+}
+
+// queue adds the weight of a key's request that started at at for the next
+// increase. inWindow tells whether the request belongs to the key's current
+// allowance window.
+func (c *claudeCredential) queue(keyID string, weight float64, at time.Time, inWindow bool) {
+	if c.Pending == nil {
+		c.Pending = make(map[string]*pendingWeight)
 	}
-	pending := credential.Pending[keyID]
+	pending := c.Pending[keyID]
 	if pending == nil {
 		pending = &pendingWeight{}
-		credential.Pending[keyID] = pending
+		c.Pending[keyID] = pending
 	}
-	pending.Weight += claudeRecordWeight(breakdown)
-	lastAt := requestAt
-	if lastAt.IsZero() {
-		lastAt = now
+	pending.Weight += weight
+	if !inWindow {
+		pending.Outside += weight
 	}
-	if lastAt.After(pending.LastAt) {
-		pending.LastAt = lastAt
+	if at.After(pending.LastAt) {
+		pending.LastAt = at
 	}
 }
 
@@ -270,8 +280,10 @@ func (c *claudeCredential) setUtilization(utilization float64, now time.Time) {
 
 // attributeClaudeLocked splits an observed increase between the keys with pending
 // weight on the credential. Each key's share also counts toward its allowance window
-// when that window is open at now; usage attributed after the window ended belongs to
-// a period that is over and is kept in the totals only. t.mu must be held.
+// when that window is open at now, in proportion to the key's pending weight from
+// requests inside it; usage attributed after the window ended, or to requests from
+// before it, belongs to a period that is over and is kept in the totals only. t.mu
+// must be held.
 func (t *Tracker) attributeClaudeLocked(authID string, credential *claudeCredential, amount float64, plan *CredentialInfo, now time.Time) {
 	if amount <= 0 {
 		return
@@ -307,8 +319,12 @@ func (t *Tracker) attributeClaudeLocked(authID string, credential *claudeCredent
 			state.Claude[authID] = keyShare
 		}
 		keyShare.add(share, credential.Epoch, info, priced)
-		if state.Window.open(now) {
-			state.Window.add(authID, share, info, priced)
+		if state.Window.open(now) && pending.Outside < pending.Weight {
+			inWindow := share
+			if pending.Outside > 0 {
+				inWindow = share * (pending.Weight - pending.Outside) / pending.Weight
+			}
+			state.Window.add(authID, inWindow, info, priced)
 		}
 	}
 	credential.Pending = nil

@@ -237,16 +237,30 @@ func (t *Tracker) HandleUsage(_ context.Context, record coreusage.Record) {
 			state.LastUsedAt = at
 		}
 	}
-	// Untracked keys still take part so their usage is not charged to other keys.
-	t.observeClaudeLocked(keyID, record, detail.TokenBreakdown, record.RequestedAt, now, plan)
+	credential := t.observeClaudeLocked(record, record.RequestedAt, now, plan)
 	// A Claude request opens the key's allowance window when none is running. It
 	// does so after the increase its response carries is attributed: that increase
 	// is usage from before the request started, which belongs to the period that
-	// ended, not to the window this request opens.
-	if state != nil && claudeAuthID(record) != "" {
-		state.openWindow(at)
+	// ended, not to the window this request opens. Weight the key queued before a
+	// new window opened is from earlier requests and stays outside it.
+	if state != nil && claudeAuthID(record) != "" && state.openWindow(at) {
+		t.markPendingOutsideLocked(keyID)
+	}
+	// Untracked keys still take part so their usage is not charged to other keys.
+	if credential != nil {
+		credential.queue(keyID, claudeRecordWeight(detail.TokenBreakdown), at, state != nil && state.Window.contains(at))
 	}
 	t.dirty = true
+}
+
+// markPendingOutsideLocked marks the weight a key has queued on every credential
+// as outside its allowance window. t.mu must be held.
+func (t *Tracker) markPendingOutsideLocked(keyID string) {
+	for _, credential := range t.claude {
+		if pending := credential.Pending[keyID]; pending != nil {
+			pending.Outside = pending.Weight
+		}
+	}
 }
 
 // Reset clears the usage of one key ID, or of every key when keyID is empty.
