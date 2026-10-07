@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
@@ -196,6 +199,78 @@ func (keys clientKeySet) maskUnknownFields(err error) error {
 	masked := unknownFieldPattern.ReplaceAllStringFunc(message, func(match string) string {
 		return "field " + keys.mask(unknownFieldPattern.FindStringSubmatch(match)[1]) + " not found in type "
 	})
+	if masked == message {
+		return err
+	}
+	return errors.New(masked)
+}
+
+// maskText masks every occurrence of a client key in text that is not part of a
+// longer word, ignoring case, as written, trimmed or escaped by %q: validators
+// print an offending value, sometimes normalized, and that value can be a client
+// key the operator aliased into their field.
+func (keys clientKeySet) maskText(text string) string {
+	seen := make(map[string]struct{})
+	var forms []string
+	for key := range keys {
+		for _, form := range []string{key, strings.TrimSpace(key)} {
+			quoted := strconv.Quote(form)
+			for _, form := range []string{form, quoted[1 : len(quoted)-1]} {
+				if _, dup := seen[form]; form != "" && !dup {
+					seen[form] = struct{}{}
+					forms = append(forms, regexp.QuoteMeta(form))
+				}
+			}
+		}
+	}
+	if len(forms) == 0 {
+		return text
+	}
+	// The longest form wins where several start at the same position.
+	sort.Slice(forms, func(i, j int) bool { return len(forms[i]) > len(forms[j]) })
+	pattern, err := regexp.Compile("(?i)" + strings.Join(forms, "|"))
+	if err != nil {
+		return text
+	}
+	var out strings.Builder
+	last := 0
+	for _, match := range pattern.FindAllStringIndex(text, -1) {
+		if !standsAlone(text, match[0], match[1]) {
+			continue
+		}
+		out.WriteString(text[last:match[0]])
+		out.WriteString(maskClientKey(text[match[0]:match[1]]))
+		last = match[1]
+	}
+	out.WriteString(text[last:])
+	return out.String()
+}
+
+// standsAlone reports whether text[start:end] does not continue a word on
+// either side, so that a short key does not mask part of an unrelated word.
+func standsAlone(text string, start, end int) bool {
+	isWord := func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }
+	first, _ := utf8.DecodeRuneInString(text[start:end])
+	before, _ := utf8.DecodeLastRuneInString(text[:start])
+	final, _ := utf8.DecodeLastRuneInString(text[start:end])
+	after, _ := utf8.DecodeRuneInString(text[end:])
+	return !(isWord(first) && isWord(before)) && !(isWord(final) && isWord(after))
+}
+
+// maskClientKeysIn masks in err every client key the document data names. The
+// public entry points apply it last, to every diagnostic they return.
+func maskClientKeysIn(data []byte, err error) error {
+	if err == nil {
+		return nil
+	}
+	var doc yaml.Node
+	if yaml.Unmarshal(data, &doc) != nil || len(doc.Content) == 0 {
+		return err
+	}
+	// Keys collected before a rejected entry are still masked.
+	keys, _ := clientKeysOf(doc.Content[0])
+	message := err.Error()
+	masked := keys.maskText(message)
 	if masked == message {
 		return err
 	}
@@ -785,6 +860,11 @@ func groupLegacyKeys(keys *yaml.Node, provider string) *yaml.Node {
 // NormalizeConfigLayout removes conflicting legacy fields. migrate also moves
 // legacy-only fields; callers use it only for an explicit v8 configuration write.
 func NormalizeConfigLayout(data []byte, migrate bool) ([]byte, bool, error) {
+	normalized, changed, err := normalizeConfigLayout(data, migrate)
+	return normalized, changed, maskClientKeysIn(data, err)
+}
+
+func normalizeConfigLayout(data []byte, migrate bool) ([]byte, bool, error) {
 	var doc yaml.Node
 	if err := yaml.Unmarshal(data, &doc); err != nil {
 		return nil, false, maskDecoderError(err)
@@ -1189,6 +1269,10 @@ func expandConfigAliases(node *yaml.Node) *yaml.Node {
 // ValidateV8Config accepts only the v8 layout in management writes.
 // Plugin-owned configuration remains extensible through its existing decoder.
 func ValidateV8Config(data []byte) error {
+	return maskClientKeysIn(data, validateV8Config(data))
+}
+
+func validateV8Config(data []byte) error {
 	var doc yaml.Node
 	if err := yaml.Unmarshal(data, &doc); err != nil {
 		return maskDecoderError(err)

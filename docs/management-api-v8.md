@@ -378,8 +378,12 @@ the decoder reports (``cannot unmarshal !!str `fi...ey` into int``). A client ke
 the document names in a client key map or in `access.api-keys` and aliases
 elsewhere, as a section, provider or field name, is masked in the diagnostic
 that names it and in the warning logged when a write comments out an unknown
-section. Diagnostics name the map (`api-key-limits` or `api-key-names`) and the
-line, never the keys above it.
+section. Every configuration error a load, a parse, a layout normalization or a
+v8 validation returns also masks each such key wherever it appears, ignoring
+case, so a value a validator prints (`invalid trusted-proxies entry "fi...ey"`)
+is masked too; a key that equals a word in the message masks that word as well.
+Diagnostics name the map (`api-key-limits` or `api-key-names`) and the line,
+never the keys above it.
 
 When a key's `current_pro_units` reaches its limit, the proxy refuses that key's
 requests to every Claude credential, OAuth and API-key alike, before any

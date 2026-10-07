@@ -43,7 +43,13 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		}
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
+	cfg, err := loadConfigData(configFile, data, optional)
+	return cfg, maskClientKeysIn(data, err)
+}
 
+// loadConfigData is LoadConfigOptional for the file's data once it is read.
+func loadConfigData(configFile string, data []byte, optional bool) (*Config, error) {
+	var err error
 	// In cloud deploy mode (optional=true), if file is empty or contains only whitespace, return empty config.
 	if optional && len(bytes.TrimSpace(data)) == 0 {
 		cfg := &Config{CredentialInFlight: DefaultCredentialInFlightConfig()}

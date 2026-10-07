@@ -1061,6 +1061,10 @@ func TestConfigV8MasksAliasedClientKeysOutsideTheirMaps(t *testing.T) {
 		{"as a nested field", "config-version: 8\naccess:\n  api-key-limits: {&client " + key + ": 1}\nrouting: {*client : 1}\n", "not found in type", http.StatusBadRequest},
 		{"as a provider", "config-version: 8\naccess:\n  api-key-limits: {&client " + key + ": 1}\napi-keys: {*client : []}\n", "unknown API-key provider", http.StatusBadRequest},
 		{"as a group field", "config-version: 8\naccess:\n  api-keys: [&client " + key + "]\napi-keys: {claude: [{name: a, keys: [], *client : 1}]}\n", "unsupported group field", http.StatusUnprocessableEntity},
+		{"into the deprecated private IP flag", "config-version: 8\naccess:\n  api-keys: [&client " + key + "]\ncodex: {live-media-relay: {allow-private-remote-ips: *client}}\n", "allow-private-remote-ips", http.StatusUnprocessableEntity},
+		{"into a trusted proxy", "config-version: 8\naccess:\n  api-keys: [&client " + key + "]\nserver: {trusted-proxies: [*client]}\n", "invalid trusted-proxies entry", http.StatusUnprocessableEntity},
+		{"into the relay public IP", "config-version: 8\naccess:\n  api-keys: [&client " + key + "]\ncodex: {live-media-relay: {enabled: true, public-ip: *client}}\n", "public-ip is invalid", http.StatusUnprocessableEntity},
+		{"into the image generation mode", "config-version: 8\naccess:\n  api-keys: [&client " + key + "]\nmultimedia: {disable-image-generation: *client}\n", "invalid disable-image-generation value", http.StatusUnprocessableEntity},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -547,6 +547,51 @@ func TestAliasedClientKeysAreMaskedOutsideTheirMaps(t *testing.T) {
 	}
 }
 
+// TestClientKeysAreMaskedInValueDiagnostics covers diagnostics outside the YAML
+// decoder that print an offending value, which can be a client key aliased into
+// their field, sometimes lowercased; and a key containing the text that
+// delimits a decoder diagnostic. Every public entry point must mask the key.
+func TestClientKeysAreMaskedInValueDiagnostics(t *testing.T) {
+	const delimiterKey = "fixture not found in type key"
+	cases := map[string]struct {
+		key, raw string
+		failing  []string
+	}{
+		"into the deprecated private IP flag": {aliasedClientKey, "config-version: 8\naccess:\n  api-keys: [&client " + aliasedClientKey + "]\ncodex: {live-media-relay: {allow-private-remote-ips: *client}}\n", []string{"ParseConfigBytes", "LoadConfig", "NormalizeConfigLayout", "ValidateV8Config"}},
+		"into a trusted proxy":                {aliasedClientKey, "config-version: 8\naccess:\n  api-keys: [&client " + aliasedClientKey + "]\nserver: {trusted-proxies: [*client]}\n", []string{"ParseConfigBytes", "LoadConfig"}},
+		"into the relay public IP":            {aliasedClientKey, "config-version: 8\naccess:\n  api-keys: [&client " + aliasedClientKey + "]\ncodex: {live-media-relay: {enabled: true, public-ip: *client}}\n", []string{"ParseConfigBytes", "LoadConfig"}},
+		"lowercased by a validator":           {"Fixture-K1", "config-version: 8\naccess:\n  api-key-limits: {&client Fixture-K1: 1}\nmultimedia: {disable-image-generation: *client}\n", []string{"ParseConfigBytes", "LoadConfig", "ValidateV8Config"}},
+		"containing a diagnostic delimiter":   {delimiterKey, "config-version: 8\naccess:\n  api-key-limits: {&client " + delimiterKey + ": 1}\nrouting: {*client : 1}\n", []string{"ValidateV8Config"}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(tc.raw), 0600); err != nil {
+				t.Fatal(err)
+			}
+			_, errParse := ParseConfigBytes([]byte(tc.raw))
+			_, errLoad := LoadConfig(path)
+			_, _, errNormalize := NormalizeConfigLayout([]byte(tc.raw), true)
+			errs := map[string]error{
+				"ParseConfigBytes":      errParse,
+				"LoadConfig":            errLoad,
+				"NormalizeConfigLayout": errNormalize,
+				"ValidateV8Config":      ValidateV8Config([]byte(tc.raw)),
+			}
+			for _, label := range tc.failing {
+				if errs[label] == nil {
+					t.Fatalf("%s accepted the document", label)
+				}
+			}
+			for label, err := range errs {
+				if err != nil && strings.Contains(strings.ToLower(err.Error()), strings.ToLower(tc.key)) {
+					t.Fatalf("%s error echoes the key: %q", label, err)
+				}
+			}
+		})
+	}
+}
+
 // TestAliasedClientKeySectionWarningIsMasked covers the warning logged when a
 // write comments out an unknown section: a client key aliased as the section
 // name must appear masked there too.
