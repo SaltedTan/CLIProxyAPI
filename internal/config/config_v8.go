@@ -156,22 +156,29 @@ func buildV8Paths() []configPath {
 // entries must never appear unmasked in errors or logs.
 var clientKeyMapNames = map[string]struct{}{"api-key-limits": {}, "api-key-names": {}}
 
-// duplicateMappingKeyPattern matches the key named by yaml.v3's duplicate
-// mapping key error.
-var duplicateMappingKeyPattern = regexp.MustCompile(`mapping key ("(?:[^"\\]|\\.)*") already defined`)
+// decoderKeyPatterns match the YAML decoder errors that print a mapping key or an
+// anchor name: a duplicated key, a key that is not a scalar, and an anchor that
+// contains itself.
+var (
+	duplicateMappingKeyPattern = regexp.MustCompile(`mapping key ("(?:[^"\\]|\\.)*") already defined`)
+	invalidMapKeyPattern       = regexp.MustCompile(`invalid map key: [^\n]*`)
+	selfAnchorPattern          = regexp.MustCompile(`anchor '([^']*)' value contains itself`)
+)
 
-// checkClientKeyMapDuplicates rejects a duplicated entry in a client key map with
-// the key masked. It walks the whole document, through aliases and merge keys,
-// because the generic decoder decodes every mapping it meets, including anchored
-// copies that merge precedence shadows, and names a duplicated key in its error.
-// Each mapping in the merge closure of a client key map is checked on its own,
-// matching how yaml.v3 decodes them; a direct entry overriding a merged one is
-// not a duplicate.
+// checkClientKeyMapDuplicates rejects a duplicated or non-scalar entry in a client
+// key map with the key masked. It walks the whole document, through aliases and
+// merge keys, because the generic decoder decodes every mapping it meets,
+// including anchored copies that merge precedence shadows, and names the key in
+// its error. Each mapping in the merge closure of a client key map is checked on
+// its own, matching how yaml.v3 decodes them; a direct entry overriding a merged
+// one is not a duplicate. Diagnostics mask every path segment that is a client key.
 func checkClientKeyMapDuplicates(root *yaml.Node) error {
-	return walkClientKeyMaps(root, "", make(map[*yaml.Node]struct{}))
+	return walkClientKeyMaps(root, "", false, make(map[*yaml.Node]struct{}))
 }
 
-func walkClientKeyMaps(node *yaml.Node, path string, seen map[*yaml.Node]struct{}) error {
+// walkClientKeyMaps visits node at the dotted path; masked is set for the entries
+// of a client key map, whose names are client keys.
+func walkClientKeyMaps(node *yaml.Node, path string, masked bool, seen map[*yaml.Node]struct{}) error {
 	node = resolveAliasNode(node, seen)
 	if node == nil {
 		return nil
@@ -183,23 +190,28 @@ func walkClientKeyMaps(node *yaml.Node, path string, seen map[*yaml.Node]struct{
 	switch node.Kind {
 	case yaml.DocumentNode, yaml.SequenceNode:
 		for _, child := range node.Content {
-			if err := walkClientKeyMaps(child, path, seen); err != nil {
+			if err := walkClientKeyMaps(child, path, masked, seen); err != nil {
 				return err
 			}
 		}
 	case yaml.MappingNode:
 		for i := 0; i+1 < len(node.Content); i += 2 {
-			name := mapKeyName(node.Content[i], seen)
-			child := name
-			if path != "" {
-				child = path + "." + name
+			name := mapKeyName(node.Content[i])
+			segment := name
+			if masked && name != "<<" {
+				segment = maskClientKey(name)
 			}
-			if _, clientKeyMap := clientKeyMapNames[name]; clientKeyMap {
-				if err := checkMergedMappingDuplicates(node.Content[i+1], child); err != nil {
+			child := segment
+			if path != "" {
+				child = path + "." + segment
+			}
+			_, clientKeyMap := clientKeyMapNames[name]
+			if clientKeyMap {
+				if err := checkClientKeyMapEntries(node.Content[i+1], child); err != nil {
 					return err
 				}
 			}
-			if err := walkClientKeyMaps(node.Content[i+1], child, seen); err != nil {
+			if err := walkClientKeyMaps(node.Content[i+1], child, clientKeyMap, seen); err != nil {
 				return err
 			}
 		}
@@ -207,28 +219,40 @@ func walkClientKeyMaps(node *yaml.Node, path string, seen map[*yaml.Node]struct{
 	return nil
 }
 
-// mapKeyName returns the name a mapping key decodes to: the merge marker for
-// <<, the anchored scalar for an alias key, and the scalar value otherwise.
-func mapKeyName(key *yaml.Node, seen map[*yaml.Node]struct{}) string {
+// scalarKey returns the scalar a mapping key decodes to, following aliases, and
+// whether the key is a scalar at all.
+func scalarKey(key *yaml.Node) (string, bool) {
+	resolved := resolveAliasNode(key, make(map[*yaml.Node]struct{}))
+	if resolved == nil || resolved.Kind != yaml.ScalarNode {
+		return "", false
+	}
+	return resolved.Value, true
+}
+
+// mapKeyName returns the name a mapping key decodes to: the merge marker for <<,
+// the resolved scalar otherwise, and an empty name for a key that is not a scalar.
+func mapKeyName(key *yaml.Node) string {
 	if isMergeKey(key) {
 		return "<<"
 	}
-	if resolved := resolveAliasNode(key, make(map[*yaml.Node]struct{})); resolved != nil && resolved.Kind == yaml.ScalarNode {
-		return resolved.Value
-	}
-	return key.Value
+	name, _ := scalarKey(key)
+	return name
 }
 
-// checkMergedMappingDuplicates reports the first entry defined twice within one
-// of the mappings that make up the client key map at path.
-func checkMergedMappingDuplicates(mapping *yaml.Node, path string) error {
+// checkClientKeyMapEntries reports the first entry of the client key map at path
+// that is not a scalar key or is defined twice within one of its mappings. Alias
+// keys are compared by the scalar they resolve to.
+func checkClientKeyMapEntries(mapping *yaml.Node, path string) error {
 	for _, node := range mergedMappings(mapping, nil, make(map[*yaml.Node]struct{})) {
 		seen := make(map[string]struct{}, len(node.Content)/2)
 		for i := 0; i+1 < len(node.Content); i += 2 {
 			if isMergeKey(node.Content[i]) {
 				continue
 			}
-			key := node.Content[i].Value
+			key, scalar := scalarKey(node.Content[i])
+			if !scalar {
+				return fmt.Errorf("%s: entry at line %d must be a plain key", path, node.Content[i].Line)
+			}
 			if _, duplicate := seen[key]; duplicate {
 				return fmt.Errorf("%s: entry %s is defined more than once (line %d)", path, maskClientKey(key), node.Content[i].Line)
 			}
@@ -238,11 +262,11 @@ func checkMergedMappingDuplicates(mapping *yaml.Node, path string) error {
 	return nil
 }
 
-// maskDuplicateKeyError masks the key named by the YAML decoder's duplicate
-// mapping key error. It is the fallback for a duplicated key the structural
-// check could not attribute to a client key map, such as an anchor declared
-// under an unrelated name; line numbers are kept so the entry stays findable.
-func maskDuplicateKeyError(err error) error {
+// maskDecoderError masks the key or anchor named by the YAML decoder's own
+// errors. It is the fallback for a mapping the structural check could not
+// attribute to a client key map, such as an anchor declared under an unrelated
+// name; line numbers are kept so the entry stays findable.
+func maskDecoderError(err error) error {
 	if err == nil {
 		return nil
 	}
@@ -254,6 +278,10 @@ func maskDuplicateKeyError(err error) error {
 			key = quoted
 		}
 		return "mapping key " + strconv.Quote(maskClientKey(key)) + " already defined"
+	})
+	masked = invalidMapKeyPattern.ReplaceAllLiteralString(masked, "invalid map key: a key must be a plain scalar")
+	masked = selfAnchorPattern.ReplaceAllStringFunc(masked, func(match string) string {
+		return "anchor '" + maskClientKey(selfAnchorPattern.FindStringSubmatch(match)[1]) + "' value contains itself"
 	})
 	if masked == message {
 		return err
@@ -449,7 +477,7 @@ func flattenV8(node *yaml.Node) (*yaml.Node, error) {
 	// winning v8 value would otherwise hide the malformed legacy subtree.
 	var shape map[string]any
 	if err := node.Decode(&shape); err != nil {
-		return nil, maskDuplicateKeyError(err)
+		return nil, maskDecoderError(err)
 	}
 	node = expandConfigAliases(node)
 	if _, err := normalizeV8PrivateIPAlias(node, true); err != nil {

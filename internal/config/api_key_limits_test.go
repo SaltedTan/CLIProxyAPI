@@ -181,3 +181,77 @@ func TestGenericDuplicateKeyErrorsAreMasked(t *testing.T) {
 		t.Fatalf("ValidateV8Config error = %v, want a masked rejection", errValidate)
 	}
 }
+
+// TestClientKeyDiagnosticsNeverNameAncestorKeys covers a malformed value under a
+// client key that itself holds a client key map: the diagnostic path masks the
+// ancestor key.
+func TestClientKeyDiagnosticsNeverNameAncestorKeys(t *testing.T) {
+	const key = "fixture-client-key-1"
+	raw := "config-version: 8\naccess:\n  api-key-limits:\n    " + key + ":\n      api-key-limits:\n        x: 1\n        x: 2\n"
+	_, err := ParseConfigBytes([]byte(raw))
+	if err == nil {
+		t.Fatal("ParseConfigBytes accepted a duplicated entry")
+	}
+	if strings.Contains(err.Error(), key) || !strings.Contains(err.Error(), "fixt...ey-1") {
+		t.Fatalf("ParseConfigBytes error = %q, want the ancestor key masked as fixt...ey-1", err)
+	}
+}
+
+// TestNonScalarClientKeyEntriesAreRejectedMasked covers compound YAML keys, which
+// the generic decoder rejects by printing the key.
+func TestNonScalarClientKeyEntriesAreRejectedMasked(t *testing.T) {
+	const key = "fixture-client-key-1"
+	cases := map[string]string{
+		"compound key in the limits map":   "config-version: 8\naccess:\n  api-key-limits:\n    ? [" + key + "]\n    : 1\n",
+		"compound key in an unrelated map": "config-version: 8\nx-unrelated:\n  ? [" + key + "]\n  : 1\n",
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, errParse := ParseConfigBytes([]byte(raw))
+			if errParse == nil {
+				t.Fatal("ParseConfigBytes accepted a compound key")
+			}
+			if strings.Contains(errParse.Error(), key) {
+				t.Fatalf("ParseConfigBytes error echoes the key: %q", errParse)
+			}
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+				t.Fatal(err)
+			}
+			_, errLoad := LoadConfig(path)
+			if errLoad == nil {
+				t.Fatal("LoadConfig accepted a compound key")
+			}
+			if strings.Contains(errLoad.Error(), key) {
+				t.Fatalf("LoadConfig error echoes the key: %q", errLoad)
+			}
+		})
+	}
+}
+
+// TestAliasKeysAreComparedByTheirResolvedName keeps alias keys usable: an alias
+// and a literal naming different keys are distinct entries, while an alias
+// resolving to a literal already present is the same entry twice.
+func TestAliasKeysAreComparedByTheirResolvedName(t *testing.T) {
+	const key = "fixture-client-key-1"
+	t.Run("distinct keys", func(t *testing.T) {
+		raw := "config-version: 8\naccess:\n  api-keys: [&short_name " + key + ", short_name]\n  api-key-limits:\n    *short_name: 1\n    short_name: 2\n"
+		cfg, err := ParseConfigBytes([]byte(raw))
+		if err != nil {
+			t.Fatalf("ParseConfigBytes() error = %v", err)
+		}
+		if cfg.APIKeyLimits[key] != 1 || cfg.APIKeyLimits["short_name"] != 2 {
+			t.Fatalf("limits = %v, want the alias and the literal as separate entries", cfg.APIKeyLimits)
+		}
+	})
+	t.Run("same key twice", func(t *testing.T) {
+		raw := "config-version: 8\naccess:\n  api-keys: [&short_name " + key + "]\n  api-key-limits:\n    *short_name: 1\n    " + key + ": 2\n"
+		_, err := ParseConfigBytes([]byte(raw))
+		if err == nil {
+			t.Fatal("ParseConfigBytes accepted the same key through an alias and a literal")
+		}
+		if strings.Contains(err.Error(), key) || !strings.Contains(err.Error(), "fixt...ey-1") {
+			t.Fatalf("ParseConfigBytes error = %q, want the key masked", err)
+		}
+	})
+}

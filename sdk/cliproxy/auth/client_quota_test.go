@@ -505,3 +505,54 @@ func TestAdmissionRefusalDoesNotHideAnEarlierUpstreamError(t *testing.T) {
 		})
 	}
 }
+
+// TestRequestAdmissionIsSharedAcrossConductorCalls pins the scope a handler puts
+// on the context once per client request: a second conductor call for the same
+// request (a stream bootstrap retry) reuses the admission decided by the first,
+// so the policy is not consulted again and the retry cannot be refused, while a
+// new request, with or without a scope, is admitted on its own.
+func TestRequestAdmissionIsSharedAcrossConductorCalls(t *testing.T) {
+	for _, kind := range []string{"execute", "stream"} {
+		t.Run(kind, func(t *testing.T) {
+			manager := NewManager(nil, nil, nil)
+			manager.SetRetryConfig(0, 0, 0)
+			model := "admission-scope-" + kind
+			claude := &admissionTestExecutor{identifier: "claude", executeErr: &Error{Code: "upstream_error", Message: "upstream failed", HTTPStatus: http.StatusInternalServerError}}
+			manager.RegisterExecutor(claude)
+			registerAdmissionAuth(t, manager, "admission-scope-claude-"+kind, "claude", model)
+			policy := &admissionTestPolicy{refuse: map[string]*ClientQuotaError{}}
+			manager.SetAdmissionPolicy(policy)
+			run := func(ctx context.Context) error {
+				req := cliproxyexecutor.Request{Model: model}
+				if kind == "execute" {
+					_, err := manager.Execute(ctx, []string{"claude"}, req, cliproxyexecutor.Options{})
+					return err
+				}
+				_, err := manager.ExecuteStream(ctx, []string{"claude"}, req, cliproxyexecutor.Options{})
+				return err
+			}
+			ctx := WithRequestAdmission(context.Background())
+			if err := run(ctx); err == nil {
+				t.Fatal("the first call must fail upstream")
+			}
+			// The key reaches its limit while the first attempt runs.
+			policy.refuse["claude"] = claudeQuotaRefusal()
+			var quota *ClientQuotaError
+			if err := run(ctx); errors.As(err, &quota) {
+				t.Fatalf("the retry of an admitted request was refused: %v", err)
+			}
+			if got := len(policy.callIDs()); got != 1 {
+				t.Fatalf("policy consulted %d times, want once for the request", got)
+			}
+			if got := len(claude.ids(kind)); got != 2 {
+				t.Fatalf("upstream calls = %d, want the retry to proceed", got)
+			}
+			if err := run(WithRequestAdmission(context.Background())); !errors.As(err, &quota) {
+				t.Fatalf("a new request must be refused: %v", err)
+			}
+			if err := run(context.Background()); !errors.As(err, &quota) {
+				t.Fatalf("a call without a scope must be refused: %v", err)
+			}
+		})
+	}
+}

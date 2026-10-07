@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -141,6 +142,7 @@ func retryAfterSeconds(retryAfter time.Duration) int64 {
 // retry rounds. It also remembers whether the request reached an upstream, so a
 // refusal is returned, and recorded with the policy, only for requests that never did.
 type admissionCache struct {
+	holder    *admissionPolicyHolder
 	policy    AdmissionPolicy
 	decisions map[string]error
 	refusal   error
@@ -148,17 +150,55 @@ type admissionCache struct {
 	recorded  bool
 }
 
+// admissionScope carries one client request's admission across the conductor
+// calls a handler makes for it, such as a stream bootstrap retry. The request is
+// admitted once, so a later call can neither consult the policy again nor turn an
+// outcome the request already had upstream into a refusal.
+type admissionScope struct {
+	mu    sync.Mutex
+	cache *admissionCache
+}
+
+type admissionScopeKey struct{}
+
+// WithRequestAdmission returns a context whose conductor calls share one
+// admission decision. Handlers call it once per client request; a context that
+// already carries a scope is returned unchanged.
+func WithRequestAdmission(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if scope, ok := ctx.Value(admissionScopeKey{}).(*admissionScope); ok && scope != nil {
+		return ctx
+	}
+	return context.WithValue(ctx, admissionScopeKey{}, &admissionScope{})
+}
+
 // newAdmissionCache returns nil when no policy is installed or Home mode is on,
-// in which case the pick loops never consult admission.
-func (m *Manager) newAdmissionCache() *admissionCache {
+// in which case the pick loops never consult admission. With a request scope on
+// ctx the cache is shared by every call made for that request, as long as the
+// installed policy has not changed in between.
+func (m *Manager) newAdmissionCache(ctx context.Context) *admissionCache {
 	if m == nil || m.HomeEnabled() {
 		return nil
 	}
-	policy := m.AdmissionPolicy()
-	if policy == nil {
+	holder := m.admissionPolicy.Load()
+	if holder == nil || holder.policy == nil {
 		return nil
 	}
-	return &admissionCache{policy: policy, decisions: make(map[string]error)}
+	fresh := func() *admissionCache {
+		return &admissionCache{holder: holder, policy: holder.policy, decisions: make(map[string]error)}
+	}
+	scope, _ := ctx.Value(admissionScopeKey{}).(*admissionScope)
+	if scope == nil {
+		return fresh()
+	}
+	scope.mu.Lock()
+	defer scope.mu.Unlock()
+	if scope.cache == nil || scope.cache.holder != holder {
+		scope.cache = fresh()
+	}
+	return scope.cache
 }
 
 // admit returns the refusal for auth, evaluating the policy on first sight of its provider.

@@ -133,7 +133,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 
 	ctx = m.routingObs.beginRequest(ctx)
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
-	admission := m.newAdmissionCache()
+	admission := m.newAdmissionCache(ctx)
 
 	var lastErr error
 	var preferredUpstreamErr error
@@ -250,7 +250,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 
 	ctx = m.routingObs.beginRequest(ctx)
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
-	admission := m.newAdmissionCache()
+	admission := m.newAdmissionCache(ctx)
 
 	var lastErr error
 	var preferredUpstreamErr error

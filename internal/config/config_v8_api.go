@@ -64,7 +64,7 @@ func NormalizeV8ConfigAliases(root *yaml.Node) error {
 	}
 	var shape any
 	if err := root.Decode(&shape); err != nil {
-		return maskDuplicateKeyError(err)
+		return maskDecoderError(err)
 	}
 	*root = *expandConfigAliases(root)
 	// A null historical container resets its fields. Represent the reset as

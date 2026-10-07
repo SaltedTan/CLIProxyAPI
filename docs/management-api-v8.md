@@ -327,9 +327,11 @@ fewer are masked completely, in errors and in the report's `key` field). An
 entry counts as duplicated within one mapping, wherever that mapping appears in
 the document: under a YAML merge key (`<<`), behind an alias, in an anchored
 copy that a direct entry shadows, or in a nested `PATCH` body. An entry set
-directly still overrides the same entry from a merged mapping. Any other
-duplicated mapping key the YAML decoder reports is masked the same way, with
-its line numbers kept.
+directly still overrides the same entry from a merged mapping; an alias key
+counts as the key it resolves to. Entries must be plain scalar keys. Any other
+duplicated or non-scalar mapping key the YAML decoder reports is masked the
+same way, with its line numbers kept, and diagnostic paths mask every segment
+that is a client key.
 
 When a key's `current_pro_units` reaches its limit, the proxy refuses that key's
 requests to every Claude credential, OAuth and API-key alike, before any
@@ -368,7 +370,11 @@ publish no usage record and do not cool down any credential. A request that is
 refused on Claude but served by another provider is not blocked and is not
 counted; `blocked` counts only requests the proxy answered with the 429. When a
 request fails upstream on another provider and a retry round then finds only
-the Claude refusal, the upstream failure is reported, not the 429.
+the Claude refusal, the upstream failure is reported, not the 429. Admission is
+decided once per client request: a stream bootstrap retry
+(`streaming.bootstrap-retries`) of a request already admitted proceeds even if
+that request's own first attempt reached the limit, and reports the upstream
+outcome.
 
 A key is admitted again as soon as its current usage is below the limit: when a
 credential's weekly window resets, when the limit is raised or removed, or when
