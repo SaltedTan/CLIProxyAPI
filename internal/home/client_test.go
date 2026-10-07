@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/google/uuid"
@@ -483,28 +484,42 @@ func TestNewLifetimePreservesClusterFailoverState(t *testing.T) {
 
 func TestEnsureClientsWaitsForPreviousTargetClose(t *testing.T) {
 	client := New(config.HomeConfig{Enabled: true, Host: "next.example.com", Port: 8327})
-	closing := make(chan struct{})
-	client.closing = closing
-	done := make(chan error, 1)
-	go func() {
-		done <- client.ensureClients()
-	}()
+	// The clients exist already, so none is created inside the bubble below: a
+	// go-redis client starts a background goroutine that outlives Close.
+	client.cmd = redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	client.sub = redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	defer client.Close()
+	// synctest.Wait returns once ensureClients is durably blocked, so neither
+	// check needs a wall-clock bound.
+	synctest.Test(t, func(t *testing.T) {
+		closing := make(chan struct{})
+		client.mu.Lock()
+		client.closing = closing
+		client.mu.Unlock()
+		// Close runs outside the bubble and must not wait on its channel.
+		t.Cleanup(func() {
+			client.mu.Lock()
+			if client.closing == closing {
+				client.closing = nil
+			}
+			client.mu.Unlock()
+		})
+		done := make(chan error, 1)
+		go func() {
+			done <- client.ensureClients()
+		}()
 
-	select {
-	case errEnsure := <-done:
-		t.Fatalf("ensureClients() returned before previous target closed: %v", errEnsure)
-	case <-time.After(20 * time.Millisecond):
-	}
-	close(closing)
-	select {
-	case errEnsure := <-done:
-		if errEnsure != nil {
+		synctest.Wait()
+		select {
+		case errEnsure := <-done:
+			t.Fatalf("ensureClients() returned before previous target closed: %v", errEnsure)
+		default:
+		}
+		close(closing)
+		if errEnsure := <-done; errEnsure != nil {
 			t.Fatal(errEnsure)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("ensureClients() did not continue after previous target closed")
-	}
-	client.Close()
+	})
 }
 
 func TestConcurrencyReleaseDoesNotOpenBeforeMembershipReady(t *testing.T) {
