@@ -215,6 +215,18 @@ func (t *Tracker) Admit(ctx context.Context, auth *coreauth.Auth) error {
 	}
 }
 
+// MayRefuse implements coreauth.RefusalPredictor: only a client key with a Claude
+// allowance can be refused.
+func (t *Tracker) MayRefuse(ctx context.Context) bool {
+	if t == nil {
+		return false
+	}
+	apiKey := apiKeyFromContext(ctx)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.limitedLocked(apiKey)
+}
+
 // RecordRefusal implements coreauth.RefusalRecorder. The conductor calls it once when
 // a refusal from Admit becomes the request's result, so a request served by another
 // provider is never counted. The refusal counts as blocked on the key's totals and on

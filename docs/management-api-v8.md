@@ -422,12 +422,19 @@ own and is admitted on its own. A request whose admission could not be decided
 (the policy failed while deciding) fails instead of being admitted; it never
 tries another credential as if the policy had refused only one. With
 `nonstream-keepalive-interval` set, no keepalive byte is written to a
-non-streaming response before the request is committed to an upstream attempt,
-so a refusal is still answered with the 429; a model call a plugin makes
+non-streaming response of a key with an allowance before the request is
+committed to an upstream attempt, so a refusal is still answered with the 429:
+the first byte commits the response status. A model call a plugin makes
 before that point does not release the keepalive either, whether a credential
-or a plugin executor serves it. The image generation stream's bootstrap
-heartbeat (`streaming.keepalive-seconds`) waits for the same point, so a
-refused image request is a plain JSON 429 rather than an SSE error.
+or a plugin executor serves it, so a long one sends no keepalive bytes; that
+cannot change without giving up the 429, because the request's own admission
+is decided only after the plugin returns. Requests of keys without an
+allowance, and every request in Home mode, get the keepalive from the start
+(an allowance added for such a key while one of its requests waits is then
+reported, if reached, after keepalive bytes in a `200` response). The image
+generation stream's bootstrap heartbeat (`streaming.keepalive-seconds`) waits
+for the same point, so a refused image request is a plain JSON 429 rather than
+an SSE error.
 
 A key is admitted again as soon as its current usage is below the limit: when
 its window ends, when the limit is raised or removed, when

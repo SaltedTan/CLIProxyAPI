@@ -351,3 +351,66 @@ func TestNestedPluginExecutorCallDoesNotCommitTheOuterKeepAlive(t *testing.T) {
 		})
 	}
 }
+
+// TestNonStreamKeepAliveFlowsBeforeAdmissionForKeysWithoutALimit pins that the
+// keepalive is held back only for a key admission could refuse: for a key
+// without a Claude allowance, a slow before-auth plugin, or a model call it
+// makes, gets keepalive bytes like an upstream wait does.
+func TestNonStreamKeepAliveFlowsBeforeAdmissionForKeysWithoutALimit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const limitedKey = "fixture-client-key-1"
+	const key = "fixture-client-key-2"
+	for _, nested := range []bool{false, true} {
+		name := "slow plugin"
+		if nested {
+			name = "nested call"
+		}
+		t.Run(name, func(t *testing.T) {
+			suffix := strings.ReplaceAll(name, " ", "-")
+			claudeAuth := "auth-claude-keepalive-unlimited-" + suffix
+			claudeModel := "claude-keepalive-unlimited-" + suffix
+			geminiAuth := "auth-gemini-keepalive-unlimited-" + suffix
+			geminiModel := "gemini-keepalive-unlimited-" + suffix
+			manager := coreauth.NewManager(nil, nil, nil)
+			manager.SetAdmissionPolicy(newKeepAliveTracker(limitedKey, claudeAuth, claudeModel, "0.2"))
+			manager.SetConfig(&sdkconfig.Config{DisableCooling: true})
+			manager.RegisterExecutor(&keepAliveExecutor{bootstrapStreamExecutor: &bootstrapStreamExecutor{}, provider: "claude", execute: func(context.Context) (coreexecutor.Response, error) {
+				return coreexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
+			}})
+			manager.RegisterExecutor(&keepAliveExecutor{bootstrapStreamExecutor: &bootstrapStreamExecutor{}, provider: "gemini", execute: func(context.Context) (coreexecutor.Response, error) {
+				return coreexecutor.Response{Payload: []byte(`{"nested":true}`)}, nil
+			}})
+			registerKeepAliveAuth(t, manager, claudeAuth, "claude", claudeModel)
+			registerKeepAliveAuth(t, manager, geminiAuth, "gemini", geminiModel)
+			h := keepAliveHandler(manager)
+			rec, c, ctx, cancel := newKeepAliveRequest(h, key)
+			defer cancel()
+			flushedBeforeAdmission := false
+			h.SetPluginHost(&handlerInterceptorTestHost{interceptRequestBeforeAuth: func(ctx context.Context, req pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse {
+				if req.Model == claudeModel {
+					if nested {
+						if _, errNested := h.ExecuteModel(ctx, ModelExecutionRequest{EntryProtocol: "openai", ExitProtocol: "openai", Model: geminiModel, Body: []byte(`{"model":"` + geminiModel + `"}`)}); errNested != nil {
+							t.Errorf("nested call: %v", errNested.Error)
+						}
+					}
+					select {
+					case <-rec.flushed:
+					case <-time.After(keepAliveProbeWait):
+					}
+					flushedBeforeAdmission = rec.wasFlushed()
+				}
+				return pluginapi.RequestInterceptResponse{Headers: cloneHeader(req.Headers)}
+			}})
+
+			stop := h.StartNonStreamingKeepAlive(c, ctx)
+			_, _, errMsg := h.ExecuteWithAuthManager(ctx, "openai", claudeModel, []byte(`{"model":"`+claudeModel+`"}`), "")
+			stop()
+			if errMsg != nil {
+				t.Fatalf("ExecuteWithAuthManager: %v", errMsg.Error)
+			}
+			if !flushedBeforeAdmission {
+				t.Fatal("no keepalive byte reached a client whose key admission cannot refuse")
+			}
+		})
+	}
+}

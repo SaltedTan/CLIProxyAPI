@@ -1242,3 +1242,24 @@ func TestPendingWeightFromBeforeAWindowResetStaysOutOfTheNextWindow(t *testing.T
 	approx(t, "current", key.CurrentProUnits, 0.25/3)
 	approx(t, "total", key.TotalProUnits, 0.5)
 }
+
+// TestMayRefuseOnlyKeysWithAnAllowance pins which requests admission could refuse
+// before a credential is picked: those of a key with a non-zero allowance, by full
+// key or by id.
+func TestMayRefuseOnlyKeysWithAnAllowance(t *testing.T) {
+	now := testNow
+	tracker := newTestTracker(&now)
+	tracker.SetLimits(map[string]float64{"key-a": 0.5, KeyID("key-b"): 0.25, "key-c": 0})
+	for key, want := range map[string]bool{"key-a": true, "key-b": true, "key-c": false, "key-d": false, "": false} {
+		if got := tracker.MayRefuse(requestContext(key)); got != want {
+			t.Fatalf("MayRefuse(%q) = %v, want %v", key, got, want)
+		}
+	}
+	tracker.SetLimits(map[string]float64{AnonymousKeyID: 1})
+	if !tracker.MayRefuse(context.Background()) {
+		t.Fatal("a request without a key falls under the anonymous allowance")
+	}
+	if (*Tracker)(nil).MayRefuse(requestContext("key-a")) {
+		t.Fatal("a nil tracker refuses nothing")
+	}
+}

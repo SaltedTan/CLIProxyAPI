@@ -543,6 +543,11 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	newCtx = context.WithValue(newCtx, "gin", c)
 	newCtx = context.WithValue(newCtx, "handler", handler)
 	newCtx = withUpstreamCommitGate(newCtx)
+	if !h.AuthManager.MayRefuseAdmission(newCtx) {
+		// Nothing can refuse this request, so nothing holds its keepalive back,
+		// including a model call a plugin makes before admission.
+		openUpstreamCommitGate(newCtx)
+	}
 	return newCtx, func(params ...interface{}) {
 		if c != nil {
 			logging.SetResponseStatus(cancelCtx, c.Writer.Status())

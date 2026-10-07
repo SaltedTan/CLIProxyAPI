@@ -25,6 +25,12 @@ type AdmissionPolicy interface {
 	Admit(ctx context.Context, auth *Auth) error
 }
 
+// RefusalPredictor is implemented by admission policies that can tell, before any
+// credential is picked, whether they could refuse the request in ctx at all.
+type RefusalPredictor interface {
+	MayRefuse(ctx context.Context) bool
+}
+
 // RefusalRecorder is implemented by admission policies that account for a refusal
 // only once the conductor returns it to the client. A request refused by one
 // provider and served by another is not recorded.
@@ -60,6 +66,24 @@ func (m *Manager) AdmissionPolicy() AdmissionPolicy {
 		return nil
 	}
 	return holder.policy
+}
+
+// MayRefuseAdmission reports whether admission could refuse the request in ctx
+// before upstream: never in Home mode or without a policy, and otherwise unless
+// the policy tells it will not. Handlers use it to release a non-streaming
+// keepalive at once for a request nothing can refuse.
+func (m *Manager) MayRefuseAdmission(ctx context.Context) bool {
+	if m == nil || m.HomeEnabled() {
+		return false
+	}
+	policy := m.AdmissionPolicy()
+	if policy == nil {
+		return false
+	}
+	if predictor, ok := policy.(RefusalPredictor); ok {
+		return predictor.MayRefuse(ctx)
+	}
+	return true
 }
 
 // ClientQuotaError refuses a request because the client API key spent its
