@@ -536,6 +536,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			// Refused credentials are skipped without any upstream attempt, result,
 			// or cooldown; other providers still serve the request.
 			if errAdmit := admission.admit(ctx, auth); errAdmit != nil {
+				if errAbort := admission.abort(ctx, errAdmit); errAbort != nil {
+					return cliproxyexecutor.Response{}, errAbort
+				}
 				tried[auth.ID] = struct{}{}
 				continue
 			}
@@ -1024,6 +1027,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			// Refused credentials are skipped without any upstream attempt, result,
 			// or cooldown; other providers still serve the request.
 			if errAdmit := admission.admit(ctx, auth); errAdmit != nil {
+				if errAbort := admission.abort(ctx, errAdmit); errAbort != nil {
+					return nil, errAbort
+				}
 				tried[auth.ID] = struct{}{}
 				continue
 			}

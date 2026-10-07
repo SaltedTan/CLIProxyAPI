@@ -325,7 +325,10 @@ rejected: the file fails to load and management writes return
 `400 invalid_config`; error messages mask the key (keys of four characters or
 fewer are masked completely, in errors and in the report's `key` field).
 Values must be plain scalars: a number, or empty for no limit (a quoted or
-tagged value is rejected before the YAML decoder can print it). An
+tagged value is rejected before the YAML decoder can print it). The map itself
+must be a mapping or empty: a scalar or a list in its place, directly or
+behind an alias, is rejected before decoding as well, and a conversion error
+the decoder reports for the map is masked like one for a value. An
 entry counts as duplicated within one mapping, wherever that mapping appears in
 the document: under a YAML merge key (`<<`), behind an alias, in an anchored
 copy that a direct entry shadows, or in a nested `PATCH` body. An entry set
@@ -380,7 +383,9 @@ decided once per client request: a stream bootstrap retry
 (`streaming.bootstrap-retries`) of a request already admitted proceeds even if
 that request's own first attempt reached the limit, and reports the upstream
 outcome. A model call a plugin makes from inside a request is a request of its
-own and is admitted on its own.
+own and is admitted on its own. A request whose admission could not be decided
+(the policy failed while deciding) fails instead of being admitted; it never
+tries another credential as if the policy had refused only one.
 
 A key is admitted again as soon as its current usage is below the limit: when a
 credential's weekly window resets, when the limit is raised or removed, or when

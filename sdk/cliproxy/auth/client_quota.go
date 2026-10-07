@@ -269,6 +269,21 @@ func (c *admissionCache) decide(ctx context.Context, auth *Auth, provider string
 
 // markAttempted notes that the request went on to an upstream attempt. From then on
 // the outcome of that attempt, not a refusal, is the request's result.
+// abort returns the error a pick loop must stop on at once after admit failed:
+// the deciding call failed before deciding, or the caller's context ended.
+// Nil means the credential was refused and the loop may try the next one.
+func (c *admissionCache) abort(ctx context.Context, err error) error {
+	if errors.Is(err, errAdmissionUndecided) {
+		return wrapRequestStopError(err)
+	}
+	if ctx != nil {
+		if errCtx := ctx.Err(); errCtx != nil {
+			return errCtx
+		}
+	}
+	return nil
+}
+
 func (c *admissionCache) markAttempted() {
 	if c == nil {
 		return

@@ -962,6 +962,8 @@ func TestConfigV8RejectsDuplicateClientKeysInNestedPatchesAndMergedYAML(t *testi
 		{"YAML PUT with a tagged key holding a backtick", http.MethodPut, "/v8/management/config.yaml", "config-version: 8\nx-unrelated:\n  !!int \"fixture`" + key + "\": 1\n"},
 		{"YAML PUT with a tagged multiline value", http.MethodPut, "/v8/management/config.yaml", "config-version: 8\naccess:\n  api-key-limits:\n    fixture-key-laptop: !!int \"prefix\\n" + key + "\"\n"},
 		{"YAML PUT with the key aliased as its value", http.MethodPut, "/v8/management/config.yaml", "config-version: 8\naccess:\n  api-keys: [&key " + key + "]\n  api-key-limits: {*key: *key}\n"},
+		{"nested PUT of a scalar as the limits map", http.MethodPut, "/v8/management/config/access/api-key-limits", `"` + key + `"`},
+		{"nested PATCH of a scalar as the limits map", http.MethodPatch, "/v8/management/config/access/api-key-limits", `"` + key + `"`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -976,6 +978,7 @@ func TestConfigV8RejectsDuplicateClientKeysInNestedPatchesAndMergedYAML(t *testi
 			h := &Handler{cfg: cfg, configFilePath: path}
 			router := gin.New()
 			router.PATCH("/v8/management/config/*path", h.ConfigV8)
+			router.PUT("/v8/management/config/*path", h.ConfigV8)
 			router.PUT("/v8/management/config.yaml", h.ConfigV8)
 			recorder := httptest.NewRecorder()
 			router.ServeHTTP(recorder, httptest.NewRequest(tc.method, tc.url, strings.NewReader(tc.body)))

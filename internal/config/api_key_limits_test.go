@@ -365,3 +365,42 @@ func TestClientKeyMapValuesAreValidatedBeforeDecoding(t *testing.T) {
 		t.Fatalf("limits = %v", cfg.APIKeyLimits)
 	}
 }
+
+// TestClientKeyMapContainersMustBeMappings covers a client key map whose value is
+// not a mapping at all: the decoder would print the scalar, which may be the key.
+func TestClientKeyMapContainersMustBeMappings(t *testing.T) {
+	const key = "fixture-client-key-1"
+	cases := map[string]string{
+		"scalar as the limits map":   "config-version: 8\naccess:\n  api-key-limits: " + key + "\n",
+		"sequence as the limits map": "config-version: 8\naccess:\n  api-key-limits: [" + key + "]\n",
+		"scalar as the names map":    "config-version: 8\naccess:\n  api-key-names: " + key + "\n",
+		"alias to a scalar":          "config-version: 8\naccess:\n  api-keys: [&key " + key + "]\n  api-key-limits: *key\n",
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, errParse := ParseConfigBytes([]byte(raw))
+			if errParse == nil {
+				t.Fatal("ParseConfigBytes accepted the document")
+			}
+			if strings.Contains(errParse.Error(), key) || !strings.Contains(errParse.Error(), "must be a mapping") {
+				t.Fatalf("ParseConfigBytes error = %q, want a mapping rejection without the key", errParse)
+			}
+			if errValidate := ValidateV8Config([]byte(raw)); errValidate == nil || strings.Contains(errValidate.Error(), key) {
+				t.Fatalf("ValidateV8Config error = %v, want a rejection without the key", errValidate)
+			}
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, errLoad := LoadConfig(path); errLoad == nil || strings.Contains(errLoad.Error(), key) {
+				t.Fatalf("LoadConfig error = %v, want a rejection without the key", errLoad)
+			}
+		})
+	}
+	// An empty map and an empty value keep meaning no limits.
+	for name, raw := range map[string]string{"empty map": "config-version: 8\naccess:\n  api-key-limits: {}\n", "empty value": "config-version: 8\naccess:\n  api-key-limits:\n"} {
+		if cfg, err := ParseConfigBytes([]byte(raw)); err != nil || len(cfg.APIKeyLimits) != 0 {
+			t.Fatalf("%s: ParseConfigBytes() = %v, %v", name, cfg, err)
+		}
+	}
+}

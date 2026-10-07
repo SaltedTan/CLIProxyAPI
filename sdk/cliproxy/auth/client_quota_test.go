@@ -790,3 +790,64 @@ func TestAdmissionPolicyPanicDoesNotAdmitOrHangWaiters(t *testing.T) {
 		t.Fatalf("policy consulted %d times, want the panicked call and one fresh consultation", got)
 	}
 }
+
+// TestAdmissionAbortStopsThePickLoop pins that a call whose admission decision
+// could not be made (the deciding call's policy panicked) returns at once: it
+// must not move on to another credential of the same provider, consult the
+// policy afresh and reach upstream as if it had been admitted.
+func TestAdmissionAbortStopsThePickLoop(t *testing.T) {
+	for _, kind := range []string{"execute", "stream"} {
+		t.Run(kind, func(t *testing.T) {
+			manager := NewManager(nil, nil, nil)
+			manager.SetRetryConfig(0, 0, 0)
+			model := "admission-abort-" + kind
+			claude := &admissionTestExecutor{identifier: "claude"}
+			manager.RegisterExecutor(claude)
+			registerAdmissionAuth(t, manager, "admission-abort-claude-1-"+kind, "claude", model)
+			registerAdmissionAuth(t, manager, "admission-abort-claude-2-"+kind, "claude", model)
+			policy := &panickingAdmissionPolicy{entered: make(chan struct{}), release: make(chan struct{})}
+			manager.SetAdmissionPolicy(policy)
+			ctx := WithRequestAdmission(context.Background())
+			run := func() error {
+				req := cliproxyexecutor.Request{Model: model}
+				if kind == "execute" {
+					_, err := manager.Execute(ctx, []string{"claude"}, req, cliproxyexecutor.Options{})
+					return err
+				}
+				_, err := manager.ExecuteStream(ctx, []string{"claude"}, req, cliproxyexecutor.Options{})
+				return err
+			}
+			panicked := make(chan any, 1)
+			go func() {
+				defer func() { panicked <- recover() }()
+				_ = run()
+			}()
+			<-policy.entered
+			second := make(chan error, 1)
+			go func() { second <- run() }()
+			for i := 0; i < 1000; i++ {
+				runtime.Gosched()
+			}
+			close(policy.release)
+			if recovered := <-panicked; recovered == nil {
+				t.Fatal("the policy panic did not reach the first caller")
+			}
+			err := awaitWithin(t, second, 5*time.Second, "the waiter of a panicked decision")
+			if !errors.Is(err, errAdmissionUndecided) {
+				t.Fatalf("waiter error = %v, want errAdmissionUndecided", err)
+			}
+			if got := len(claude.ids(kind)); got != 0 {
+				t.Fatalf("upstream calls = %d for the waiter, want 0", got)
+			}
+			if got := policy.callCount(); got != 1 {
+				t.Fatalf("policy consulted %d times by the waiter's request, want only the panicked call", got)
+			}
+			if err := run(); err != nil {
+				t.Fatalf("a later call on the scope must consult afresh and succeed: %v", err)
+			}
+			if got := len(claude.ids(kind)); got != 1 {
+				t.Fatalf("upstream calls = %d after the fresh consultation, want 1", got)
+			}
+		})
+	}
+}

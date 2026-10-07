@@ -168,7 +168,7 @@ var (
 	taggedScalarPattern = regexp.MustCompile("(?s)cannot decode (\\S+) `(.*)` as a")
 	// A value that does not convert to an allowance is printed by the decoder
 	// (truncated to seven characters); several such lines may follow each other.
-	unmarshalFloatPattern = regexp.MustCompile("(?s)cannot unmarshal (\\S+) `(.*?)` into float64")
+	unmarshalTargetPattern = regexp.MustCompile("(?s)cannot unmarshal (\\S+) `(.*?)` into (float64|map\\[string\\]float64|map\\[string\\]string)")
 )
 
 // checkClientKeyMapDuplicates rejects a duplicated or non-plain entry in a client
@@ -252,6 +252,12 @@ func mapKeyName(key *yaml.Node) string {
 // scalars, and allowances numbers or empty. Alias keys are compared by the
 // scalar they resolve to.
 func checkClientKeyMapEntries(mapping *yaml.Node, name string) error {
+	// The map itself must be a mapping or empty: the decoder would otherwise
+	// print a scalar found there, which may well be a client key.
+	container := resolveAliasNode(mapping, make(map[*yaml.Node]struct{}))
+	if container != nil && container.Kind != yaml.MappingNode && !isNullScalar(container) {
+		return fmt.Errorf("%s: value at line %d must be a mapping", name, mapping.Line)
+	}
 	for _, node := range mergedMappings(mapping, nil, make(map[*yaml.Node]struct{})) {
 		seen := make(map[string]struct{}, len(node.Content)/2)
 		for i := 0; i+1 < len(node.Content); i += 2 {
@@ -310,14 +316,22 @@ func maskDecoderError(err error) error {
 		parts := taggedScalarPattern.FindStringSubmatch(match)
 		return "cannot decode " + parts[1] + " `" + maskClientKey(parts[2]) + "` as a"
 	})
-	masked = unmarshalFloatPattern.ReplaceAllStringFunc(masked, func(match string) string {
-		parts := unmarshalFloatPattern.FindStringSubmatch(match)
-		return "cannot unmarshal " + parts[1] + " `" + maskClientKey(parts[2]) + "` into float64"
+	masked = unmarshalTargetPattern.ReplaceAllStringFunc(masked, func(match string) string {
+		parts := unmarshalTargetPattern.FindStringSubmatch(match)
+		return "cannot unmarshal " + parts[1] + " `" + maskClientKey(parts[2]) + "` into " + parts[3]
 	})
 	if masked == message {
 		return err
 	}
 	return errors.New(masked)
+}
+
+// isNullScalar reports whether node is YAML null, including an empty value.
+func isNullScalar(node *yaml.Node) bool {
+	if node == nil || node.Kind != yaml.ScalarNode {
+		return false
+	}
+	return node.Tag == "!!null" || (node.Tag == "" && node.Value == "")
 }
 
 // isMergeKey reports whether key is a YAML merge key (<<).
