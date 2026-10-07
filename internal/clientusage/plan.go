@@ -9,6 +9,7 @@ import (
 // Claude plan identifiers and their weekly allowance relative to Claude Pro.
 const (
 	PlanPro     = "pro"
+	PlanTeam    = "team"
 	PlanMax5x   = "max_5x"
 	PlanMax20x  = "max_20x"
 	PlanUnknown = "unknown"
@@ -16,6 +17,7 @@ const (
 
 var claudePlanProUnits = map[string]float64{
 	PlanPro:    1,
+	PlanTeam:   1.25,
 	PlanMax5x:  2,
 	PlanMax20x: 10,
 }
@@ -32,9 +34,10 @@ const (
 type CredentialInfo struct {
 	AuthIndex string
 	Label     string
-	// Plan is a known plan (pro, max_5x, max_20x), another plan name, or unknown.
+	// Plan is a known plan (pro, team, max_5x, max_20x), another plan name, or unknown.
 	Plan string
-	// PlanProUnits is the weekly allowance in Claude Pro units (Pro 1, Max 5x 2, Max 20x 10).
+	// PlanProUnits is the weekly allowance in Claude Pro units
+	// (Pro 1, Team 1.25, Max 5x 2, Max 20x 10).
 	PlanProUnits float64
 	// PlanSource names where the allowance came from. Plans without a known
 	// allowance fall back to the credential weight, which also expresses relative
@@ -43,8 +46,8 @@ type CredentialInfo struct {
 }
 
 // CredentialInfoFromAuth resolves the report details of a credential. An explicit
-// plan_type metadata value (pro, max_5x, max_20x) overrides the plan recorded from
-// the Claude OAuth profile (rate_limit_tier and organization_type).
+// plan_type metadata value (pro, team, max_5x, max_20x) overrides the plan recorded
+// from the Claude OAuth profile (rate_limit_tier and organization_type).
 func CredentialInfoFromAuth(auth *coreauth.Auth) CredentialInfo {
 	if auth == nil {
 		return CredentialInfo{Plan: PlanUnknown, PlanProUnits: 1, PlanSource: PlanSourceWeight}

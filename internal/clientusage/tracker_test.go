@@ -663,7 +663,9 @@ func TestCredentialInfoFromAuthResolvesPlan(t *testing.T) {
 		{name: "pro organization", metadata: map[string]any{"organization_type": "claude_pro"}, plan: PlanPro, units: 1, source: PlanSourceOrganizationType},
 		{name: "stale max tier after downgrade", metadata: map[string]any{"organization_type": "claude_pro", "rate_limit_tier": "default_claude_max_20x"}, plan: PlanPro, units: 1, source: PlanSourceOrganizationType},
 		{name: "manual override wins", metadata: map[string]any{"plan_type": "Max-5x", "rate_limit_tier": "default_claude_max_20x"}, plan: PlanMax5x, units: 2, source: PlanSourcePlanType},
-		{name: "team falls back to weight", metadata: map[string]any{"organization_type": "claude_team", "weight": 4}, plan: "team", units: 4, source: PlanSourceWeight},
+		{name: "team organization", metadata: map[string]any{"organization_type": "claude_team", "rate_limit_tier": "default_raven", "weight": 4}, plan: PlanTeam, units: 1.25, source: PlanSourceOrganizationType},
+		{name: "manual team override", metadata: map[string]any{"plan_type": "Team", "organization_type": "claude_pro"}, plan: PlanTeam, units: 1.25, source: PlanSourcePlanType},
+		{name: "enterprise falls back to weight", metadata: map[string]any{"organization_type": "claude_enterprise", "weight": 4}, plan: "enterprise", units: 4, source: PlanSourceWeight},
 		{name: "max without tier falls back to weight", metadata: map[string]any{"organization_type": "claude_max"}, plan: "max", units: 1, source: PlanSourceWeight},
 		{name: "unknown defaults to one", metadata: map[string]any{"email": "me@example.com"}, plan: PlanUnknown, units: 1, source: PlanSourceWeight, label: "me@example.com"},
 	}

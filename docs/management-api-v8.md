@@ -260,11 +260,12 @@ process stops may be lost. Usage is not tracked in Home mode.
   reasoning.
 - `daily` covers the last 31 days, by the server's local date.
 - `claude` measures Claude subscription usage in Claude Pro units: `1.0` is one
-  full weekly allowance of a Pro plan. A Max 5x plan is worth 2 units and a Max
-  20x plan 10 units per week. `current_*` covers each credential's open weekly
-  window; `total_*` accumulates across windows. Usage is converted with the
-  plan in effect when it was attributed, so a later plan change does not rewrite
-  history; usage attributed while the plan was unknown uses the current plan.
+  full weekly allowance of a Pro plan. A Team plan is worth 1.25 units, a Max 5x
+  plan 2 units, and a Max 20x plan 10 units per week. `current_*` covers each
+  credential's open weekly window; `total_*` accumulates across windows. Usage
+  is converted with the plan in effect when it was attributed, so a later plan
+  change does not rewrite history; usage attributed while the plan was unknown
+  uses the current plan.
 - Claude credentials report weekly usage as a fraction of their own plan limit
   (`Anthropic-Ratelimit-Unified-7d-Utilization`). Each increase is split between
   the client keys that used the credential since the previous increase, by
@@ -275,11 +276,11 @@ process stops may be lost. Usage is not tracked in Home mode.
   weekly reset is not charged for the new window. The first response after
   tracking starts is a baseline and is not attributed, and a drop in utilization
   (limits reset or rescaled) starts a new baseline.
-- `plan` comes from the credential's `plan_type` field when set (`pro`,
+- `plan` comes from the credential's `plan_type` field when set (`pro`, `team`,
   `max_5x`, or `max_20x`; set it with `PATCH /credentials/fields`), otherwise
   from the plan Claude reports at login and token refresh (`rate_limit_tier`,
-  `organization_type`). Plans without a known allowance (for example `team`) use
-  the credential `weight` as their allowance, defaulting to 1.
+  `organization_type`). Plans without a known allowance (for example
+  `enterprise`) use the credential `weight` as their allowance, defaulting to 1.
 
 `DELETE /observability/usage/clients?id=<id>` resets one key and returns 404
 for an unknown id. `DELETE /observability/usage/clients?all=true` resets every
