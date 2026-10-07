@@ -88,6 +88,11 @@ access:
     - "your-api-key-1"
     - "your-api-key-2"
     - "your-api-key-3"
+  # Optional display names for client API keys, used by usage reports.
+  # Keys are the full API key strings listed above.
+  # api-key-names:
+  #   "your-api-key-1": "MacBook"
+  #   "your-api-key-2": "Desktop"
 
 # Optional credential concurrency and observation contracts.
 
