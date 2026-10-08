@@ -159,6 +159,42 @@ func TestUsageCacheQuotaReading(t *testing.T) {
 	}
 }
 
+// A window reported fully used without a reset time is used up with its reset unknown,
+// for routing as for the Fable pool, rather than unknown.
+func TestUsageCacheQuotaReadingUsedUpWithoutReset(t *testing.T) {
+	parsed, errParse := parseUsageReading([]byte(`{
+		"five_hour":{"utilization":30,"resets_at":null},
+		"seven_day":{"utilization":100,"resets_at":null},
+		"limits":[{"kind":"weekly_scoped","percent":104,"resets_at":null,"is_active":true,"scope":{"model":{"display_name":"Fable"}}}]
+	}`))
+	if errParse != nil {
+		t.Fatal(errParse)
+	}
+	if !parsed.weeklyBlocked(testNow) {
+		t.Fatal("the Fable pool must count the account as blocked")
+	}
+	now := testNow
+	fetcher := &fakeFetcher{calls: map[string]int{}, result: map[string]usageReading{"a": parsed}}
+	cache := newTestCache(&now, fetcher, claudeOAuth("a"))
+	cache.refresh(now)
+	settle(cache)
+
+	reading, ok := cache.QuotaReading(claudeOAuth("a"))
+	if !ok {
+		t.Fatal("the account must have a reading")
+	}
+	if reading.Weekly == nil || reading.Weekly.Used != 1 || !reading.Weekly.ResetAt.IsZero() {
+		t.Fatalf("weekly window = %+v, want used up with the reset unknown", reading.Weekly)
+	}
+	if reading.Fable == nil || reading.Fable.Used != 1 || !reading.Fable.ResetAt.IsZero() {
+		t.Fatalf("fable window = %+v, want used up with the reset unknown", reading.Fable)
+	}
+	// A window partly used without a reset stays unknown.
+	if reading.Short != nil {
+		t.Fatalf("5h window = %+v, want unknown", reading.Short)
+	}
+}
+
 func TestUsageCacheQuotaReadingDoesNotWaitForALookup(t *testing.T) {
 	now := testNow
 	fetcher := &fakeFetcher{

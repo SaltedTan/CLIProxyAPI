@@ -557,6 +557,7 @@ func TestApplyQuotaSources_IgnoresUnusableWindows(t *testing.T) {
 		{name: "negative usage", window: QuotaWindowReading{Used: -0.1, ResetAt: now.Add(time.Hour)}},
 		{name: "elapsed reset", window: QuotaWindowReading{Used: 0.4, ResetAt: now.Add(-time.Minute)}},
 		{name: "no reset", window: QuotaWindowReading{Used: 0.4}},
+		{name: "used up without reset", window: QuotaWindowReading{Used: 1}},
 		{name: "weekly reset beyond window and slack", window: QuotaWindowReading{Used: 0.4, ResetAt: observedAt.Add(7*24*time.Hour + quotaAwareWindowSlack + time.Minute)}, length: 7 * 24 * time.Hour},
 		{name: "5h reset beyond window and slack", window: QuotaWindowReading{Used: 0.4, ResetAt: observedAt.Add(5*time.Hour + quotaAwareWindowSlack + time.Minute)}, length: 5 * time.Hour},
 	}
@@ -1093,6 +1094,148 @@ func TestRankQuotaAware_FableRequestOverallWeeklyUsedUp(t *testing.T) {
 	decision = rankQuotaAware([]*Auth{blocked, heavy}, testFableModel, now, sources)
 	if got := chosenIDs(decision); len(got) != 1 || got[0] != "a-blocked" {
 		t.Fatalf("chosen = %v, want a-blocked once its overall window has quota left", got)
+	}
+}
+
+// usedUpWithoutResetReading is an endpoint reading, observed a minute ago, whose overall
+// weekly window is reported fully used with no reset time, with the given Fable window.
+func usedUpWithoutResetReading(now time.Time, fable *QuotaWindowReading) QuotaReading {
+	reading := fableQuotaReading(now, 0, fable)
+	reading.Weekly = &QuotaWindowReading{Used: 1}
+	return reading
+}
+
+// An overall weekly window reported used up without a reset time leaves no Fable, unless a
+// usable overall window observed at the same time or later says otherwise.
+func TestRankQuotaAware_FableRequestOverallWeeklyUsedUpWithoutReset(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	reportedAt := now.Add(-time.Minute)
+	endpoint := map[string]QuotaReading{
+		// More Fable left than b-heavy, but the overall window is used up.
+		"a-used-up": usedUpWithoutResetReading(now, &QuotaWindowReading{Used: 0.1, ResetAt: now.Add(72 * time.Hour)}),
+		"b-heavy":   fableQuotaReading(now, 0.3, &QuotaWindowReading{Used: 0.6, ResetAt: now.Add(72 * time.Hour)}),
+	}
+	saved := map[string]QuotaReading{}
+	// The service installs the saved readings before the endpoint readings.
+	sources := []QuotaSource{mapQuotaSource(saved), mapQuotaSource(endpoint)}
+	usedUp := &Auth{ID: "a-used-up", Provider: "claude", Status: StatusActive}
+	heavy := &Auth{ID: "b-heavy", Provider: "claude", Status: StatusActive}
+
+	decision := rankQuotaAware([]*Auth{usedUp, heavy}, testFableModel, now, sources)
+	if got := chosenIDs(decision); len(got) != 1 || got[0] != "b-heavy" || decision.reason != "weekly_pace" || decision.withWeekly != 2 {
+		t.Fatalf("chosen = %v (%s, with_weekly %d), want b-heavy ahead of the used-up account", got, decision.reason, decision.withWeekly)
+	}
+	alone := rankQuotaAware([]*Auth{usedUp}, testFableModel, now, sources)
+	if len(alone.chosen) != 1 || alone.reason != "no_weekly_quota_left" || !alone.chosen[0].fable ||
+		alone.chosen[0].usage.long.label != "oauth-usage-fable" || alone.chosen[0].usage.long.used != 1 || alone.chosen[0].score != 0 {
+		t.Fatalf("decision = %+v, want the used-up account ranked as out of Fable", alone)
+	}
+
+	// Usable overall windows older than the report, from a response and a saved reading,
+	// do not outrank it.
+	saved["a-used-up"] = weeklyReading("last-known", 0.2, now.Add(72*time.Hour), reportedAt.Add(-10*time.Minute))
+	older := claudeSnapshotAuth("a-used-up", now, reportedAt.Add(-5*time.Minute), "0.2", 72*time.Hour, "0.1", 2*time.Hour)
+	for _, auth := range []*Auth{usedUp, older} {
+		decision = rankQuotaAware([]*Auth{auth, heavy}, testFableModel, now, sources)
+		if got := chosenIDs(decision); len(got) != 1 || got[0] != "b-heavy" {
+			t.Fatalf("chosen = %v, want b-heavy while the report is newer than the usable window", got)
+		}
+	}
+
+	// A usable overall window observed at the same time or later carries a reset, so it
+	// wins: the account is ranked by its Fable window again.
+	for name, observedAt := range map[string]time.Time{"same time": reportedAt, "later": now} {
+		newer := claudeSnapshotAuth("a-used-up", now, observedAt, "0.2", 72*time.Hour, "0.1", 2*time.Hour)
+		decision = rankQuotaAware([]*Auth{newer, heavy}, testFableModel, now, sources)
+		if got := chosenIDs(decision); len(got) != 1 || got[0] != "a-used-up" || decision.chosen[0].usage.long.label != "oauth-usage-fable" ||
+			math.Abs(decision.chosen[0].usage.long.used-0.1) > 1e-9 {
+			t.Fatalf("%s: chosen = %v (%+v), want a-used-up ranked by its Fable window", name, got, decision.chosen)
+		}
+	}
+	saved["a-used-up"] = weeklyReading("last-known", 0.2, now.Add(72*time.Hour), now)
+	decision = rankQuotaAware([]*Auth{usedUp, heavy}, testFableModel, now, sources)
+	if got := chosenIDs(decision); len(got) != 1 || got[0] != "a-used-up" {
+		t.Fatalf("chosen = %v, want a-used-up once a newer saved reading has overall quota left", got)
+	}
+}
+
+// An overall weekly window reported used up without a reset time applies to every model, so
+// a non-Fable request ranks the credential as used up too: a last resort behind credentials
+// without weekly data, still used when it is the only one, and logged without a reset.
+func TestQuotaAwareSelector_OverallWeeklyUsedUpWithoutResetIsLastResort(t *testing.T) {
+	hook := setupTestLoggerHook(t)
+	log.SetLevel(log.DebugLevel)
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	readings := map[string]QuotaReading{
+		"a-used-up": usedUpWithoutResetReading(now, &QuotaWindowReading{Used: 0.1, ResetAt: now.Add(72 * time.Hour)}),
+		"b-heavy":   fableQuotaReading(now, 0.3, &QuotaWindowReading{Used: 0.6, ResetAt: now.Add(72 * time.Hour)}),
+	}
+	selector := newTestQuotaAwareSelector(now, nil)
+	selector.SetQuotaSources(mapQuotaSource(readings))
+	usedUp := &Auth{ID: "a-used-up", Provider: "claude", Status: StatusActive}
+	heavy := &Auth{ID: "b-heavy", Provider: "claude", Status: StatusActive}
+	unread := &Auth{ID: "c-unread", Provider: "claude", Status: StatusActive}
+
+	assertModelPickSequence(t, selector, testOtherModel, []*Auth{usedUp, heavy}, "b-heavy", "b-heavy")
+	decision := rankQuotaAware([]*Auth{usedUp, unread}, testOtherModel, now, selector.quotaSources())
+	if got := chosenIDs(decision); len(got) != 1 || got[0] != "c-unread" || decision.reason != "no_weekly_data" || decision.withWeekly != 1 {
+		t.Fatalf("chosen = %v (%s, with_weekly %d), want the credential without weekly data first", got, decision.reason, decision.withWeekly)
+	}
+
+	hook.Reset()
+	assertModelPickSequence(t, selector, testOtherModel, []*Auth{usedUp}, "a-used-up")
+	var fields log.Fields
+	for _, entry := range hook.AllEntries() {
+		if entry.Message == "quota-aware: selected credential" {
+			fields = entry.Data
+		}
+	}
+	if fields == nil || fields["reason"] != "no_weekly_quota_left" || fields["weekly_window"] != "oauth-usage-weekly(used up, reset unknown)" ||
+		fields["weekly_used_pct"] != 100.0 || fields["required_pct_per_hour"] != 0.0 {
+		t.Fatalf("selection fields = %v, want the used-up report logged", fields)
+	}
+	if _, ok := fields["weekly_reset_at"]; ok {
+		t.Fatalf("selection fields = %v, want no reset time for a reset that is unknown", fields)
+	}
+
+	// A newer usable overall window ranks it by that window again.
+	fresh := claudeSnapshotAuth("a-used-up", now, now, "0.1", 72*time.Hour, "0.1", 2*time.Hour)
+	assertModelPickSequence(t, selector, testOtherModel, []*Auth{fresh, heavy}, "a-used-up", "a-used-up")
+}
+
+// A Fable window reported used up without a reset time ranks a Fable request as used up,
+// unless a usable Fable window observed later says otherwise; other requests are unaffected.
+func TestRankQuotaAware_FableWindowUsedUpWithoutReset(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	endpoint := map[string]QuotaReading{
+		"a-no-fable": fableQuotaReading(now, 0.2, &QuotaWindowReading{Used: 1}),
+		"b-heavy":    fableQuotaReading(now, 0.5, &QuotaWindowReading{Used: 0.6, ResetAt: now.Add(72 * time.Hour)}),
+	}
+	other := map[string]QuotaReading{}
+	sources := []QuotaSource{mapQuotaSource(endpoint), mapQuotaSource(other)}
+	noFable := &Auth{ID: "a-no-fable", Provider: "claude", Status: StatusActive}
+	heavy := &Auth{ID: "b-heavy", Provider: "claude", Status: StatusActive}
+
+	decision := rankQuotaAware([]*Auth{noFable, heavy}, testFableModel, now, sources)
+	if got := chosenIDs(decision); len(got) != 1 || got[0] != "b-heavy" {
+		t.Fatalf("chosen = %v, want b-heavy for a Fable request", got)
+	}
+	alone := rankQuotaAware([]*Auth{noFable}, testFableModel, now, sources)
+	if len(alone.chosen) != 1 || alone.reason != "no_weekly_quota_left" || alone.chosen[0].usage.long.label != "oauth-usage-fable(used up, reset unknown)" {
+		t.Fatalf("decision = %+v, want the account out of Fable", alone)
+	}
+	decision = rankQuotaAware([]*Auth{noFable, heavy}, testOtherModel, now, sources)
+	if got := chosenIDs(decision); len(got) != 1 || got[0] != "a-no-fable" || decision.chosen[0].usage.long.label != "oauth-usage-weekly" {
+		t.Fatalf("chosen = %v, want a-no-fable ranked by its overall window for other models", got)
+	}
+
+	// A newer usable Fable window wins.
+	other["a-no-fable"] = QuotaReading{Fable: &QuotaWindowReading{Used: 0.1, ResetAt: now.Add(72 * time.Hour)}, ObservedAt: now, Source: "other"}
+	decision = rankQuotaAware([]*Auth{noFable, heavy}, testFableModel, now, sources)
+	if got := chosenIDs(decision); len(got) != 1 || got[0] != "a-no-fable" || decision.chosen[0].usage.long.label != "other-fable" {
+		t.Fatalf("chosen = %v, want a-no-fable ranked by its newer Fable window", got)
 	}
 }
 

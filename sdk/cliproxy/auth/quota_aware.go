@@ -74,6 +74,13 @@ const (
 // weekly window's rules. An account whose overall weekly window is used up has no Fable
 // left; without a Fable reading the overall window is used. Rule 1 is unchanged.
 //
+// A source may report the weekly or Fable window as used up with its reset unknown (see
+// QuotaWindowReading). The newest such report counts only while it is strictly newer than
+// the usable window held for it, which wins otherwise because it carries a reset. A Fable
+// window so reported ranks a Fable request as used up. A weekly window so reported applies
+// to every model: it leaves no Fable, and ranks any request as used up (rule 3: a last
+// resort, never excluded).
+//
 // Rule 2 alone would starve a credential without weekly data from any reading (for example
 // after a restart, or once its weekly window rolled over), since its quota is then only
 // observed from its responses. So while some candidates have weekly data, a positive-size
@@ -91,7 +98,10 @@ type QuotaAwareSelector struct {
 	sources  []QuotaSource
 }
 
-// QuotaWindowReading is one quota window outside the passive snapshot.
+// QuotaWindowReading is one quota window outside the passive snapshot. Used of at least 1
+// with a zero ResetAt means the window is used up and its reset is unknown. Quota-aware
+// routing honours that for the weekly and Fable windows (see QuotaAwareSelector); a 5h
+// window needs a reset. Any other window without a reset is unknown.
 type QuotaWindowReading struct {
 	// Used is the fraction of the window's quota consumed.
 	Used    float64
@@ -190,20 +200,56 @@ type quotaUsage struct {
 	// fable is the weekly Fable window, which only quota sources report.
 	fable    quotaWindow
 	hasFable bool
+	// longExhausted and fableExhausted are the newest source reports of the weekly and
+	// Fable windows as used up with the reset unknown (used 1, zero resetAt). They are kept
+	// apart from the usable windows above, which carry a reset to pace against.
+	longExhausted     quotaWindow
+	hasLongExhausted  bool
+	fableExhausted    quotaWindow
+	hasFableExhausted bool
+}
+
+// exhaustedWins reports whether a report of a window as used up with the reset unknown
+// outranks the usable window held for it. Only a strictly newer report does: a usable
+// window observed at the same time or later wins, because it carries a reset.
+func exhaustedWins(report quotaWindow, hasReport bool, window quotaWindow, hasWindow bool) bool {
+	return hasReport && (!hasWindow || report.observedAt.After(window.observedAt))
+}
+
+// longUsedUp reports whether the overall weekly window is used up: the usable window is
+// fully used, or a newer report says it is used up with the reset unknown.
+func (u quotaUsage) longUsedUp() bool {
+	return u.hasLong && u.long.used >= 1 || exhaustedWins(u.longExhausted, u.hasLongExhausted, u.long, u.hasLong)
 }
 
 // rankByFable makes the Fable window, when known, the long window that ranks a Fable
-// request. An account whose overall weekly window is used up (a usable window always
-// resets in the future) has no Fable left.
+// request: the usable one, or a newer report of it as used up. An account whose overall
+// weekly window is used up has no Fable left. Without a Fable window the overall window
+// ranks the request.
 func (u *quotaUsage) rankByFable() {
-	if !u.hasFable {
+	window, ok := u.fable, u.hasFable
+	if exhaustedWins(u.fableExhausted, u.hasFableExhausted, u.fable, u.hasFable) {
+		window, ok = u.fableExhausted, true
+	}
+	if !ok {
+		u.rankByOverall()
 		return
 	}
-	window := u.fable
-	if u.hasLong && u.long.used >= 1 {
+	if u.longUsedUp() {
 		window.used = 1
 	}
 	u.long, u.hasLong = window, true
+}
+
+// rankByOverall ranks a request by the overall weekly window. A newer report of that
+// window as used up with the reset unknown replaces the usable one, or stands in for a
+// missing one: the window applies to every model, so the credential is ranked as used up
+// (a last resort, never excluded) for any request. With used 1 its required pace is zero
+// however far off the unknown reset is taken to be.
+func (u *quotaUsage) rankByOverall() {
+	if exhaustedWins(u.longExhausted, u.hasLongExhausted, u.long, u.hasLong) {
+		u.long, u.hasLong = u.longExhausted, true
+	}
 }
 
 // requiredPace returns the remaining long-window fraction per hour until the reset.
@@ -246,9 +292,11 @@ func rankQuotaAware(auths []*Auth, model string, now time.Time, sources []QuotaS
 		applyQuotaSources(auth, sources, now, &candidate.usage)
 		// Only a credential with a Fable reading is ranked differently, so only its
 		// registered models are looked up.
-		candidate.fable = candidate.usage.hasFable && quotaAwareFableRequest(auth, model)
+		candidate.fable = (candidate.usage.hasFable || candidate.usage.hasFableExhausted) && quotaAwareFableRequest(auth, model)
 		if candidate.fable {
 			candidate.usage.rankByFable()
+		} else {
+			candidate.usage.rankByOverall()
 		}
 		if candidate.usage.hasLong {
 			candidate.score = candidate.usage.requiredPace(now) * quotaAwarePlanSize(auth)
@@ -378,7 +426,10 @@ func (s *QuotaAwareSelector) Pick(ctx context.Context, provider, model string, o
 	if picked.usage.hasLong {
 		fields["weekly_window"] = picked.usage.long.label
 		fields["weekly_used_pct"] = roundPercent(picked.usage.long.used)
-		fields["weekly_reset_at"] = picked.usage.long.resetAt.UTC().Format(time.RFC3339)
+		// A window reported used up has no reset; its label says so.
+		if !picked.usage.long.resetAt.IsZero() {
+			fields["weekly_reset_at"] = picked.usage.long.resetAt.UTC().Format(time.RFC3339)
+		}
 		fields["required_pct_per_hour"] = math.Round(picked.usage.requiredPace(now)*10000) / 100
 		fields["plan_size"] = quotaAwarePlanSize(picked.auth)
 	}
@@ -532,6 +583,8 @@ func authQuotaUsage(auth *Auth, now time.Time) quotaUsage {
 // usable source reading observed strictly later. Ties keep the window already held, so the
 // snapshot wins over a source and an earlier source over a later one. The Fable window,
 // which the snapshot lacks, is the newest usable one among the sources by the same rules.
+// Reports of the weekly and Fable windows as used up with the reset unknown are kept apart,
+// the newest of each by the same rules; the ranking weighs them against the usable windows.
 func applyQuotaSources(auth *Auth, sources []QuotaSource, now time.Time, usage *quotaUsage) {
 	if auth == nil {
 		return
@@ -540,6 +593,12 @@ func applyQuotaSources(auth *Auth, sources []QuotaSource, now time.Time, usage *
 		reading, ok := source(auth)
 		if !ok {
 			continue
+		}
+		if report, okReport := exhaustedQuotaWindow(reading.Source+"-weekly", reading.Weekly, reading.ObservedAt); okReport && (!usage.hasLongExhausted || report.observedAt.After(usage.longExhausted.observedAt)) {
+			usage.longExhausted, usage.hasLongExhausted = report, true
+		}
+		if report, okReport := exhaustedQuotaWindow(reading.Source+"-fable", reading.Fable, reading.ObservedAt); okReport && (!usage.hasFableExhausted || report.observedAt.After(usage.fableExhausted.observedAt)) {
+			usage.fableExhausted, usage.hasFableExhausted = report, true
 		}
 		if window, okWindow := sourcedQuotaWindow(reading.Source+"-weekly", reading.Weekly, 7*24*time.Hour, reading.ObservedAt, now); okWindow && (!usage.hasLong || window.observedAt.After(usage.long.observedAt)) {
 			usage.long, usage.hasLong = window, true
@@ -560,6 +619,15 @@ func sourcedQuotaWindow(label string, reading *QuotaWindowReading, window time.D
 		return quotaWindow{}, false
 	}
 	return quotaWindow{label: label, used: math.Min(reading.Used, 1), resetAt: reading.ResetAt, observedAt: observedAt}, true
+}
+
+// exhaustedQuotaWindow reads a source's report of a window as used up with the reset
+// unknown (see QuotaWindowReading): fully used, with a zero resetAt.
+func exhaustedQuotaWindow(label string, reading *QuotaWindowReading, observedAt time.Time) (quotaWindow, bool) {
+	if reading == nil || !(reading.Used >= 1) || !reading.ResetAt.IsZero() {
+		return quotaWindow{}, false
+	}
+	return quotaWindow{label: label + "(used up, reset unknown)", used: 1, observedAt: observedAt}, true
 }
 
 func codexQuotaUsage(signals map[string]string, observedAt, now time.Time, usage *quotaUsage) bool {

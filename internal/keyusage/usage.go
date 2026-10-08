@@ -248,13 +248,18 @@ func (c *UsageCache) QuotaReading(auth *coreauth.Auth) (coreauth.QuotaReading, b
 // quotaWindow converts the window for quota-aware routing, or returns nil when it is
 // unknown. A window without a reset has not started if nothing is used: it would
 // reset one window length after its first use, so at the earliest after the reading.
+// A fully used window without a reset is used up with its reset unknown (Used 1 and a
+// zero ResetAt), as the Fable pool counts it (see usageReading.weeklyBlocked).
 func (w windowReading) quotaWindow(at time.Time, length time.Duration) *coreauth.QuotaWindowReading {
 	if !w.ok {
 		return nil
 	}
 	resetAt := w.resetAt
 	if resetAt.IsZero() {
-		if w.used != 0 {
+		switch {
+		case w.used >= 100:
+			return &coreauth.QuotaWindowReading{Used: 1}
+		case w.used != 0:
 			return nil
 		}
 		resetAt = at.Add(length)
