@@ -6,7 +6,9 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
-// Claude plan identifiers and their weekly allowance relative to Claude Pro.
+// Claude plan identifiers and their weekly allowance relative to Claude Pro. The
+// allowances are approximate: Max 5x has about five times the weekly usage of Pro,
+// and Max 20x about twice that of Max 5x.
 const (
 	PlanPro     = "pro"
 	PlanTeam    = "team"
@@ -18,7 +20,7 @@ const (
 var claudePlanProUnits = map[string]float64{
 	PlanPro:    1,
 	PlanTeam:   1.25,
-	PlanMax5x:  2,
+	PlanMax5x:  5,
 	PlanMax20x: 10,
 }
 
@@ -37,7 +39,7 @@ type CredentialInfo struct {
 	// Plan is a known plan (pro, team, max_5x, max_20x), another plan name, or unknown.
 	Plan string `json:"plan"`
 	// PlanProUnits is the weekly allowance in Claude Pro units
-	// (Pro 1, Team 1.25, Max 5x 2, Max 20x 10).
+	// (Pro 1, Team 1.25, Max 5x 5, Max 20x 10).
 	PlanProUnits float64 `json:"plan_pro_units"`
 	// PlanSource names where the allowance came from. Plans without a known
 	// allowance fall back to the credential weight, which also expresses relative

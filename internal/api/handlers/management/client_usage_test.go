@@ -63,7 +63,7 @@ func TestClientUsageEndpoints(t *testing.T) {
 	}
 	publish("laptop-key-0001", "t1", "0.40")
 	publish("laptop-key-0001", "t2", "0.45")
-	// The laptop spent 0.1 Pro units; a 0.05 limit is reached. The tablet key is
+	// The laptop spent 0.25 Pro units; a 0.05 limit is reached. The tablet key is
 	// not configured and has no usage, so it is listed only because of its limit.
 	// An id entry naming no known key is not listed: it could be a raw key.
 	h.clientUsage.SetLimits(map[string]float64{"laptop-key-0001": 0.05, "tablet-key-0003": 0.5, clientusage.KeyID("watch-key-0004"): 0.25})
@@ -107,11 +107,11 @@ func TestClientUsageEndpoints(t *testing.T) {
 		t.Fatalf("laptop claude usage = %+v", laptop.Claude)
 	}
 	credential := laptop.Claude.Credentials[0]
-	if credential.Label != "Personal" || credential.Plan != clientusage.PlanMax5x || credential.PlanProUnits != 2 {
+	if credential.Label != "Personal" || credential.Plan != clientusage.PlanMax5x || credential.PlanProUnits != 5 {
 		t.Fatalf("credential = %+v", credential)
 	}
-	// 5% of a Max 5x weekly limit is 0.1 Pro units.
-	if credential.CurrentFraction != 0.05 || laptop.Claude.CurrentProUnits != 0.1 {
+	// 5% of a Max 5x weekly limit is 0.25 Pro units.
+	if credential.CurrentFraction != 0.05 || laptop.Claude.CurrentProUnits != 0.25 {
 		t.Fatalf("claude usage = %+v", laptop.Claude)
 	}
 	if laptop.Claude.LimitProUnits == nil || *laptop.Claude.LimitProUnits != 0.05 || !laptop.Claude.LimitReached || laptop.Claude.RemainingProUnits == nil || *laptop.Claude.RemainingProUnits != 0 || laptop.Claude.LimitResetsAt == nil {
@@ -172,10 +172,10 @@ func TestClientUsageEndpoints(t *testing.T) {
 		t.Fatalf("POST window reset status = %d, want 200", code)
 	}
 	laptop = get().Keys[0]
-	if laptop.Totals.Requests != 2 || laptop.Totals.Blocked != 1 || len(laptop.Daily) != 1 || laptop.Claude == nil || laptop.Claude.CurrentProUnits != 0 || laptop.Claude.TotalProUnits != 0.1 || laptop.Claude.LimitReached || laptop.Claude.WindowResetsAt != nil || laptop.Claude.LimitResetsAt != nil {
+	if laptop.Totals.Requests != 2 || laptop.Totals.Blocked != 1 || len(laptop.Daily) != 1 || laptop.Claude == nil || laptop.Claude.CurrentProUnits != 0 || laptop.Claude.TotalProUnits != 0.25 || laptop.Claude.LimitReached || laptop.Claude.WindowResetsAt != nil || laptop.Claude.LimitResetsAt != nil {
 		t.Fatalf("laptop after window reset = %+v claude = %+v", laptop.Totals, laptop.Claude)
 	}
-	if len(laptop.Claude.Credentials) != 1 || laptop.Claude.Credentials[0].CurrentProUnits != 0 || laptop.Claude.Credentials[0].TotalProUnits != 0.1 {
+	if len(laptop.Claude.Credentials) != 1 || laptop.Claude.Credentials[0].CurrentProUnits != 0 || laptop.Claude.Credentials[0].TotalProUnits != 0.25 {
 		t.Fatalf("laptop credentials after window reset = %+v", laptop.Claude.Credentials)
 	}
 	if errAdmit := h.clientUsage.Admit(requestCtx, &coreauth.Auth{ID: "claude-max", Provider: "claude"}); errAdmit != nil {

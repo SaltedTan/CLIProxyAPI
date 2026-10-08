@@ -158,9 +158,10 @@ routing:
   # Usage is a percentage of each plan's own weekly limit, so set "weight" to the relative
   # weekly allowance when plans differ (for example 5 on a ChatGPT Pro $100 Codex account
   # next to weight-1 Plus accounts). Weights only compare credentials of the same provider.
-  # Plan names are not reliable ratios: Claude Max 5x/20x describe the 5h session allowance,
-  # and Anthropic does not publish weekly ratios. A weight of 0 makes the credential a last
-  # resort under quota-aware.
+  # Plan names are not reliable weekly ratios: Claude Max 5x has roughly 5 times the weekly
+  # allowance of Pro, but Max 20x only about twice that of Max 5x, and Anthropic does not
+  # publish exact weekly ratios. A weight of 0 makes the credential a last resort under
+  # quota-aware.
   # Enable universal session-sticky routing for all clients.
   # Explicit Claude Code, Codex, OpenCode, and pi session headers are preferred,
   # followed by prompt_cache_key, Responses conversation IDs, legacy body IDs,

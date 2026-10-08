@@ -234,11 +234,11 @@ process stops may be lost. Usage is not tracked in Home mode.
             "auth_index": "a1b2c3d4e5f6a7b8",
             "label": "user@example.com",
             "plan": "max_5x",
-            "plan_pro_units": 2,
+            "plan_pro_units": 5,
             "plan_source": "rate_limit_tier",
-            "current_fraction": 0.42,
+            "current_fraction": 0.168,
             "current_pro_units": 0.84,
-            "total_fraction": 1.155,
+            "total_fraction": 0.462,
             "total_pro_units": 2.31
           }
         ]
@@ -251,7 +251,7 @@ process stops may be lost. Usage is not tracked in Home mode.
       "auth_index": "a1b2c3d4e5f6a7b8",
       "label": "user@example.com",
       "plan": "max_5x",
-      "plan_pro_units": 2,
+      "plan_pro_units": 5,
       "plan_source": "rate_limit_tier",
       "weekly_utilization": 0.61,
       "window_resets_at": "2026-10-09T15:00:00Z",
@@ -273,8 +273,9 @@ process stops may be lost. Usage is not tracked in Home mode.
   `requests` or `failed`, and `models` entries have no `blocked` field.
 - `daily` covers the last 31 days, by the server's local date.
 - `claude` measures Claude subscription usage in Claude Pro units: `1.0` is one
-  full weekly allowance of a Pro plan. A Team plan is worth 1.25 units, a Max 5x
-  plan 2 units, and a Max 20x plan 10 units per week. `current_*` covers the
+  full weekly allowance of a Pro plan. Other plans are approximate: a Team plan
+  is worth 1.25 units, a Max 5x plan 5 units, and a Max 20x plan 10 units (about
+  twice Max 5x) per week. `current_*` covers the
   key's own 7-day window, like a subscription period: it opens at the key's
   first Claude request, ends exactly seven days later, and the next window opens
   at the key's next Claude request after that, so an idle key has no running
