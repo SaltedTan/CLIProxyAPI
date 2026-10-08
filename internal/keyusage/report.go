@@ -7,6 +7,7 @@ package keyusage
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -100,4 +101,65 @@ func formatUTC(at time.Time) string {
 
 func formatPercent(value float64) string {
 	return strconv.FormatFloat(value, 'f', -1, 64)
+}
+
+// ANSI colors for Line: green while more than half is left, yellow down to a fifth,
+// red below.
+const (
+	ansiGreen  = "\x1b[32m"
+	ansiYellow = "\x1b[33m"
+	ansiRed    = "\x1b[31m"
+	ansiReset  = "\x1b[0m"
+)
+
+// Line renders the report as one short line for a status bar such as Claude Code's,
+// with times as the time left. color adds ANSI colors to the percentages left.
+func (r Report) Line(color bool) string {
+	paint := func(percent float64, text string) string {
+		if !color {
+			return text
+		}
+		code := ansiGreen
+		switch {
+		case percent < 20:
+			code = ansiRed
+		case percent <= 50:
+			code = ansiYellow
+		}
+		return code + text + ansiReset
+	}
+
+	claude := r.Claude
+	var parts []string
+	switch {
+	case !claude.Limited:
+		parts = append(parts, "Claude: no limit")
+	case claude.LimitReached:
+		parts = append(parts, paint(0, "Claude: limit reached")+" · back in "+r.until(*claude.WindowResetsAt))
+	case claude.WindowResetsAt == nil:
+		parts = append(parts, paint(100, "Claude 100% left")+" · 7d window starts on next use")
+	default:
+		parts = append(parts, paint(*claude.RemainingPercent, "Claude "+wholePercent(*claude.RemainingPercent)+"% left")+" · resets in "+r.until(*claude.WindowResetsAt))
+	}
+
+	fable := r.Fable
+	switch {
+	case !fable.Available:
+		parts = append(parts, "Fable: n/a")
+	default:
+		text := paint(fable.RemainingPercent, "Fable "+wholePercent(fable.RemainingPercent)+"% left")
+		if fable.NextResetAt != nil {
+			text += " · +" + wholePercent(fable.NextResetRestoresPercent) + "% in " + r.until(*fable.NextResetAt)
+		}
+		parts = append(parts, text)
+	}
+	return strings.Join(parts, " │ ")
+}
+
+// wholePercent rounds a percentage for Line, keeping a small nonzero one visible.
+func wholePercent(value float64) string {
+	if value > 0 && value < 1 {
+		return "<1"
+	}
+	return formatPercent(math.Round(value))
 }

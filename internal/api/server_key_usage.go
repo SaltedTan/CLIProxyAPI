@@ -15,8 +15,9 @@ import (
 const keyUsageFableWait = 3 * time.Second
 
 // keyUsage serves GET /v1/key/usage to the holder of a client API key: the key's own
-// Claude allowance and the Fable allowance left across the accounts, as JSON, or as
-// plain text with ?format=text.
+// Claude allowance and the Fable allowance left across the accounts, as JSON, as
+// plain text with ?format=text, or as one status bar line with ?format=line
+// (&color=1 for ANSI colors).
 func (s *Server) keyUsage(c *gin.Context) {
 	apiKey := clientKeyFromGin(c)
 	var names map[string]string
@@ -25,11 +26,14 @@ func (s *Server) keyUsage(c *gin.Context) {
 	}
 	report := keyusage.Build(c.Request.Context(), apiKey, keyusage.KeyName(names, apiKey), clientusage.Default(), s.fablePool, keyUsageFableWait)
 	c.Header("Cache-Control", "no-store")
-	if strings.EqualFold(strings.TrimSpace(c.Query("format")), "text") {
+	switch strings.ToLower(strings.TrimSpace(c.Query("format"))) {
+	case "text":
 		c.String(http.StatusOK, report.Text())
-		return
+	case "line":
+		c.String(http.StatusOK, report.Line(c.Query("color") == "1" || strings.EqualFold(c.Query("color"), "true"))+"\n")
+	default:
+		c.JSON(http.StatusOK, report)
 	}
-	c.JSON(http.StatusOK, report)
 }
 
 // clientKeyFromGin returns the client API key the access middleware authenticated,

@@ -63,4 +63,12 @@ func TestKeyUsageReportsTheCallersOwnKey(t *testing.T) {
 	if !strings.HasPrefix(text.Header().Get("Content-Type"), "text/plain") || !strings.Contains(text.Body.String(), "Claude allowance: 100% left, 0.00 of 2.50 Pro units used") {
 		t.Fatalf("text report = %q", text.Body.String())
 	}
+
+	line := httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, "/v1/key/usage?format=line", nil)
+	request.Header.Set("Authorization", "Bearer test-key")
+	server.engine.ServeHTTP(line, request)
+	if got, want := line.Body.String(), "Claude 100% left · 7d window starts on next use │ Fable: n/a\n"; got != want {
+		t.Fatalf("line report = %q, want %q", got, want)
+	}
 }
