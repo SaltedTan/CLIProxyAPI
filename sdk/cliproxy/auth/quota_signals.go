@@ -225,3 +225,55 @@ func mergeQuotaObservation(target, source QuotaState) QuotaState {
 	target.Signals = source.Clone().Signals
 	return target
 }
+
+// quotaAccountMetadataKeys identify the upstream account a credential draws quota from.
+// Claude quota is per organization, so the organization is compared as well as the account.
+var quotaAccountMetadataKeys = []string{"account_uuid", "organization_uuid", "account_id", "org_id", "user_id", "email"}
+
+// sameQuotaAccount reports whether incoming draws quota from the same upstream account as
+// existing, so the passive quota snapshot of existing still describes it. A token refresh
+// changes the credentials but not the account, so identity metadata decides first:
+//   - a key present on both sides with different values means another account;
+//   - a key present on one side only is ignored, since it may have been added at runtime
+//     without being persisted (config credentials) or be missing from an older file;
+//   - a matching key other than account_uuid proves the same account. account_uuid alone is
+//     no proof, because it is synthesized from the auth ID when no profile is available.
+//
+// Without proof, the credentials must be present and unchanged, including a Devin
+// session_token, which CredentialsChanged does not compare.
+func sameQuotaAccount(existing, incoming *Auth) bool {
+	if existing == nil || incoming == nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(existing.Provider), strings.TrimSpace(incoming.Provider)) {
+		return false
+	}
+	proven := false
+	for _, key := range quotaAccountMetadataKeys {
+		existingValue := authMetadataString(existing, key)
+		incomingValue := authMetadataString(incoming, key)
+		if existingValue == "" || incomingValue == "" {
+			continue
+		}
+		if !strings.EqualFold(existingValue, incomingValue) {
+			return false
+		}
+		if key != "account_uuid" {
+			proven = true
+		}
+	}
+	if proven {
+		return true
+	}
+	return quotaCredentialPresent(existing) && !CredentialsChanged(existing, incoming) &&
+		authMetadataString(existing, "session_token") == authMetadataString(incoming, "session_token")
+}
+
+// quotaCredentialPresent reports whether auth carries a credential that sameQuotaAccount
+// compares, so an unchanged result means the same credential rather than none at all.
+func quotaCredentialPresent(auth *Auth) bool {
+	return authAccessToken(auth) != "" || authRefreshToken(auth) != "" ||
+		authMetadataString(auth, "id_token") != "" || authMetadataString(auth, "idToken") != "" ||
+		authAttribute(auth, AttributeAPIKey) != "" || authMetadataString(auth, "api_key") != "" ||
+		authMetadataString(auth, "session_token") != ""
+}

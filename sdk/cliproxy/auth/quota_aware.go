@@ -59,9 +59,10 @@ const (
 //  3. Credentials without usable weekly data come next, then credentials whose weekly quota
 //     is used up or whose plan size is zero; each group is rotated by the fallback selector.
 //
-// The snapshot is cleared by a restart and replaced when the credential's auth file is
-// reloaded. A credential whose snapshot has no usable weekly window then uses the reading of
-// the weekly quota source, when one is set (see SetWeeklyQuotaSource), under the same rules.
+// The snapshot is cleared by a restart and by an auth file reload that changes the account;
+// other reloads (such as the token refreshes that rewrite the file) keep it. A credential
+// whose snapshot has no usable weekly window uses the reading of the weekly quota source,
+// when one is set (see SetWeeklyQuotaSource), under the same rules.
 //
 // Because quota is only observed from responses, rule 2 alone would starve a credential that
 // has no data yet (for example after a restart, or once its weekly window rolled over). So

@@ -226,6 +226,12 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	} else {
 		auth.Generation++
 	}
+	// A replace usually rebuilds the auth from its file, which carries no quota snapshot, and
+	// every token refresh rewrites that file. Keep the newer snapshot while the account stays
+	// the same. The credential_quota carry-over below copies only cooldown fields.
+	if mode == updateModeReplace && sameQuotaAccount(existing, auth) {
+		auth.Quota = mergeQuotaObservation(auth.Quota, existing.Quota)
+	}
 	cooldownStateChanged := false
 	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
 		if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
@@ -247,7 +253,7 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 		if existing.Quota.Exceeded && existing.Quota.Reason == "credential_quota" && existing.Quota.NextRecoverAt.After(time.Now()) {
 			auth.Unavailable = existing.Unavailable
 			auth.NextRetryAfter = existing.NextRetryAfter
-			auth.Quota = existing.Quota
+			applyCooldownFields(&auth.Quota, existing.Quota)
 			if auth.Status == StatusActive {
 				auth.Status = existing.Status
 			}
