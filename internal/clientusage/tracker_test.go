@@ -535,7 +535,7 @@ func TestTrackerPersistsAcrossRestart(t *testing.T) {
 	}
 	// The credential's weekly reading survives for quota-aware routing.
 	if reading, ok := restarted.ClaudeQuota(&coreauth.Auth{ID: "claude-1"}); !ok || reading.Weekly == nil || reading.Weekly.Used != 0.10 || !reading.Weekly.ResetAt.Equal(resetAt) ||
-		reading.Short != nil || !reading.ObservedAt.Equal(testNow) || reading.Source != "last-known" {
+		reading.Short != nil || reading.Fable != nil || !reading.ObservedAt.Equal(testNow) || reading.Source != "last-known" {
 		t.Fatalf("weekly reading after restart = %+v (%v)", reading, ok)
 	}
 	if _, ok := restarted.ClaudeQuota(nil); ok {

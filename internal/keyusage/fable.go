@@ -241,6 +241,8 @@ func registryServesFable(authID string) bool {
 	return false
 }
 
+// isFableModel is mirrored by quota-aware routing (quotaAwareFableRequest in
+// sdk/cliproxy/auth); keep the two rules in step.
 func isFableModel(model *registry.ModelInfo) bool {
 	id := strings.TrimSpace(model.MetadataModelID)
 	if id == "" {

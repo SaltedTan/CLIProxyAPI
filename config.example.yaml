@@ -158,6 +158,8 @@ routing:
   # made outside the proxy). Claude credentials' last weekly readings are saved in
   # client-usage.json, so they are ranked right after a restart. For each window the newest
   # of the response headers, the endpoint reading and the saved reading is used.
+  # Requests for Fable models rank Claude credentials by their endpoint Fable weekly window,
+  # else the overall one; an account whose overall weekly window is used up has no Fable left.
   # Credentials without any data rank after those with it, but each still gets one new
   # session every 30 minutes so its quota is observed (a Claude credential with a current
   # endpoint or saved reading has data and is never probed); when no credential has data,

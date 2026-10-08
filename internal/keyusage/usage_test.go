@@ -78,17 +78,34 @@ func sameReading(a, b usageReading) bool {
 	return a.at.Equal(b.at) && same(a.fiveHour, b.fiveHour) && same(a.weekly, b.weekly) && same(a.fable, b.fable)
 }
 
+func TestUsageReadingDescribe(t *testing.T) {
+	reading := usageReading{
+		fiveHour: windowReading{ok: true, used: 12.5},
+		weekly:   windowReading{ok: true, used: 40},
+		fable:    windowReading{ok: true, used: 64},
+	}
+	if got := reading.describe(); got != "5h 12.5%, weekly 40%, fable 64%" {
+		t.Fatalf("describe() = %q", got)
+	}
+	reading.fable = windowReading{}
+	if got := reading.describe(); got != "5h 12.5%, weekly 40%, fable n/a" {
+		t.Fatalf("describe() without a Fable window = %q", got)
+	}
+}
+
 func TestUsageCacheQuotaReading(t *testing.T) {
 	now := testNow
 	fetcher := &fakeFetcher{calls: map[string]int{}, result: map[string]usageReading{
 		"read": {
 			fiveHour: windowReading{ok: true, used: 12, resetAt: testNow.Add(2 * time.Hour)},
 			weekly:   windowReading{ok: true, used: 40, resetAt: testNow.Add(72 * time.Hour)},
+			fable:    windowReading{ok: true, used: 64, resetAt: testNow.Add(48 * time.Hour)},
 		},
-		"unstarted": {fiveHour: windowReading{ok: true}, weekly: windowReading{ok: true}},
-		"no-reset":  {fiveHour: windowReading{ok: true, used: 30}, weekly: windowReading{ok: true, used: 50}},
+		"unstarted": {fiveHour: windowReading{ok: true}, weekly: windowReading{ok: true}, fable: windowReading{ok: true}},
+		"no-reset":  {fiveHour: windowReading{ok: true, used: 30}, weekly: windowReading{ok: true, used: 50}, fable: windowReading{ok: true, used: 20}},
+		"no-fable":  {weekly: windowReading{ok: true, used: 10, resetAt: testNow.Add(72 * time.Hour)}},
 	}}
-	cache := newTestCache(&now, fetcher, claudeOAuth("read"), claudeOAuth("unstarted"), claudeOAuth("no-reset"))
+	cache := newTestCache(&now, fetcher, claudeOAuth("read"), claudeOAuth("unstarted"), claudeOAuth("no-reset"), claudeOAuth("no-fable"))
 	cache.refresh(now)
 	settle(cache)
 
@@ -102,16 +119,24 @@ func TestUsageCacheQuotaReading(t *testing.T) {
 	if reading.Weekly == nil || reading.Weekly.Used != 0.4 || !reading.Weekly.ResetAt.Equal(testNow.Add(72*time.Hour)) {
 		t.Fatalf("weekly window = %+v", reading.Weekly)
 	}
+	if reading.Fable == nil || reading.Fable.Used != 0.64 || !reading.Fable.ResetAt.Equal(testNow.Add(48*time.Hour)) {
+		t.Fatalf("fable window = %+v", reading.Fable)
+	}
 
 	// An unused window without a reset has not started: it resets a window after use.
 	unstarted, ok := cache.QuotaReading(claudeOAuth("unstarted"))
 	if !ok || unstarted.Short == nil || unstarted.Short.Used != 0 || !unstarted.Short.ResetAt.Equal(testNow.Add(5*time.Hour)) ||
-		unstarted.Weekly == nil || unstarted.Weekly.Used != 0 || !unstarted.Weekly.ResetAt.Equal(testNow.Add(7*24*time.Hour)) {
+		unstarted.Weekly == nil || unstarted.Weekly.Used != 0 || !unstarted.Weekly.ResetAt.Equal(testNow.Add(7*24*time.Hour)) ||
+		unstarted.Fable == nil || unstarted.Fable.Used != 0 || !unstarted.Fable.ResetAt.Equal(testNow.Add(7*24*time.Hour)) {
 		t.Fatalf("unstarted = %+v (%v)", unstarted, ok)
 	}
 	// A used window without a reset is unknown.
-	if noReset, ok := cache.QuotaReading(claudeOAuth("no-reset")); !ok || noReset.Short != nil || noReset.Weekly != nil {
+	if noReset, ok := cache.QuotaReading(claudeOAuth("no-reset")); !ok || noReset.Short != nil || noReset.Weekly != nil || noReset.Fable != nil {
 		t.Fatalf("no reset = %+v (%v)", noReset, ok)
+	}
+	// An account whose payload has no Fable window has no Fable reading.
+	if noFable, ok := cache.QuotaReading(claudeOAuth("no-fable")); !ok || noFable.Weekly == nil || noFable.Fable != nil {
+		t.Fatalf("no fable = %+v (%v)", noFable, ok)
 	}
 	if _, ok := cache.QuotaReading(claudeOAuth("never-read")); ok {
 		t.Fatal("an account never read must have no reading")

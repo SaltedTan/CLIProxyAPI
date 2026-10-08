@@ -11,6 +11,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/claudeplan"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
@@ -67,6 +68,12 @@ const (
 // reload that changes the account; other reloads (such as the token refreshes that rewrite
 // the file) keep it.
 //
+// Each Claude account also has a separate weekly allowance for Fable. A request for a Fable
+// model (see quotaAwareFableRequest) ranks a credential by its weekly Fable window instead
+// of the overall one, when a source reports it: the newest usable Fable reading, with the
+// weekly window's rules. An account whose overall weekly window is used up has no Fable
+// left; without a Fable reading the overall window is used. Rule 1 is unchanged.
+//
 // Rule 2 alone would starve a credential without weekly data from any reading (for example
 // after a restart, or once its weekly window rolled over), since its quota is then only
 // observed from its responses. So while some candidates have weekly data, a positive-size
@@ -98,6 +105,8 @@ type QuotaReading struct {
 	Weekly *QuotaWindowReading
 	// Short is the 5h window; nil when unknown.
 	Short *QuotaWindowReading
+	// Fable is the account's weekly Fable window; nil when unknown.
+	Fable *QuotaWindowReading
 	// ObservedAt is when the reading was taken.
 	ObservedAt time.Time
 	// Source prefixes the reading's window labels in logs, for example "oauth-usage".
@@ -178,6 +187,23 @@ type quotaUsage struct {
 	hasLong  bool
 	short    quotaWindow
 	hasShort bool
+	// fable is the weekly Fable window, which only quota sources report.
+	fable    quotaWindow
+	hasFable bool
+}
+
+// rankByFable makes the Fable window, when known, the long window that ranks a Fable
+// request. An account whose overall weekly window is used up (a usable window always
+// resets in the future) has no Fable left.
+func (u *quotaUsage) rankByFable() {
+	if !u.hasFable {
+		return
+	}
+	window := u.fable
+	if u.hasLong && u.long.used >= 1 {
+		window.used = 1
+	}
+	u.long, u.hasLong = window, true
 }
 
 // requiredPace returns the remaining long-window fraction per hour until the reset.
@@ -197,6 +223,7 @@ type quotaAwareCandidate struct {
 	auth  *Auth
 	usage quotaUsage
 	score float64 // required pace scaled by the plan size
+	fable bool    // ranked by its Fable window for a Fable request
 }
 
 // quotaAwareDecision describes which candidates remain after ranking.
@@ -211,11 +238,18 @@ type quotaAwareDecision struct {
 // rankQuotaAware applies the selection rules to available candidates. Input order only
 // matters within the returned group, which keeps the ID-sorted availability order.
 // sources supply readings besides the snapshot; per window the newest usable one wins.
-func rankQuotaAware(auths []*Auth, now time.Time, sources []QuotaSource) quotaAwareDecision {
+// model is the route model; a Fable request ranks each credential by its Fable window.
+func rankQuotaAware(auths []*Auth, model string, now time.Time, sources []QuotaSource) quotaAwareDecision {
 	all := make([]quotaAwareCandidate, 0, len(auths))
 	for _, auth := range auths {
 		candidate := quotaAwareCandidate{auth: auth, usage: authQuotaUsage(auth, now)}
 		applyQuotaSources(auth, sources, now, &candidate.usage)
+		// Only a credential with a Fable reading is ranked differently, so only its
+		// registered models are looked up.
+		candidate.fable = candidate.usage.hasFable && quotaAwareFableRequest(auth, model)
+		if candidate.fable {
+			candidate.usage.rankByFable()
+		}
 		if candidate.usage.hasLong {
 			candidate.score = candidate.usage.requiredPace(now) * quotaAwarePlanSize(auth)
 		}
@@ -287,7 +321,7 @@ func (s *QuotaAwareSelector) Pick(ctx context.Context, provider, model string, o
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 
-	decision := rankQuotaAware(available, now, s.quotaSources())
+	decision := rankQuotaAware(available, model, now, s.quotaSources())
 	probes := s.dueProbes(decision, now)
 	if len(probes) > 0 {
 		decision.chosen = probes
@@ -337,6 +371,9 @@ func (s *QuotaAwareSelector) Pick(ctx context.Context, provider, model string, o
 		"short_saturated": decision.shortSaturated,
 		"rotated_among":   len(decision.chosen),
 		"session":         quotaAwareSessionField(opts.Metadata),
+	}
+	if picked.fable {
+		fields["fable_request"] = true
 	}
 	if picked.usage.hasLong {
 		fields["weekly_window"] = picked.usage.long.label
@@ -416,6 +453,33 @@ func quotaAwarePlanSize(auth *Auth) float64 {
 	return float64(weight)
 }
 
+// quotaAwareFableRequest reports whether a request for the route model asks the credential
+// for a Fable model. It mirrors the Fable pool's rule (keyusage.isFableModel): the model the
+// credential registered under the route model counts by its upstream model (MetadataModelID,
+// set for aliases), else its ID; a credential without such a model is decided by the route
+// model itself. As in alias resolution, a model registered under the exact route model (such
+// as a suffixed alias) comes before one registered under the route model without its
+// thinking suffix.
+func quotaAwareFableRequest(auth *Auth, model string) bool {
+	model = strings.TrimSpace(model)
+	if auth != nil && model != "" {
+		models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
+		for _, key := range []string{model, canonicalModelKey(model)} {
+			for _, info := range models {
+				if info == nil || !strings.EqualFold(strings.TrimSpace(info.ID), key) {
+					continue
+				}
+				upstream := strings.TrimSpace(info.MetadataModelID)
+				if upstream == "" {
+					upstream = info.ID
+				}
+				return strings.Contains(strings.ToLower(upstream), "fable")
+			}
+		}
+	}
+	return strings.Contains(strings.ToLower(model), "fable")
+}
+
 func roundPercent(fraction float64) float64 {
 	return math.Round(fraction*1000) / 10
 }
@@ -466,7 +530,8 @@ func authQuotaUsage(auth *Auth, now time.Time) quotaUsage {
 
 // applyQuotaSources replaces the weekly and short windows of usage, each on its own, by a
 // usable source reading observed strictly later. Ties keep the window already held, so the
-// snapshot wins over a source and an earlier source over a later one.
+// snapshot wins over a source and an earlier source over a later one. The Fable window,
+// which the snapshot lacks, is the newest usable one among the sources by the same rules.
 func applyQuotaSources(auth *Auth, sources []QuotaSource, now time.Time, usage *quotaUsage) {
 	if auth == nil {
 		return
@@ -481,6 +546,9 @@ func applyQuotaSources(auth *Auth, sources []QuotaSource, now time.Time, usage *
 		}
 		if window, okWindow := sourcedQuotaWindow(reading.Source+"-5h", reading.Short, 5*time.Hour, reading.ObservedAt, now); okWindow && (!usage.hasShort || window.observedAt.After(usage.short.observedAt)) {
 			usage.short, usage.hasShort = window, true
+		}
+		if window, okWindow := sourcedQuotaWindow(reading.Source+"-fable", reading.Fable, 7*24*time.Hour, reading.ObservedAt, now); okWindow && (!usage.hasFable || window.observedAt.After(usage.fable.observedAt)) {
+			usage.fable, usage.hasFable = window, true
 		}
 	}
 }

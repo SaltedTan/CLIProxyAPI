@@ -10,6 +10,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	log "github.com/sirupsen/logrus"
 )
 
 // quotaAwareTestBase anchors the mock clock to wall time once, without sleeping, so the
@@ -989,5 +990,339 @@ func TestManagerQuotaAwareSessionAffinityCooldownFailover(t *testing.T) {
 	}
 	if got := pick("session-y"); got != relaxedID {
 		t.Fatalf("new session picked %s, want %s (cooling credential must be skipped)", got, relaxedID)
+	}
+}
+
+const (
+	testFableModel = "claude-fable-5-1"
+	testOtherModel = "claude-sonnet-5"
+)
+
+// fableQuotaReading is an endpoint reading, observed a minute ago, with the given overall
+// weekly usage resetting in 72h, a lightly used 5h window and the given Fable window.
+func fableQuotaReading(now time.Time, weeklyUsed float64, fable *QuotaWindowReading) QuotaReading {
+	return QuotaReading{
+		Weekly:     &QuotaWindowReading{Used: weeklyUsed, ResetAt: now.Add(72 * time.Hour)},
+		Short:      &QuotaWindowReading{Used: 0.1, ResetAt: now.Add(2 * time.Hour)},
+		Fable:      fable,
+		ObservedAt: now.Add(-time.Minute),
+		Source:     "oauth-usage",
+	}
+}
+
+func assertModelPickSequence(t *testing.T, selector Selector, model string, auths []*Auth, want ...string) {
+	t.Helper()
+	for i, wantID := range want {
+		picked, errPick := selector.Pick(context.Background(), "claude", model, cliproxyexecutor.Options{}, auths)
+		if errPick != nil {
+			t.Fatalf("Pick(%s) error = %v", model, errPick)
+		}
+		if picked == nil || picked.ID != wantID {
+			t.Fatalf("pick #%d for %s = %v, want %s", i, model, picked, wantID)
+		}
+	}
+}
+
+func chosenIDs(decision quotaAwareDecision) []string {
+	ids := make([]string, 0, len(decision.chosen))
+	for _, candidate := range decision.chosen {
+		ids = append(ids, candidate.auth.ID)
+	}
+	return ids
+}
+
+// A Fable request goes to the account with the most Fable at risk, not the one with the
+// most overall weekly quota at risk; other requests still follow the overall window.
+func TestQuotaAwareSelector_FableRequestRanksByFableWindow(t *testing.T) {
+	t.Parallel()
+	now := quotaAwareTestBase()
+	x := &Auth{ID: "x-little-fable", Provider: "claude", Status: StatusActive}
+	y := &Auth{ID: "y-more-fable", Provider: "claude", Status: StatusActive}
+	auths := []*Auth{x, y}
+	selector := newTestQuotaAwareSelector(now, nil)
+	selector.SetQuotaSources(mapQuotaSource(map[string]QuotaReading{
+		// 80% of the week left but only 10% of Fable.
+		x.ID: fableQuotaReading(now, 0.2, &QuotaWindowReading{Used: 0.9, ResetAt: now.Add(72 * time.Hour)}),
+		// 40% of the week left and 90% of Fable.
+		y.ID: fableQuotaReading(now, 0.6, &QuotaWindowReading{Used: 0.1, ResetAt: now.Add(72 * time.Hour)}),
+	}))
+	assertModelPickSequence(t, selector, testFableModel, auths, y.ID, y.ID, y.ID)
+	assertModelPickSequence(t, selector, testOtherModel, auths, x.ID, x.ID, x.ID)
+
+	decision := rankQuotaAware(auths, testFableModel, now, selector.quotaSources())
+	if len(decision.chosen) != 1 || !decision.chosen[0].fable || decision.chosen[0].usage.long.label != "oauth-usage-fable" ||
+		math.Abs(decision.chosen[0].usage.long.used-0.1) > 1e-9 || decision.reason != "weekly_pace" {
+		t.Fatalf("decision = %+v, want y ranked by its Fable window", decision)
+	}
+}
+
+// An account whose overall weekly window is used up cannot serve Fable, whatever its Fable
+// window says, so it joins the used-up group for a Fable request.
+func TestRankQuotaAware_FableRequestOverallWeeklyUsedUp(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	unusedFable := &QuotaWindowReading{Used: 0, ResetAt: now.Add(72 * time.Hour)}
+	blockedReading := fableQuotaReading(now, 1, unusedFable)
+	blockedReading.Weekly.ResetAt = now.Add(30 * time.Hour)
+	readings := map[string]QuotaReading{
+		"a-blocked": blockedReading,
+		"b-heavy":   fableQuotaReading(now, 0.3, &QuotaWindowReading{Used: 0.95, ResetAt: now.Add(72 * time.Hour)}),
+	}
+	sources := []QuotaSource{mapQuotaSource(readings)}
+	blocked := &Auth{ID: "a-blocked", Provider: "claude", Status: StatusActive}
+	heavy := &Auth{ID: "b-heavy", Provider: "claude", Status: StatusActive}
+
+	decision := rankQuotaAware([]*Auth{blocked, heavy}, testFableModel, now, sources)
+	if got := chosenIDs(decision); len(got) != 1 || got[0] != "b-heavy" || decision.reason != "weekly_pace" || decision.withWeekly != 2 {
+		t.Fatalf("chosen = %v (%s, with_weekly %d), want b-heavy ahead of the blocked account", got, decision.reason, decision.withWeekly)
+	}
+	alone := rankQuotaAware([]*Auth{blocked}, testFableModel, now, sources)
+	if len(alone.chosen) != 1 || alone.reason != "no_weekly_quota_left" || alone.chosen[0].usage.long.label != "oauth-usage-fable" || alone.chosen[0].usage.long.used != 1 {
+		t.Fatalf("decision = %+v, want the blocked account used up", alone)
+	}
+
+	// A newer response reporting the overall window used up blocks it as well.
+	snapshotBlocked := claudeSnapshotAuth("a-blocked", now, now, "1", 30*time.Hour, "0.1", 2*time.Hour)
+	readings["a-blocked"] = fableQuotaReading(now, 0.5, unusedFable)
+	decision = rankQuotaAware([]*Auth{snapshotBlocked, heavy}, testFableModel, now, sources)
+	if got := chosenIDs(decision); len(got) != 1 || got[0] != "b-heavy" {
+		t.Fatalf("chosen = %v, want b-heavy ahead of the account whose snapshot is used up", got)
+	}
+
+	// With overall quota left, the unused Fable allowance ranks first.
+	decision = rankQuotaAware([]*Auth{blocked, heavy}, testFableModel, now, sources)
+	if got := chosenIDs(decision); len(got) != 1 || got[0] != "a-blocked" {
+		t.Fatalf("chosen = %v, want a-blocked once its overall window has quota left", got)
+	}
+}
+
+// Without a Fable reading a Fable request is ranked by the overall weekly window.
+func TestRankQuotaAware_FableRequestWithoutFableReadingUsesOverallWindow(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	sources := []QuotaSource{mapQuotaSource(map[string]QuotaReading{
+		"a-roomy":   fableQuotaReading(now, 0.2, nil),
+		"b-drained": fableQuotaReading(now, 0.6, nil),
+	})}
+	auths := []*Auth{
+		{ID: "a-roomy", Provider: "claude", Status: StatusActive},
+		{ID: "b-drained", Provider: "claude", Status: StatusActive},
+		claudeSnapshotAuth("c-snapshot", now, now, "0.7", 72*time.Hour, "0.1", 2*time.Hour),
+	}
+	fable := rankQuotaAware(auths, testFableModel, now, sources)
+	other := rankQuotaAware(auths, testOtherModel, now, sources)
+	for _, decision := range []quotaAwareDecision{fable, other} {
+		if got := chosenIDs(decision); len(got) != 1 || got[0] != "a-roomy" || decision.reason != "weekly_pace" {
+			t.Fatalf("chosen = %v (%s), want a-roomy for Fable and other models alike", got, decision.reason)
+		}
+	}
+	if fable.chosen[0].fable || fable.chosen[0].usage.long.label != "oauth-usage-weekly" || fable.chosen[0].score != other.chosen[0].score {
+		t.Fatalf("fable candidate = %+v, want the overall window, no Fable ranking and the same score as other models", fable.chosen[0])
+	}
+}
+
+// The 5h window is overall, so a saturated one still keeps new Fable sessions away.
+func TestQuotaAwareSelector_FableRequestShortWindowSaturationSkipsCredential(t *testing.T) {
+	t.Parallel()
+	now := quotaAwareTestBase()
+	saturated := fableQuotaReading(now, 0.6, &QuotaWindowReading{Used: 0.1, ResetAt: now.Add(72 * time.Hour)})
+	saturated.Short = &QuotaWindowReading{Used: 0.9, ResetAt: now.Add(2 * time.Hour)}
+	selector := newTestQuotaAwareSelector(now, nil)
+	selector.SetQuotaSources(mapQuotaSource(map[string]QuotaReading{
+		"x-little-fable": fableQuotaReading(now, 0.2, &QuotaWindowReading{Used: 0.9, ResetAt: now.Add(72 * time.Hour)}),
+		"y-more-fable":   saturated,
+	}))
+	auths := []*Auth{
+		{ID: "x-little-fable", Provider: "claude", Status: StatusActive},
+		{ID: "y-more-fable", Provider: "claude", Status: StatusActive},
+	}
+	assertModelPickSequence(t, selector, testFableModel, auths, "x-little-fable", "x-little-fable")
+	if decision := rankQuotaAware(auths, testFableModel, now, selector.quotaSources()); decision.shortSaturated != 1 {
+		t.Fatalf("short saturated = %d, want 1", decision.shortSaturated)
+	}
+}
+
+// The Fable window follows the weekly window's rules: the newest usable reading wins, ties
+// keep the earlier source, usage is clamped, and unusable windows are ignored.
+func TestApplyQuotaSources_FableWindow(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	observedAt := now.Add(-time.Minute)
+	reading := func(source string, observedAt time.Time, fable QuotaWindowReading) QuotaReading {
+		return QuotaReading{
+			Weekly:     &QuotaWindowReading{Used: 0.3, ResetAt: now.Add(50 * time.Hour)},
+			Fable:      &fable,
+			ObservedAt: observedAt,
+			Source:     source,
+		}
+	}
+	usageFor := func(readings ...QuotaReading) quotaUsage {
+		auth := &Auth{ID: "a", Provider: "claude", Status: StatusActive}
+		var sources []QuotaSource
+		for _, r := range readings {
+			sources = append(sources, mapQuotaSource(map[string]QuotaReading{"a": r}))
+		}
+		usage := authQuotaUsage(auth, now)
+		applyQuotaSources(auth, sources, now, &usage)
+		usage.rankByFable()
+		return usage
+	}
+
+	unusable := []struct {
+		name  string
+		fable QuotaWindowReading
+	}{
+		{name: "NaN usage", fable: QuotaWindowReading{Used: math.NaN(), ResetAt: now.Add(time.Hour)}},
+		{name: "negative usage", fable: QuotaWindowReading{Used: -0.1, ResetAt: now.Add(time.Hour)}},
+		{name: "elapsed reset", fable: QuotaWindowReading{Used: 0.4, ResetAt: now.Add(-time.Minute)}},
+		{name: "no reset", fable: QuotaWindowReading{Used: 0.4}},
+		{name: "reset beyond a week and slack", fable: QuotaWindowReading{Used: 0.4, ResetAt: observedAt.Add(7*24*time.Hour + quotaAwareWindowSlack + time.Minute)}},
+	}
+	for _, tc := range unusable {
+		t.Run(tc.name, func(t *testing.T) {
+			usage := usageFor(reading("oauth-usage", observedAt, tc.fable))
+			if usage.hasFable || usage.long.label != "oauth-usage-weekly" {
+				t.Fatalf("usage = %+v, want the unusable Fable window ignored", usage)
+			}
+		})
+	}
+
+	newer := usageFor(
+		reading("older", now.Add(-10*time.Minute), QuotaWindowReading{Used: 0.2, ResetAt: now.Add(40 * time.Hour)}),
+		reading("newer", now.Add(-5*time.Minute), QuotaWindowReading{Used: 1.3, ResetAt: now.Add(40 * time.Hour)}),
+	)
+	if newer.long.label != "newer-fable" || newer.long.used != 1 || !newer.long.resetAt.Equal(now.Add(40*time.Hour)) {
+		t.Fatalf("long = %+v, want the newer, clamped Fable window", newer.long)
+	}
+	tie := usageFor(
+		reading("first", observedAt, QuotaWindowReading{Used: 0.2, ResetAt: now.Add(40 * time.Hour)}),
+		reading("second", observedAt, QuotaWindowReading{Used: 0.4, ResetAt: now.Add(40 * time.Hour)}),
+	)
+	if tie.long.label != "first-fable" {
+		t.Fatalf("long = %+v, want the earlier source on a tie", tie.long)
+	}
+	// A usable older reading is kept when a newer one has an unusable Fable window.
+	kept := usageFor(
+		reading("older", now.Add(-10*time.Minute), QuotaWindowReading{Used: 0.2, ResetAt: now.Add(40 * time.Hour)}),
+		reading("newer", now.Add(-5*time.Minute), QuotaWindowReading{Used: 0.4, ResetAt: now.Add(-time.Minute)}),
+	)
+	if kept.long.label != "older-fable" {
+		t.Fatalf("long = %+v, want the older usable Fable window", kept.long)
+	}
+}
+
+// A request is a Fable request for a credential by the upstream model the credential
+// registered under the route model, else by the route model's name.
+func TestQuotaAwareFableRequest(t *testing.T) {
+	t.Parallel()
+	aliased := &Auth{ID: "fable-alias-" + t.Name(), Provider: "claude"}
+	other := &Auth{ID: "fable-other-" + t.Name(), Provider: "claude"}
+	registry.GetGlobalRegistry().RegisterClient(aliased.ID, "claude", []*registry.ModelInfo{
+		{ID: "my-fable", MetadataModelID: testFableModel},
+		{ID: "best", MetadataModelID: "Claude-FABLE-5-1"},
+		{ID: "fable-lookalike", MetadataModelID: testOtherModel},
+		{ID: "claude-fable-5"},
+		{ID: testOtherModel},
+	})
+	registry.GetGlobalRegistry().RegisterClient(other.ID, "claude", []*registry.ModelInfo{{ID: testOtherModel}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(aliased.ID)
+		registry.GetGlobalRegistry().UnregisterClient(other.ID)
+	})
+
+	cases := []struct {
+		name  string
+		auth  *Auth
+		model string
+		want  bool
+	}{
+		{name: "alias to a Fable model", auth: aliased, model: "my-fable", want: true},
+		{name: "alias with other case and a thinking suffix", auth: aliased, model: "My-Fable(high)", want: true},
+		{name: "upstream model decides case-insensitively", auth: aliased, model: "best", want: true},
+		{name: "alias to a non-Fable model", auth: aliased, model: "fable-lookalike", want: false},
+		{name: "registered Fable model without alias", auth: aliased, model: "claude-fable-5", want: true},
+		{name: "registered non-Fable model", auth: aliased, model: testOtherModel, want: false},
+		{name: "model not registered for the credential is decided by name", auth: aliased, model: testFableModel, want: true},
+		{name: "unregistered non-Fable name", auth: other, model: "best", want: false},
+		{name: "unregistered Fable name", auth: other, model: "my-fable", want: true},
+		{name: "nil credential is decided by name", auth: nil, model: testFableModel, want: true},
+		{name: "empty model", auth: aliased, model: "", want: false},
+	}
+	for _, tc := range cases {
+		if got := quotaAwareFableRequest(tc.auth, tc.model); got != tc.want {
+			t.Errorf("%s: quotaAwareFableRequest(%q) = %v, want %v", tc.name, tc.model, got, tc.want)
+		}
+	}
+}
+
+// A suffixed alias is matched exactly before the route model without its suffix, whatever
+// the registration order, as alias resolution does.
+func TestQuotaAwareFableRequestPrefersExactSuffixedAlias(t *testing.T) {
+	t.Parallel()
+	orders := map[string][]*registry.ModelInfo{
+		"plain first": {
+			{ID: "best", MetadataModelID: testOtherModel},
+			{ID: "best(high)", MetadataModelID: testFableModel},
+		},
+		"suffixed first": {
+			{ID: "best(high)", MetadataModelID: testFableModel},
+			{ID: "best", MetadataModelID: testOtherModel},
+		},
+	}
+	for name, models := range orders {
+		auth := &Auth{ID: "fable-suffixed-" + name + "-" + t.Name(), Provider: "claude"}
+		registry.GetGlobalRegistry().RegisterClient(auth.ID, "claude", models)
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+		for model, want := range map[string]bool{"best(high)": true, "Best(High)": true, "best": false, "best(low)": false} {
+			if got := quotaAwareFableRequest(auth, model); got != want {
+				t.Errorf("%s: quotaAwareFableRequest(%q) = %v, want %v", name, model, got, want)
+			}
+		}
+	}
+}
+
+// End to end through Pick: an aliased Fable route model ranks by the Fable window and logs
+// it, while an alias to a non-Fable upstream ranks by the overall window.
+func TestQuotaAwareSelector_PickLogsFableRanking(t *testing.T) {
+	hook := setupTestLoggerHook(t)
+	log.SetLevel(log.DebugLevel)
+	now := quotaAwareTestBase()
+	x := &Auth{ID: "x-little-fable-" + t.Name(), Provider: "claude", Status: StatusActive}
+	y := &Auth{ID: "y-more-fable-" + t.Name(), Provider: "claude", Status: StatusActive}
+	for _, auth := range []*Auth{x, y} {
+		registry.GetGlobalRegistry().RegisterClient(auth.ID, "claude", []*registry.ModelInfo{
+			{ID: "my-fable", MetadataModelID: testFableModel},
+			{ID: "fable-lookalike", MetadataModelID: testOtherModel},
+		})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+	}
+	selector := newTestQuotaAwareSelector(now, nil)
+	selector.SetQuotaSources(mapQuotaSource(map[string]QuotaReading{
+		x.ID: fableQuotaReading(now, 0.2, &QuotaWindowReading{Used: 0.9, ResetAt: now.Add(72 * time.Hour)}),
+		y.ID: fableQuotaReading(now, 0.6, &QuotaWindowReading{Used: 0.1, ResetAt: now.Add(72 * time.Hour)}),
+	}))
+	auths := []*Auth{x, y}
+
+	pickEntry := func(model, wantID string) log.Fields {
+		t.Helper()
+		hook.Reset()
+		assertModelPickSequence(t, selector, model, auths, wantID)
+		for _, entry := range hook.AllEntries() {
+			if entry.Message == "quota-aware: selected credential" && entry.Data["model"] == model {
+				return entry.Data
+			}
+		}
+		t.Fatalf("no quota-aware selection logged for %s", model)
+		return nil
+	}
+
+	fields := pickEntry("my-fable", y.ID)
+	if fields["fable_request"] != true || fields["weekly_window"] != "oauth-usage-fable" || fields["weekly_used_pct"] != 10.0 ||
+		fields["reason"] != "weekly_pace" || fields["short_window"] != "oauth-usage-5h" || fields["auth"] != y.ID {
+		t.Fatalf("Fable selection fields = %v", fields)
+	}
+	fields = pickEntry("fable-lookalike", x.ID)
+	if _, ok := fields["fable_request"]; ok || fields["weekly_window"] != "oauth-usage-weekly" || fields["weekly_used_pct"] != 20.0 || fields["auth"] != x.ID {
+		t.Fatalf("non-Fable selection fields = %v", fields)
 	}
 }

@@ -20,8 +20,8 @@ import (
 // account's OAuth usage endpoint, including usage made outside the proxy. The usage
 // cache reads that endpoint for the enabled Claude OAuth accounts, at most once per
 // refreshAfter per account and never on the request path: readers get the cached
-// readings. Quota-aware routing reads the 5h and weekly windows, and the Fable pool the
-// Fable and weekly windows.
+// readings. Quota-aware routing reads the 5h, weekly and Fable windows, and the Fable
+// pool the Fable and weekly windows.
 
 // usageURL is Anthropic's OAuth usage endpoint. It is a variable only so that
 // end-to-end test builds can point it at a local server with -ldflags -X.
@@ -81,7 +81,7 @@ func (r usageReading) weeklyBlocked(now time.Time) bool {
 	return r.weekly.used >= 100 && (r.weekly.resetAt.IsZero() || r.weekly.resetAt.After(now))
 }
 
-// describe summarises the 5h and weekly windows for logs.
+// describe summarises the 5h, weekly and Fable windows for logs.
 func (r usageReading) describe() string {
 	percent := func(window windowReading) string {
 		if !window.ok {
@@ -89,7 +89,7 @@ func (r usageReading) describe() string {
 		}
 		return formatPercent(window.used) + "%"
 	}
-	return fmt.Sprintf("5h %s, weekly %s", percent(r.fiveHour), percent(r.weekly))
+	return fmt.Sprintf("5h %s, weekly %s, fable %s", percent(r.fiveHour), percent(r.weekly), percent(r.fable))
 }
 
 // UsageCache keeps the last OAuth usage endpoint reading of each enabled Claude OAuth
@@ -204,7 +204,7 @@ func (c *UsageCache) cancelLookups() {
 	}
 }
 
-// QuotaReading returns the account's last 5h and weekly windows for quota-aware
+// QuotaReading returns the account's last 5h, weekly and Fable windows for quota-aware
 // routing. It never starts or waits for a lookup. It returns false when the account
 // has no reading younger than maxReadingAge, or when the reading describes another
 // upstream account that had the same auth ID.
@@ -221,6 +221,7 @@ func (c *UsageCache) QuotaReading(auth *coreauth.Auth) (coreauth.QuotaReading, b
 	return coreauth.QuotaReading{
 		Weekly:     reading.weekly.quotaWindow(reading.at, weeklyWindow),
 		Short:      reading.fiveHour.quotaWindow(reading.at, fiveHourWindow),
+		Fable:      reading.fable.quotaWindow(reading.at, weeklyWindow),
 		ObservedAt: reading.at,
 		Source:     usageSource,
 	}, true
