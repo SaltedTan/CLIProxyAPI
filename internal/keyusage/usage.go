@@ -97,7 +97,8 @@ func (r usageReading) describe() string {
 type UsageCache struct {
 	mu       sync.Mutex
 	readings map[string]usageReading
-	tried    map[string]time.Time
+	// tried holds each account's last lookup attempt, whether or not it succeeded.
+	tried    map[string]attempt
 	inflight map[string]*lookup
 	// announced holds the accounts whose first reading was logged.
 	announced map[string]struct{}
@@ -105,6 +106,14 @@ type UsageCache struct {
 	list    func() []*coreauth.Auth
 	fetch   func(ctx context.Context, auth *coreauth.Auth) (usageReading, error)
 	nowFunc func() time.Time
+}
+
+// attempt is the start of an account's last lookup.
+type attempt struct {
+	at time.Time
+	// auth is the account looked up, cloned when the lookup started. It identifies the
+	// account after a failed lookup, which leaves no reading.
+	auth *coreauth.Auth
 }
 
 // lookup is a running lookup of one account.
@@ -120,7 +129,7 @@ type lookup struct {
 func NewUsageCache(list func() []*coreauth.Auth, cfg func() *config.Config) *UsageCache {
 	return &UsageCache{
 		readings:  make(map[string]usageReading),
-		tried:     make(map[string]time.Time),
+		tried:     make(map[string]attempt),
 		inflight:  make(map[string]*lookup),
 		announced: make(map[string]struct{}),
 		list:      list,
@@ -286,10 +295,11 @@ func (c *UsageCache) reconcileLocked(accounts []*coreauth.Auth) {
 	}
 }
 
-// replacedLocked reports whether the reading or running lookup of auth's ID is of
-// another upstream account. c.mu must be held.
+// replacedLocked reports whether the last lookup attempt or the reading of auth's ID is
+// of another upstream account. The last attempt covers the running lookup, if any, and
+// a failed lookup, which leaves no reading. c.mu must be held.
 func (c *UsageCache) replacedLocked(auth *coreauth.Auth) bool {
-	if running, ok := c.inflight[auth.ID]; ok && !coreauth.SameQuotaAccount(running.auth, auth) {
+	if last, ok := c.tried[auth.ID]; ok && !coreauth.SameQuotaAccount(last.auth, auth) {
 		return true
 	}
 	reading, ok := c.readings[auth.ID]
@@ -303,7 +313,7 @@ func (c *UsageCache) refreshLocked(auth *coreauth.Auth, now time.Time) chan stru
 	if running, ok := c.inflight[auth.ID]; ok {
 		return running.done
 	}
-	if last, ok := c.tried[auth.ID]; ok && now.Sub(last) < refreshAfter {
+	if last, ok := c.tried[auth.ID]; ok && now.Sub(last.at) < refreshAfter {
 		return nil
 	}
 	if !auth.HasValidAccessToken(now) {
@@ -317,7 +327,7 @@ func (c *UsageCache) refreshLocked(auth *coreauth.Auth, now time.Time) chan stru
 	running := &lookup{auth: auth.Clone(), done: make(chan struct{}), cancel: cancel}
 	id := auth.ID
 	c.inflight[id] = running
-	c.tried[id] = now
+	c.tried[id] = attempt{at: now, auth: running.auth}
 	go func() {
 		defer close(running.done)
 		defer cancel()

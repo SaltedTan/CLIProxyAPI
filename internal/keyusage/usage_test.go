@@ -659,6 +659,69 @@ func TestUsageCacheReplacementCancelsTheOldAccountsLookup(t *testing.T) {
 	}
 }
 
+// After a failed lookup, which leaves no reading, an auth file replaced by another
+// account's under the same auth ID is looked up at once, while the same account still
+// waits out refreshAfter.
+func TestUsageCacheLooksUpAReplacementAfterAFailedLookup(t *testing.T) {
+	now := testNow
+	var mu sync.Mutex
+	calls := map[string]int{}
+	accountA := claudeAccount("x", "a@example.com", "token-a")
+	accountA.Metadata["organization_uuid"] = "org-a"
+	accountB := claudeAccount("x", "b@example.com", "token-b")
+	accountB.Metadata["organization_uuid"] = "org-b"
+	auths := []*coreauth.Auth{accountA}
+	cache := NewUsageCache(func() []*coreauth.Auth { return auths }, nil)
+	cache.nowFunc = func() time.Time { return now }
+	cache.fetch = func(_ context.Context, auth *coreauth.Auth) (usageReading, error) {
+		email, _ := auth.Metadata["email"].(string)
+		mu.Lock()
+		defer mu.Unlock()
+		calls[email]++
+		if email == "a@example.com" {
+			return usageReading{}, errors.New("status 429")
+		}
+		return weeklyUsed(70), nil
+	}
+	count := func(email string) int {
+		mu.Lock()
+		defer mu.Unlock()
+		return calls[email]
+	}
+
+	cache.refresh(now)
+	settle(cache)
+	if count("a@example.com") != 1 {
+		t.Fatalf("lookups of A = %d, want 1", count("a@example.com"))
+	}
+
+	// The same account, even with its token refreshed, waits out refreshAfter.
+	refreshed := claudeAccount("x", "a@example.com", "token-a2")
+	refreshed.Metadata["organization_uuid"] = "org-a"
+	auths = []*coreauth.Auth{refreshed}
+	now = testNow.Add(10 * time.Second)
+	cache.refresh(now)
+	settle(cache)
+	if count("a@example.com") != 1 {
+		t.Fatalf("lookups of A = %d, want no retry within refreshAfter of the failure", count("a@example.com"))
+	}
+
+	// The replacement is looked up at once, seconds after A's failed lookup.
+	auths = []*coreauth.Auth{accountB}
+	now = testNow.Add(20 * time.Second)
+	cache.refresh(now)
+	settle(cache)
+	if count("b@example.com") != 1 {
+		t.Fatalf("lookups of B = %d, want B looked up at once", count("b@example.com"))
+	}
+	if reading, ok := cache.QuotaReading(accountB); !ok || reading.Weekly == nil || reading.Weekly.Used != 0.7 {
+		t.Fatalf("reading of B = %+v (%v)", reading, ok)
+	}
+	if count("a@example.com") != 1 {
+		t.Fatalf("lookups of A = %d, want 1", count("a@example.com"))
+	}
+}
+
 // A reading is stamped with the start of its lookup, so a lookup that completes after a
 // response was observed does not override that response's newer quota snapshot.
 func TestUsageCacheReadingIsAsOldAsItsLookupStart(t *testing.T) {

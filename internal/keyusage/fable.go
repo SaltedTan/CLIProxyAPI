@@ -98,7 +98,7 @@ func (p *FablePool) Summary(ctx context.Context, wait time.Duration) FableSummar
 		if done == nil || ok {
 			continue
 		}
-		if until := c.tried[auth.ID].Add(wait); until.After(now) {
+		if until := c.tried[auth.ID].at.Add(wait); until.After(now) {
 			pending = append(pending, done)
 			if until.After(waitUntil) {
 				waitUntil = until
