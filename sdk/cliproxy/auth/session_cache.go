@@ -450,6 +450,98 @@ func (c *SessionCache) ActiveBindingsByAuth(now time.Time) map[string]int {
 	return out
 }
 
+// SessionBinding is one logical session's binding: every cache key of the session
+// (provider::session::model aliases, primary first), the bound auth and its expiry.
+type SessionBinding struct {
+	Keys      []string  `json:"keys"`
+	AuthID    string    `json:"auth_id"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// Bindings returns the unexpired session bindings, oldest first in eviction order,
+// so restoring them keeps the least recently used sessions first in line for eviction.
+func (c *SessionCache) Bindings(now time.Time) []SessionBinding {
+	if c == nil {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.evictionOrder == nil {
+		return nil
+	}
+	out := make([]SessionBinding, 0, len(c.groups))
+	for elem := c.evictionOrder.Front(); elem != nil; elem = elem.Next() {
+		primaryKey, _ := elem.Value.(string)
+		group, ok := c.groups[primaryKey]
+		if !ok || group.authID == "" || len(group.aliases) == 0 || !now.Before(group.expiresAt) {
+			continue
+		}
+		out = append(out, SessionBinding{
+			Keys:      append([]string(nil), group.aliases...),
+			AuthID:    group.authID,
+			ExpiresAt: group.expiresAt,
+		})
+	}
+	return out
+}
+
+// RestoreBindings inserts saved bindings in order and returns how many were restored.
+// Bindings that are expired, have no keys, or whose auth keep rejects are skipped, and
+// so is any binding with a key that is already bound: live bindings win. Expiries are
+// capped at now plus the cache TTL, in case the TTL was shortened since they were saved.
+func (c *SessionCache) RestoreBindings(bindings []SessionBinding, now time.Time, keep func(authID string) bool) int {
+	if c == nil || len(bindings) == 0 {
+		return 0
+	}
+	// keep may consult other locks (such as the auth manager's), so it runs before c.mu is taken.
+	candidates := make([]SessionBinding, 0, len(bindings))
+	for _, binding := range bindings {
+		if binding.AuthID == "" || !now.Before(binding.ExpiresAt) {
+			continue
+		}
+		if keep != nil && !keep(binding.AuthID) {
+			continue
+		}
+		candidates = append(candidates, binding)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ensureInitializedLocked()
+	maxExpiresAt := now.Add(c.ttl)
+	restored := 0
+	for _, binding := range candidates {
+		keys := mergeSessionAliases(nil, binding.Keys...)
+		if len(keys) == 0 || c.anyKeyBoundLocked(keys, now) {
+			continue
+		}
+		aliases := compactSessionAliases(keys)
+		expiresAt := binding.ExpiresAt
+		if expiresAt.After(maxExpiresAt) {
+			expiresAt = maxExpiresAt
+		}
+		c.replaceAliasGroupsLocked(binding.AuthID, expiresAt, aliases)
+		restored++
+	}
+	return restored
+}
+
+// anyKeyBoundLocked reports whether any key is bound to an unexpired entry. Expired
+// entries found on the way are removed so they cannot shadow the restored binding.
+func (c *SessionCache) anyKeyBoundLocked(keys []string, now time.Time) bool {
+	for _, key := range keys {
+		entry, ok := c.entries[key]
+		if !ok {
+			continue
+		}
+		if now.Before(entry.expiresAt) {
+			return true
+		}
+		c.removeAliasGroupLocked(entry)
+	}
+	return false
+}
+
 func (c *SessionCache) cleanup() {
 	now := time.Now()
 	c.mu.Lock()

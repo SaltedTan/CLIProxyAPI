@@ -175,6 +175,9 @@ routing:
   # An established binding outranks credential priority: once a session is bound, that
   # credential is kept even if a higher-priority credential recovers. Credential priority
   # still decides cold bindings, requests without a session, and post-failover rebinding.
+  # Session bindings are saved to session-affinity.json next to the config file (or under
+  # WRITABLE_PATH) and restored on restart while unexpired and their credential still exists
+  # and is enabled. Prefix-matched (LCP) bindings are not saved.
   session-affinity: false # default: false
   # How long session-to-auth bindings are retained. Default: 1h
   session-affinity-ttl: "1h"

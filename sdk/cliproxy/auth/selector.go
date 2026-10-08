@@ -1369,6 +1369,25 @@ func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 	}
 }
 
+// SessionBindings returns the unexpired session cache bindings, oldest first.
+// Prefix-matched (LCP) bindings are not included.
+func (s *SessionAffinitySelector) SessionBindings(now time.Time) []SessionBinding {
+	if s == nil || s.cache == nil {
+		return nil
+	}
+	return s.cache.Bindings(now)
+}
+
+// RestoreSessionBindings restores saved session cache bindings and returns how many
+// were restored. A restored binding is an ordinary cache entry, so a request for it
+// still fails over when its auth is unavailable.
+func (s *SessionAffinitySelector) RestoreSessionBindings(bindings []SessionBinding, now time.Time, keep func(authID string) bool) int {
+	if s == nil || s.cache == nil {
+		return 0
+	}
+	return s.cache.RestoreBindings(bindings, now, keep)
+}
+
 // LookupAffinity observes the current session affinity binding without side effects.
 // It never selects a credential, creates a binding, rebinds, or refreshes TTL.
 // Optional authFilters allow callers (such as Manager) to exclude credentials that do not match the requested provider.

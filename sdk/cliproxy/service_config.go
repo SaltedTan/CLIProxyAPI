@@ -238,6 +238,29 @@ func (s *Service) applyManagerConfig(ctx context.Context, commit configCommit) b
 	return true
 }
 
+// ensureRoutingSelector installs the configured routing selector when none has been
+// applied yet (a manager supplied through WithCoreAuthManager), as the first config
+// commit would, so state restored into the selector is not dropped by that commit.
+func (s *Service) ensureRoutingSelector() {
+	if s == nil || s.coreManager == nil {
+		return
+	}
+	s.cfgMu.RLock()
+	cfg := s.cfg
+	s.cfgMu.RUnlock()
+	if cfg == nil {
+		return
+	}
+	s.configRuntimeMu.Lock()
+	defer s.configRuntimeMu.Unlock()
+	if s.appliedRoutingState != nil {
+		return
+	}
+	routingState := normalizedRoutingRuntimeState(cfg)
+	s.coreManager.SetSelector(newRoutingSelector(routingState))
+	s.appliedRoutingState = &routingState
+}
+
 func (s *Service) updateServerClientsContext(ctx context.Context, cfg *config.Config) bool {
 	if s == nil || cfg == nil || (ctx != nil && ctx.Err() != nil) {
 		return false

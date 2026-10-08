@@ -91,6 +91,7 @@ func (s *Service) Run(ctx context.Context) error {
 				log.Warnf("failed to restore cooldown state: %v", errRestoreCooldown)
 			}
 		}
+		s.startSessionAffinityPersistence(ctx)
 		s.registerAvailableExecutors(ctx, executorRegistrationOptions{
 			includeBaseline: true,
 			auths:           s.coreManager.List(),
@@ -372,6 +373,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		if errFlush := clientusage.Default().Flush(); errFlush != nil {
 			log.Warnf("client usage: %v", errFlush)
 		}
+		s.saveSessionAffinityState()
 	})
 	return shutdownErr
 }
