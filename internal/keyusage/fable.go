@@ -67,10 +67,10 @@ func NewFablePool(cache *UsageCache) *FablePool {
 }
 
 // Summary combines the cached readings. Accounts whose reading is stale are refreshed
-// in the background. Summary waits (until ctx ends at the latest) for accounts that
-// have never been read, but only until wait has passed since their lookup started, so
-// a lookup that hangs delays the first readers rather than every reader. The lookups
-// themselves continue after Summary returns.
+// in the background, unless the cache's Run has stopped. Summary waits (until ctx ends
+// at the latest) for accounts that have never been read, but only until wait has passed
+// since their lookup started, so a lookup that hangs delays the first readers rather
+// than every reader. The lookups themselves continue after Summary returns.
 func (p *FablePool) Summary(ctx context.Context, wait time.Duration) FableSummary {
 	if p == nil || p.cache == nil || p.cache.list == nil {
 		return FableSummary{}

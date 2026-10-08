@@ -447,6 +447,77 @@ func TestUsageCacheRunCancelsLookupsWhenItStops(t *testing.T) {
 	}
 }
 
+// After Run stops, a Fable pool summary (a key usage request served during shutdown)
+// starts no lookup that nothing would cancel, and readers keep the cached readings.
+// Run starts the cache again.
+func TestUsageCacheStartsNoLookupAfterRunStops(t *testing.T) {
+	now := testNow
+	fetcher := &fakeFetcher{calls: map[string]int{}, result: map[string]usageReading{
+		"read":   withFable(40, testNow.Add(48*time.Hour)),
+		"unread": withFable(10, testNow.Add(48*time.Hour)),
+	}}
+	auths := []*coreauth.Auth{claudeOAuth("read")}
+	cache := NewUsageCache(func() []*coreauth.Auth { return auths }, nil)
+	cache.nowFunc = func() time.Time { return now }
+	// Room for every lookup, so a lookup the cache wrongly starts never blocks.
+	looked := make(chan string, 8)
+	cache.fetch = func(ctx context.Context, auth *coreauth.Auth) (usageReading, error) {
+		defer func() { looked <- auth.ID }()
+		return fetcher.fetch(ctx, auth)
+	}
+	pool := NewFablePool(cache)
+	pool.servesFable = nil
+	pool.weight = func(*coreauth.Auth) float64 { return 1 }
+	run := func(lookups int) {
+		t.Helper()
+		ctx, cancel := context.WithCancel(context.Background())
+		stopped := make(chan struct{})
+		go func() {
+			defer close(stopped)
+			cache.Run(ctx, nil)
+		}()
+		defer func() {
+			cancel()
+			<-stopped
+		}()
+		for i := 0; i < lookups; i++ {
+			select {
+			case <-looked:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Run did not refresh at once")
+			}
+		}
+		// Let the lookups finish before Run stops, which would cancel them.
+		settle(cache)
+	}
+
+	run(1)
+	// Later the reading is stale and a new account is listed.
+	auths = []*coreauth.Auth{claudeOAuth("read"), claudeOAuth("unread")}
+	now = testNow.Add(refreshAfter + time.Second)
+	summary := pool.Summary(context.Background(), time.Minute)
+	cache.refresh(now)
+	settle(cache)
+	if fetcher.count("read") != 1 || fetcher.count("unread") != 0 {
+		t.Fatalf("calls = %v, want no lookup after Run stopped", fetcher.calls)
+	}
+	if !summary.Available || !summary.Partial || summary.RemainingPercent != 60 {
+		t.Fatalf("summary = %+v, want the cached reading only", summary)
+	}
+	if _, ok := cache.QuotaReading(claudeOAuth("read")); !ok {
+		t.Fatal("the cached reading must still count after Run stopped")
+	}
+
+	// A new Run looks up both accounts again.
+	run(2)
+	if fetcher.count("read") != 2 || fetcher.count("unread") != 1 {
+		t.Fatalf("calls = %v, want both accounts looked up once Run restarted", fetcher.calls)
+	}
+	if summary := pool.Summary(context.Background(), 0); summary.Partial || summary.RemainingPercent != 75 {
+		t.Fatalf("summary after restart = %+v", summary)
+	}
+}
+
 // While inactive, Run starts no lookup but still forgets accounts that left or were
 // replaced by another account under the same auth ID.
 func TestUsageCacheRunForgetsAccountsWhileInactive(t *testing.T) {

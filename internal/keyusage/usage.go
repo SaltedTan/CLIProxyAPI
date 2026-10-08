@@ -102,6 +102,9 @@ type UsageCache struct {
 	inflight map[string]*lookup
 	// announced holds the accounts whose first reading was logged.
 	announced map[string]struct{}
+	// stopped is set from when Run stops until Run starts again. No lookup starts
+	// meanwhile, since none would be cancelled.
+	stopped bool
 
 	list    func() []*coreauth.Auth
 	fetch   func(ctx context.Context, auth *coreauth.Auth) (usageReading, error)
@@ -148,11 +151,15 @@ func NewUsageCache(list func() []*coreauth.Auth, cfg func() *config.Config) *Usa
 // done. Every minute, starting at once, it refreshes the accounts whose reading is
 // missing or older than refreshAfter, while active reports true (nil means always);
 // otherwise it only forgets the accounts that left or were replaced. When ctx is done
-// it cancels the running lookups.
+// it cancels the running lookups, and the cache starts no lookups until Run is called
+// again; readers keep the cached readings. Run must not run twice at once.
 func (c *UsageCache) Run(ctx context.Context, active func() bool) {
 	if c == nil {
 		return
 	}
+	c.mu.Lock()
+	c.stopped = false
+	c.mu.Unlock()
 	ticker := time.NewTicker(runInterval)
 	defer ticker.Stop()
 	reading := false
@@ -203,10 +210,12 @@ func (c *UsageCache) reconcile() {
 	c.reconcileLocked(accounts)
 }
 
-// cancelLookups cancels the running lookups, which then publish nothing.
+// cancelLookups cancels the running lookups, which then publish nothing, and stops new
+// lookups until Run starts again.
 func (c *UsageCache) cancelLookups() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.stopped = true
 	for id, running := range c.inflight {
 		running.cancel()
 		delete(c.inflight, id)
@@ -306,10 +315,13 @@ func (c *UsageCache) replacedLocked(auth *coreauth.Auth) bool {
 	return ok && !coreauth.SameQuotaAccount(reading.auth, auth)
 }
 
-// refreshLocked starts a lookup of the account unless one is running, one started
-// within refreshAfter, or the account's access token has expired. It returns the
-// running lookup's done channel, or nil. c.mu must be held.
+// refreshLocked starts a lookup of the account unless Run has stopped, one is running,
+// one started within refreshAfter, or the account's access token has expired. It
+// returns the running lookup's done channel, or nil. c.mu must be held.
 func (c *UsageCache) refreshLocked(auth *coreauth.Auth, now time.Time) chan struct{} {
+	if c.stopped {
+		return nil
+	}
 	if running, ok := c.inflight[auth.ID]; ok {
 		return running.done
 	}
