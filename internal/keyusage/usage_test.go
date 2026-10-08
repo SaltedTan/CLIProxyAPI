@@ -2,6 +2,8 @@ package keyusage
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"strconv"
 	"sync"
 	"testing"
@@ -708,5 +710,154 @@ func TestUsageCacheRunIdlesWhileInactive(t *testing.T) {
 	cache.mu.Unlock()
 	if tried != 0 || fetcher.count("a") != 0 {
 		t.Fatalf("tried = %d, lookups = %d, want none while inactive", tried, fetcher.count("a"))
+	}
+}
+
+// tokenRotatingExecutor is a Claude executor whose refresh rotates both tokens to
+// access-<next> and refresh-<next>, like the proxy's own refresh of a credential whose
+// upstream reports no identity (a setup token, or a profile lookup refused with 403).
+type tokenRotatingExecutor struct{ next string }
+
+func (tokenRotatingExecutor) Identifier() string { return "claude" }
+
+func (tokenRotatingExecutor) Execute(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, errors.New("not implemented")
+}
+
+func (tokenRotatingExecutor) ExecuteStream(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e tokenRotatingExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	auth.Metadata["access_token"] = "access-" + e.next
+	auth.Metadata["refresh_token"] = "refresh-" + e.next
+	return auth, nil
+}
+
+func (tokenRotatingExecutor) CountTokens(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, errors.New("not implemented")
+}
+
+func (tokenRotatingExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, errors.New("not implemented")
+}
+
+// identitylessClaude is a Claude OAuth credential without identity metadata, as the auth
+// file of a setup token holds it, optionally with an account_uuid.
+func identitylessClaude(id, token, accountUUID string) *coreauth.Auth {
+	metadata := map[string]any{"type": "claude", "access_token": "access-" + token, "refresh_token": "refresh-" + token}
+	if accountUUID != "" {
+		metadata["account_uuid"] = accountUUID
+	}
+	return &coreauth.Auth{ID: id, Provider: "claude", Status: coreauth.StatusActive, Metadata: metadata}
+}
+
+// newManagedCache registers auth with a manager whose Claude refresh rotates the tokens
+// to "2", and creates a cache over the manager's credentials that has read auth.
+func newManagedCache(t *testing.T, now *time.Time, fetcher *fakeFetcher, auth *coreauth.Auth) (*coreauth.Manager, *UsageCache) {
+	t.Helper()
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(tokenRotatingExecutor{next: "2"})
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	cache := NewUsageCache(manager.List, nil)
+	cache.fetch = fetcher.fetch
+	cache.nowFunc = func() time.Time { return *now }
+	cache.refresh(*now)
+	settle(cache)
+	if got := fetcher.count(auth.ID); got != 1 {
+		t.Fatalf("lookups = %d, want the first lookup", got)
+	}
+	return manager, cache
+}
+
+// managedAuth returns the manager's current auth of id.
+func managedAuth(t *testing.T, manager *coreauth.Manager, id string) *coreauth.Auth {
+	t.Helper()
+	auth, ok := manager.GetByID(id)
+	if !ok || auth == nil {
+		t.Fatalf("auth %s missing", id)
+	}
+	return auth
+}
+
+// The proxy's own token refresh changes the tokens of an account without identity
+// metadata but not the account: its reading is kept, and it is not looked up again
+// before refreshAfter.
+func TestUsageCacheKeepsTheReadingAcrossTheProxysTokenRefresh(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		accountUUID string
+	}{
+		{name: "no identity"},
+		{name: "synthesized account uuid", accountUUID: "synthetic-x"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := testNow
+			fetcher := &fakeFetcher{calls: map[string]int{}, result: map[string]usageReading{"x": weeklyUsed(40)}}
+			manager, cache := newManagedCache(t, &now, fetcher, identitylessClaude("x", "1", tc.accountUUID))
+
+			refreshed, errRefresh := manager.ForceRefreshAuth(context.Background(), "x")
+			if errRefresh != nil || refreshed == nil || refreshed.Metadata["access_token"] != "access-2" {
+				t.Fatalf("ForceRefreshAuth() = %v, %v, want the rotated tokens", refreshed, errRefresh)
+			}
+			current := managedAuth(t, manager, "x")
+			if reading, ok := cache.QuotaReading(current); !ok || reading.Weekly == nil || reading.Weekly.Used != 0.4 {
+				t.Fatalf("reading after the proxy's refresh = %+v (%v), want the kept reading", reading, ok)
+			}
+			now = testNow.Add(time.Minute)
+			cache.refresh(now)
+			settle(cache)
+			if got := fetcher.count("x"); got != 1 {
+				t.Fatalf("lookups = %d, want none within refreshAfter of the first", got)
+			}
+			if _, ok := cache.QuotaReading(current); !ok {
+				t.Fatal("the reading was dropped after the refresh")
+			}
+		})
+	}
+}
+
+// Only the proxy's own changes keep the reading of an account without identity metadata.
+// The file its refresh wrote reloads with the same tokens and keeps it. A file replaced
+// with other tokens (a new login, or another tool) may hold another account, so its
+// reading is dropped and it is looked up again at once.
+func TestUsageCacheDropsTheReadingWhenAnotherLoginReplacesTheTokens(t *testing.T) {
+	ctx := context.Background()
+	now := testNow
+	fetcher := &fakeFetcher{calls: map[string]int{}, result: map[string]usageReading{"x": weeklyUsed(40)}}
+	manager, cache := newManagedCache(t, &now, fetcher, identitylessClaude("x", "1", "synthetic-x"))
+
+	if _, errRefresh := manager.ForceRefreshAuth(ctx, "x"); errRefresh != nil {
+		t.Fatalf("ForceRefreshAuth() error = %v", errRefresh)
+	}
+	// The watcher reloads the file the refresh wrote.
+	if _, errUpdate := manager.Update(ctx, identitylessClaude("x", "2", "synthetic-x")); errUpdate != nil {
+		t.Fatalf("Update() error = %v", errUpdate)
+	}
+	reloaded := managedAuth(t, manager, "x")
+	now = testNow.Add(time.Minute)
+	cache.refresh(now)
+	settle(cache)
+	if reading, ok := cache.QuotaReading(reloaded); !ok || reading.Weekly == nil || reading.Weekly.Used != 0.4 || fetcher.count("x") != 1 {
+		t.Fatalf("reloaded file: reading %+v (%v) after %d lookups, want the kept reading", reading, ok, fetcher.count("x"))
+	}
+
+	// Another login replaces the file with other tokens and the same synthesized account_uuid.
+	fetcher.mu.Lock()
+	fetcher.result["x"] = weeklyUsed(70)
+	fetcher.mu.Unlock()
+	if _, errUpdate := manager.Update(ctx, identitylessClaude("x", "3", "synthetic-x")); errUpdate != nil {
+		t.Fatalf("Update() error = %v", errUpdate)
+	}
+	replaced := managedAuth(t, manager, "x")
+	if reading, ok := cache.QuotaReading(replaced); ok {
+		t.Fatalf("the replaced file read the previous reading %+v", reading)
+	}
+	cache.refresh(now)
+	settle(cache)
+	if reading, ok := cache.QuotaReading(replaced); !ok || reading.Weekly == nil || reading.Weekly.Used != 0.7 || fetcher.count("x") != 2 {
+		t.Fatalf("replaced file: reading %+v (%v) after %d lookups, want a new lookup at once", reading, ok, fetcher.count("x"))
 	}
 }

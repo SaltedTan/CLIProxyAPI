@@ -105,6 +105,13 @@ type Auth struct {
 
 	recentRequests recentRequestRing `json:"-"`
 	indexAssigned  bool              `json:"-"`
+	// quotaLineage is a runtime-only value the Manager assigns when it registers or loads
+	// the auth. The Manager keeps it across its own token refreshes and request
+	// preparations, and across replaces proven to keep the upstream account. Any other
+	// replace, or a refresh or preparation started before such a replace, assigns a new one.
+	// A clone with the same lineage therefore describes the same account even after its
+	// credentials changed (see sameQuotaAccount). Zero means unassigned.
+	quotaLineage uint64 `json:"-"`
 }
 
 const (

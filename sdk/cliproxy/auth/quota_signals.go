@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -231,36 +232,41 @@ func mergeQuotaObservation(target, source QuotaState) QuotaState {
 var quotaAccountMetadataKeys = []string{"account_uuid", "organization_uuid", "account_id", "org_id", "user_id", "email"}
 
 // sameQuotaAccount reports whether incoming draws quota from the same upstream account as
-// existing, so the passive quota snapshot of existing still describes it. A token refresh
-// changes the credentials but not the account, so identity metadata decides first:
-//   - a key present on both sides with different values means another account;
-//   - a key present on one side only is ignored, since it may have been added at runtime
-//     without being persisted (config credentials) or be missing from an older file;
-//   - a matching key other than account_uuid proves the same account. account_uuid alone is
-//     no proof, because it is synthesized from the auth ID when no profile is available.
-//
-// Without proof, the credentials must be present and unchanged, including a Devin
-// session_token, which CredentialsChanged does not compare.
+// existing, so quota data taken for existing (its passive quota snapshot, or a usage
+// endpoint reading) still describes incoming. Providers must match, and identity metadata
+// on both sides that disagrees always means another account (see quotaAccountMetadata).
+// Otherwise either proves the same account:
+//   - sameQuotaAccountByIdentity, which decides from the auths' contents;
+//   - the same quota lineage: since existing was cloned, the Manager changed the auth only
+//     by its own token refreshes and request preparations, and by replaces that
+//     sameQuotaAccountByIdentity proved (see Auth.quotaLineage). Different lineages prove
+//     nothing either way.
 func sameQuotaAccount(existing, incoming *Auth) bool {
-	if existing == nil || incoming == nil {
+	if sameQuotaAccountByIdentity(existing, incoming) {
+		return true
+	}
+	if existing == nil || incoming == nil || existing.quotaLineage == 0 || existing.quotaLineage != incoming.quotaLineage {
 		return false
 	}
-	if !strings.EqualFold(strings.TrimSpace(existing.Provider), strings.TrimSpace(incoming.Provider)) {
+	if !sameQuotaProvider(existing, incoming) {
 		return false
 	}
-	proven := false
-	for _, key := range quotaAccountMetadataKeys {
-		existingValue := authMetadataString(existing, key)
-		incomingValue := authMetadataString(incoming, key)
-		if existingValue == "" || incomingValue == "" {
-			continue
-		}
-		if !strings.EqualFold(existingValue, incomingValue) {
-			return false
-		}
-		if key != "account_uuid" {
-			proven = true
-		}
+	_, conflict := quotaAccountMetadata(existing, incoming)
+	return !conflict
+}
+
+// sameQuotaAccountByIdentity is sameQuotaAccount without the quota lineage: it decides from
+// the auths' contents alone. A token refresh changes the credentials but not the account,
+// so identity metadata decides first (see quotaAccountMetadata). Without proof, the
+// credentials must be present and unchanged, including a Devin session_token, which
+// CredentialsChanged does not compare.
+func sameQuotaAccountByIdentity(existing, incoming *Auth) bool {
+	if !sameQuotaProvider(existing, incoming) {
+		return false
+	}
+	proven, conflict := quotaAccountMetadata(existing, incoming)
+	if conflict {
+		return false
 	}
 	if proven {
 		return true
@@ -269,8 +275,68 @@ func sameQuotaAccount(existing, incoming *Auth) bool {
 		authMetadataString(existing, "session_token") == authMetadataString(incoming, "session_token")
 }
 
-// quotaCredentialPresent reports whether auth carries a credential that sameQuotaAccount
-// compares, so an unchanged result means the same credential rather than none at all.
+// sameQuotaProvider reports whether both auths exist and have the same provider.
+func sameQuotaProvider(existing, incoming *Auth) bool {
+	if existing == nil || incoming == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(existing.Provider), strings.TrimSpace(incoming.Provider))
+}
+
+// quotaAccountMetadata compares the identity metadata of two auths:
+//   - a key present on both sides with different values is a conflict: another account;
+//   - a key present on one side only is ignored, since it may have been added at runtime
+//     without being persisted (config credentials) or be missing from an older file;
+//   - a matching key other than account_uuid proves the same account. account_uuid alone is
+//     no proof, because it is synthesized from the auth ID when no profile is available.
+func quotaAccountMetadata(existing, incoming *Auth) (proven, conflict bool) {
+	for _, key := range quotaAccountMetadataKeys {
+		existingValue := authMetadataString(existing, key)
+		incomingValue := authMetadataString(incoming, key)
+		if existingValue == "" || incomingValue == "" {
+			continue
+		}
+		if !strings.EqualFold(existingValue, incomingValue) {
+			return false, true
+		}
+		if key != "account_uuid" {
+			proven = true
+		}
+	}
+	return proven, false
+}
+
+// quotaLineageCounter issues quota lineages (see Auth.quotaLineage).
+var quotaLineageCounter atomic.Uint64
+
+// nextQuotaLineage returns a new quota lineage, never zero.
+func nextQuotaLineage() uint64 {
+	return quotaLineageCounter.Add(1)
+}
+
+// keptQuotaLineage returns the quota lineage of existing for an auth that follows it, or a
+// new one when existing has none.
+func keptQuotaLineage(existing *Auth) uint64 {
+	if existing != nil && existing.quotaLineage != 0 {
+		return existing.quotaLineage
+	}
+	return nextQuotaLineage()
+}
+
+// replacedQuotaLineage returns the quota lineage of incoming, which replaces existing (nil
+// for a new auth ID): existing's when sameQuotaAccountByIdentity proves the same account,
+// else a new one. incoming's own lineage is ignored: it may be a clone of existing taken
+// before an edit that changed the account.
+func replacedQuotaLineage(existing, incoming *Auth) uint64 {
+	if existing != nil && sameQuotaAccountByIdentity(existing, incoming) {
+		return keptQuotaLineage(existing)
+	}
+	return nextQuotaLineage()
+}
+
+// quotaCredentialPresent reports whether auth carries a credential that
+// sameQuotaAccountByIdentity compares, so an unchanged result means the same credential
+// rather than none at all.
 func quotaCredentialPresent(auth *Auth) bool {
 	return authAccessToken(auth) != "" || authRefreshToken(auth) != "" ||
 		authMetadataString(auth, "id_token") != "" || authMetadataString(auth, "idToken") != "" ||

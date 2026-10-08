@@ -358,3 +358,118 @@ func TestManagerUpdateQuotaMergeDoesNotResurrectCooldown(t *testing.T) {
 		})
 	}
 }
+
+// lineageClaudeAuth is a Claude OAuth credential without identity metadata, as the auth file
+// of a setup token holds it, with a passive quota snapshot.
+func lineageClaudeAuth(id, token string) *Auth {
+	return &Auth{
+		ID:       id,
+		Provider: "claude",
+		Status:   StatusActive,
+		Metadata: map[string]any{"type": "claude", "access_token": "access-" + token, "refresh_token": "refresh-" + token},
+		Quota:    reloadQuotaSnapshot(reloadQuotaObservedAt, "0.95"),
+	}
+}
+
+// withTokens returns a clone of auth whose tokens are rotated to token.
+func withTokens(auth *Auth, token string) *Auth {
+	clone := auth.Clone()
+	clone.Metadata["access_token"] = "access-" + token
+	clone.Metadata["refresh_token"] = "refresh-" + token
+	return clone
+}
+
+func registerForLineage(t *testing.T, manager *Manager, auth *Auth) *Auth {
+	t.Helper()
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	return currentForLineage(t, manager, auth.ID)
+}
+
+func currentForLineage(t *testing.T, manager *Manager, id string) *Auth {
+	t.Helper()
+	current, ok := manager.GetByID(id)
+	if !ok || current == nil {
+		t.Fatalf("auth %s missing", id)
+	}
+	return current
+}
+
+// Quota data taken for an auth without identity metadata (a usage reading keeps a clone of
+// the auth it read) still describes it after the manager's own token refresh and request
+// preparation, though its tokens changed.
+func TestManagerOwnChangesKeepTheQuotaAccountOfAnAuthWithoutIdentity(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	manager := NewManager(nil, nil, nil)
+	stored := registerForLineage(t, manager, lineageClaudeAuth("lineage-own", "1"))
+
+	if _, errUpdate := manager.UpdateRefreshedAuth(ctx, stored, withTokens(stored, "2")); errUpdate != nil {
+		t.Fatalf("UpdateRefreshedAuth() error = %v", errUpdate)
+	}
+	refreshed := currentForLineage(t, manager, stored.ID)
+	if authAccessToken(refreshed) != "access-2" {
+		t.Fatalf("access token = %q, want the refreshed one", authAccessToken(refreshed))
+	}
+	if !SameQuotaAccount(stored, refreshed) {
+		t.Fatal("a clone taken before the manager's refresh must describe the refreshed auth")
+	}
+
+	// Request preparation synthesizes an account_uuid.
+	prepared := refreshed.Clone()
+	prepared.Metadata["account_uuid"] = "synthetic-1"
+	if _, errUpdate := manager.UpdatePreparedAuth(ctx, refreshed, prepared); errUpdate != nil {
+		t.Fatalf("UpdatePreparedAuth() error = %v", errUpdate)
+	}
+	current := currentForLineage(t, manager, stored.ID)
+	if !SameQuotaAccount(stored, current) || !SameQuotaAccount(refreshed, current) {
+		t.Fatal("clones taken before the manager's request preparation must describe the prepared auth")
+	}
+	if !current.Quota.ObservedAt.Equal(reloadQuotaObservedAt) {
+		t.Fatalf("quota snapshot = %+v, want it kept", current.Quota)
+	}
+}
+
+// A management edit replaces the auth with a clone of the manager's auth. A clone whose
+// tokens were changed carries the old quota lineage, which must not prove the account: the
+// passive snapshot is dropped as before, and quota data taken before the edit, even after
+// the manager's own refresh, no longer describes the auth.
+func TestManagerReplaceWithAnEditedCloneDoesNotKeepTheQuotaAccount(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	manager := NewManager(nil, nil, nil)
+	stored := registerForLineage(t, manager, lineageClaudeAuth("lineage-edit", "1"))
+	if _, errUpdate := manager.UpdateRefreshedAuth(ctx, stored, withTokens(stored, "2")); errUpdate != nil {
+		t.Fatalf("UpdateRefreshedAuth() error = %v", errUpdate)
+	}
+	refreshed := currentForLineage(t, manager, stored.ID)
+	if !SameQuotaAccount(stored, refreshed) {
+		t.Fatal("a clone taken before the manager's refresh must describe the refreshed auth")
+	}
+
+	// An edit of other fields keeps the account.
+	renamed := refreshed.Clone()
+	renamed.Prefix = "team"
+	if _, errUpdate := manager.Update(ctx, renamed); errUpdate != nil {
+		t.Fatalf("Update() error = %v", errUpdate)
+	}
+	if current := currentForLineage(t, manager, stored.ID); !SameQuotaAccount(stored, current) {
+		t.Fatal("an edit that keeps the credentials must keep the account")
+	}
+
+	// An edit of the tokens may hold another account. The clone's own snapshot is cleared
+	// so that only the carry-over decides the snapshot.
+	edited := withTokens(currentForLineage(t, manager, stored.ID), "3")
+	edited.Quota = QuotaState{}
+	if _, errUpdate := manager.Update(ctx, edited); errUpdate != nil {
+		t.Fatalf("Update() error = %v", errUpdate)
+	}
+	current := currentForLineage(t, manager, stored.ID)
+	if len(current.Quota.Signals) != 0 || !current.Quota.ObservedAt.IsZero() {
+		t.Fatalf("quota snapshot = %+v, want cleared", current.Quota)
+	}
+	if SameQuotaAccount(stored, current) || SameQuotaAccount(refreshed, current) {
+		t.Fatal("quota data taken before the token edit must not describe the edited auth")
+	}
+}

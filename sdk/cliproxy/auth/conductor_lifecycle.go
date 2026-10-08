@@ -105,9 +105,11 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if m.authEpochs == nil {
 		m.authEpochs = make(map[string]uint64)
 	}
-	if existing, exists := m.auths[auth.ID]; exists && existing != nil && existing.RegistrationEpoch > m.authEpochs[auth.ID] {
+	existing := m.auths[auth.ID]
+	if existing != nil && existing.RegistrationEpoch > m.authEpochs[auth.ID] {
 		m.authEpochs[auth.ID] = existing.RegistrationEpoch
 	}
+	auth.quotaLineage = replacedQuotaLineage(existing, auth)
 	if auth.RegistrationEpoch > m.authEpochs[auth.ID] {
 		m.authEpochs[auth.ID] = auth.RegistrationEpoch
 	}
@@ -226,11 +228,26 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	} else {
 		auth.Generation++
 	}
-	// A replace usually rebuilds the auth from its file, which carries no quota snapshot, and
-	// every token refresh rewrites that file. Keep the newer snapshot while the account stays
-	// the same. The credential_quota carry-over below copies only cooldown fields.
-	if mode == updateModeReplace && sameQuotaAccount(existing, auth) {
+	if mode == updateModeRefresh || mode == updateModePrepare {
+		// The provider rotated the credentials of the same grant, or the proxy added
+		// metadata: quota data taken for existing still describes the account. A replace
+		// that changed the lineage while base was refreshed or prepared mixes two accounts'
+		// data, so the merge starts a new lineage.
+		if base == nil || base.quotaLineage == existing.quotaLineage {
+			auth.quotaLineage = keptQuotaLineage(existing)
+		} else {
+			auth.quotaLineage = nextQuotaLineage()
+		}
+	} else if sameQuotaAccountByIdentity(existing, auth) {
+		// A replace usually rebuilds the auth from its file, which carries no quota snapshot,
+		// and every token refresh rewrites that file. Keep the newer snapshot and the quota
+		// lineage while the account stays the same. The decision ignores auth's own lineage:
+		// auth may be a clone of existing whose account was edited. The credential_quota
+		// carry-over below copies only cooldown fields.
 		auth.Quota = mergeQuotaObservation(auth.Quota, existing.Quota)
+		auth.quotaLineage = keptQuotaLineage(existing)
+	} else {
+		auth.quotaLineage = nextQuotaLineage()
 	}
 	cooldownStateChanged := false
 	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
@@ -409,6 +426,7 @@ func (m *Manager) Load(ctx context.Context) error {
 		m.authEpochs[auth.ID] = max(m.authEpochs[auth.ID], auth.RegistrationEpoch) + 1
 		auth.RegistrationEpoch = m.authEpochs[auth.ID]
 		auth.Generation = 1
+		auth.quotaLineage = replacedQuotaLineage(previousAuths[auth.ID], auth)
 		m.auths[auth.ID] = auth.Clone()
 	}
 
