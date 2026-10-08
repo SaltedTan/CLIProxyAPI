@@ -67,6 +67,16 @@ func TestParseFableReading(t *testing.T) {
 	}
 }
 
+func TestParseFableReadingReadsTheWeeklyWindow(t *testing.T) {
+	reading, errParse := parseFableReading([]byte(`{"seven_day":{"utilization":100,"resets_at":"2026-10-09T08:00:00+00:00"},"limits":[{"kind":"weekly_scoped","percent":20,"resets_at":"2026-10-10T10:00:00Z","is_active":true,"scope":{"model":{"display_name":"Fable"}}}]}`))
+	if errParse != nil {
+		t.Fatal(errParse)
+	}
+	if want := time.Date(2026, 10, 9, 8, 0, 0, 0, time.UTC); reading.weeklyUsed != 100 || !reading.weeklyResetAt.Equal(want) || reading.used != 20 {
+		t.Fatalf("reading = %+v", reading)
+	}
+}
+
 func fable(used float64, resetIn time.Duration) fableReading {
 	return fableReading{at: testNow.Add(-time.Minute), hasFable: true, used: used, resetAt: testNow.Add(resetIn)}
 }
@@ -111,6 +121,48 @@ func TestCombineFableEdgeCases(t *testing.T) {
 	none := combineFable(testNow, []fableAccount{{units: 1, reading: fableReading{at: testNow}, ok: true}})
 	if none.Available || none.UpdatedAt != nil {
 		t.Fatalf("no Fable account must be unavailable: %+v", none)
+	}
+}
+
+// weeklyUsedUp marks the account's overall weekly window as used up until resetIn.
+func weeklyUsedUp(reading fableReading, resetIn time.Duration) fableReading {
+	reading.weeklyUsed = 100
+	reading.weeklyResetAt = testNow.Add(resetIn)
+	return reading
+}
+
+func TestCombineFableCountsBlockedAccountsAsEmpty(t *testing.T) {
+	summary := combineFable(testNow, []fableAccount{
+		// Pro: 80% of its Fable unused but out of weekly allowance for 10 hours.
+		{units: 1, reading: weeklyUsedUp(fable(20, 30*time.Hour), 10*time.Hour), ok: true},
+		// Max 20x: half its Fable left.
+		{units: 10, reading: fable(50, 40*time.Hour), ok: true},
+		// Max 5x: blocked until 20 hours, when its Fable window has reset as well.
+		{units: 5, reading: weeklyUsedUp(fable(30, 5*time.Hour), 20*time.Hour), ok: true},
+	})
+	// Only the Max 20x account can serve Fable: 5 of 16 Pro units.
+	if summary.RemainingPercent != 31.3 || summary.UsedPercent != 68.7 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	// The Pro account comes back first, with its unused 0.8 units.
+	if summary.NextResetAt == nil || !summary.NextResetAt.Equal(testNow.Add(10*time.Hour)) || summary.NextResetRestoresPercent != 5 {
+		t.Fatalf("next reset = %v +%v%%", summary.NextResetAt, summary.NextResetRestoresPercent)
+	}
+
+	// A blocked account with no Fable left comes back when its Fable window resets.
+	usedUp := combineFable(testNow, []fableAccount{
+		{units: 1, reading: weeklyUsedUp(fable(100, 30*time.Hour), 10*time.Hour), ok: true},
+	})
+	if usedUp.RemainingPercent != 0 || usedUp.NextResetAt == nil || !usedUp.NextResetAt.Equal(testNow.Add(30*time.Hour)) || usedUp.NextResetRestoresPercent != 100 {
+		t.Fatalf("used up = %+v", usedUp)
+	}
+
+	// A weekly window that has reset since it was read no longer blocks.
+	reset := combineFable(testNow, []fableAccount{
+		{units: 1, reading: weeklyUsedUp(fable(40, 48*time.Hour), -time.Minute), ok: true},
+	})
+	if reset.RemainingPercent != 60 {
+		t.Fatalf("reset = %+v", reset)
 	}
 }
 

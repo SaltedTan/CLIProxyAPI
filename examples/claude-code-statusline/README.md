@@ -11,8 +11,10 @@ Claude 63% left · resets in 4d22h │ Fable 69% left · +3% in 19h59m
 The percentages are green above 50%, yellow down to 20% and red below. Other
 states read `Claude: limit reached · back in 1d2h`, `Claude 100% left · 7d window
 starts on next use` (no window running yet) and `Fable: n/a` (no Fable figure).
-`+3% in 19h59m` is the next Fable reset of an account with usage: how much of the
-pool comes back and when. When no Fable is left, it is when Fable returns.
+`+3% in 19h59m` is the next time the pool grows, and by how much: an account's Fable
+window resetting, or an account that has used up its overall weekly allowance (and
+so counts as having no Fable left) getting it back. When no Fable is left, it is
+when Fable returns.
 
 ## Setup
 

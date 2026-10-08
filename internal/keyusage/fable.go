@@ -7,7 +7,6 @@ import (
 	"io"
 	"math"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -32,11 +31,14 @@ import (
 // allowance (clientusage.CredentialInfo.PlanProUnits), assuming a plan's Fable
 // allowance scales like its overall weekly allowance: the pool's capacity is the sum
 // of the weights, and what is left is the sum of each weight times the unused share.
+// An account whose overall weekly window is used up cannot serve Fable until that
+// window resets, so none of its Fable counts as left until then.
+
+// usageURL is Anthropic's OAuth usage endpoint. It is a variable only so that
+// end-to-end test builds can point it at a local server with -ldflags -X.
+var usageURL = "https://api.anthropic.com/api/oauth/usage"
 
 const (
-	defaultUsageURL = "https://api.anthropic.com/api/oauth/usage"
-	// usageURLEnv overrides the usage endpoint, for tests against a local server.
-	usageURLEnv = "CLIPROXY_CLAUDE_USAGE_URL"
 	usageBeta   = "oauth-2025-04-20"
 	usageAgent  = "claude-cli/2.1.280 (external, cli)"
 	maxBodySize = 1 << 20
@@ -57,9 +59,10 @@ type FableSummary struct {
 	Available        bool    `json:"available"`
 	RemainingPercent float64 `json:"remaining_percent"`
 	UsedPercent      float64 `json:"used_percent"`
-	// NextResetAt is the earliest upcoming reset of an account with Fable usage: the
-	// next time the pool grows, by NextResetRestoresPercent of its capacity. When
-	// nothing is left, it is when Fable becomes available again.
+	// NextResetAt is the next time the pool grows, by NextResetRestoresPercent of its
+	// capacity: the earliest reset of an account's used Fable window, or of the weekly
+	// window of an account that used it up. When nothing is left, it is when Fable
+	// becomes available again.
 	NextResetAt              *time.Time `json:"next_reset_at,omitempty"`
 	NextResetRestoresPercent float64    `json:"next_reset_restores_percent,omitempty"`
 	// UpdatedAt is when the oldest reading in the figure was taken.
@@ -75,11 +78,20 @@ type fableReading struct {
 	// used is the percentage of the account's Fable allowance used, 0 to 100.
 	used    float64
 	resetAt time.Time
+	// weeklyUsed and weeklyResetAt describe the account's overall weekly window.
+	weeklyUsed    float64
+	weeklyResetAt time.Time
 }
 
-// windowEnded reports whether the reading's Fable window has reset since it was read.
-func (r fableReading) windowEnded(now time.Time) bool {
+// fableEnded reports whether the reading's Fable window has reset since it was read.
+func (r fableReading) fableEnded(now time.Time) bool {
 	return r.hasFable && !r.resetAt.IsZero() && !r.resetAt.After(now)
+}
+
+// weeklyBlocked reports whether the account's overall weekly window is used up,
+// which stops the account serving Fable until that window resets.
+func (r fableReading) weeklyBlocked(now time.Time) bool {
+	return r.weeklyUsed >= 100 && (r.weeklyResetAt.IsZero() || r.weeklyResetAt.After(now))
 }
 
 // FablePool caches the Fable windows of the Claude accounts. The zero value is not
@@ -100,10 +112,6 @@ type FablePool struct {
 // NewFablePool creates a pool over the accounts list returns. cfg supplies the
 // global proxy for lookups.
 func NewFablePool(list func() []*coreauth.Auth, cfg func() *config.Config) *FablePool {
-	url := strings.TrimSpace(os.Getenv(usageURLEnv))
-	if url == "" {
-		url = defaultUsageURL
-	}
 	return &FablePool{
 		readings:    make(map[string]fableReading),
 		tried:       make(map[string]time.Time),
@@ -115,7 +123,7 @@ func NewFablePool(list func() []*coreauth.Auth, cfg func() *config.Config) *Fabl
 			if cfg != nil {
 				current = cfg()
 			}
-			return fetchFableReading(ctx, helps.NewUtlsHTTPClient(ctx, current, auth, 0), url, auth)
+			return fetchFableReading(ctx, helps.NewUtlsHTTPClient(ctx, current, auth, 0), usageURL, auth)
 		},
 		weight: func(auth *coreauth.Auth) float64 {
 			return clientusage.CredentialInfoFromAuth(auth).PlanProUnits
@@ -141,7 +149,7 @@ func (p *FablePool) Summary(ctx context.Context, wait time.Duration) FableSummar
 	for _, auth := range accounts {
 		known[auth.ID] = struct{}{}
 		reading, ok := p.readings[auth.ID]
-		if ok && now.Sub(reading.at) < refreshAfter && !reading.windowEnded(now) {
+		if ok && now.Sub(reading.at) < refreshAfter {
 			continue
 		}
 		if done := p.refreshLocked(auth, now); done != nil && !ok {
@@ -248,34 +256,56 @@ type fableAccount struct {
 	ok      bool
 }
 
+// topUp is a time at which the pool grows, and by how many Pro units.
+type topUp struct {
+	at    time.Time
+	units float64
+}
+
 // combineFable weighs each account's Fable window by its plan's weekly allowance.
 func combineFable(now time.Time, accounts []fableAccount) FableSummary {
 	var summary FableSummary
 	var capacity, remaining float64
-	var oldest, nextReset time.Time
-	used := make([]float64, len(accounts))
-	for i, account := range accounts {
+	var oldest time.Time
+	var topUps []topUp
+	for _, account := range accounts {
 		if !account.ok {
 			summary.Partial = true
 			continue
 		}
-		if !account.reading.hasFable || account.units <= 0 {
+		reading := account.reading
+		if !reading.hasFable || account.units <= 0 {
 			continue
 		}
-		share := math.Min(math.Max(account.reading.used, 0), 100) / 100
-		if account.reading.windowEnded(now) {
+		share := math.Min(math.Max(reading.used, 0), 100) / 100
+		if reading.fableEnded(now) {
 			// Anthropic restarted the window empty.
 			share = 0
 		}
-		used[i] = share
 		capacity += account.units
-		remaining += account.units * (1 - share)
-		if oldest.IsZero() || account.reading.at.Before(oldest) {
-			oldest = account.reading.at
+		if oldest.IsZero() || reading.at.Before(oldest) {
+			oldest = reading.at
 		}
-		if share > 0 && !account.reading.resetAt.IsZero() && (nextReset.IsZero() || account.reading.resetAt.Before(nextReset)) {
-			nextReset = account.reading.resetAt
+		if !reading.weeklyBlocked(now) {
+			remaining += account.units * (1 - share)
+			if share > 0 && !reading.resetAt.IsZero() {
+				topUps = append(topUps, topUp{at: reading.resetAt, units: account.units * share})
+			}
+			continue
 		}
+		// None of the account's Fable is usable before its weekly window resets.
+		if reading.weeklyResetAt.IsZero() {
+			continue
+		}
+		if share > 0 && (reading.resetAt.IsZero() || reading.resetAt.After(reading.weeklyResetAt)) {
+			topUps = append(topUps, topUp{at: reading.weeklyResetAt, units: account.units * (1 - share)})
+			if !reading.resetAt.IsZero() {
+				topUps = append(topUps, topUp{at: reading.resetAt, units: account.units * share})
+			}
+			continue
+		}
+		// The Fable window has reset by then too.
+		topUps = append(topUps, topUp{at: reading.weeklyResetAt, units: account.units})
 	}
 	if capacity <= 0 {
 		return summary
@@ -284,14 +314,20 @@ func combineFable(now time.Time, accounts []fableAccount) FableSummary {
 	summary.RemainingPercent = roundPercent(100 * remaining / capacity)
 	summary.UsedPercent = roundPercent(100 - summary.RemainingPercent)
 	summary.UpdatedAt = &oldest
-	if !nextReset.IsZero() {
+	var next time.Time
+	for _, event := range topUps {
+		if event.units > 0 && (next.IsZero() || event.at.Before(next)) {
+			next = event.at
+		}
+	}
+	if !next.IsZero() {
 		var restored float64
-		for i, account := range accounts {
-			if used[i] > 0 && !account.reading.resetAt.IsZero() && account.reading.resetAt.Sub(nextReset) < resetGroup {
-				restored += account.units * used[i]
+		for _, event := range topUps {
+			if event.at.Sub(next) < resetGroup {
+				restored += event.units
 			}
 		}
-		summary.NextResetAt = &nextReset
+		summary.NextResetAt = &next
 		summary.NextResetRestoresPercent = roundPercent(100 * restored / capacity)
 	}
 	return summary
@@ -350,11 +386,14 @@ func fetchFableReading(ctx context.Context, client *http.Client, url string, aut
 	return parseFableReading(body)
 }
 
+type usageWindow struct {
+	Utilization *float64 `json:"utilization"`
+	ResetsAt    string   `json:"resets_at"`
+}
+
 type usagePayload struct {
-	Legacy *struct {
-		Utilization *float64 `json:"utilization"`
-		ResetsAt    string   `json:"resets_at"`
-	} `json:"iguana_necktie"`
+	Weekly *usageWindow `json:"seven_day"`
+	Legacy *usageWindow `json:"iguana_necktie"`
 	Limits []struct {
 		Kind     string   `json:"kind"`
 		Percent  *float64 `json:"percent"`
@@ -371,6 +410,7 @@ type usagePayload struct {
 // parseFableReading reads the Fable window of an OAuth usage payload the way the
 // management panel does: the active weekly_scoped limit of the Fable model family
 // (any version), else the first valid one, else the legacy iguana_necktie window.
+// It also reads the account's overall seven_day window.
 func parseFableReading(body []byte) (fableReading, error) {
 	var payload usagePayload
 	if errUnmarshal := json.Unmarshal(body, &payload); errUnmarshal != nil {
@@ -397,6 +437,10 @@ func parseFableReading(body []byte) (fableReading, error) {
 	}
 	if !found && payload.Legacy != nil && payload.Legacy.Utilization != nil {
 		reading = fableReading{hasFable: true, used: *payload.Legacy.Utilization, resetAt: parseResetTime(payload.Legacy.ResetsAt)}
+	}
+	if payload.Weekly != nil && payload.Weekly.Utilization != nil {
+		reading.weeklyUsed = *payload.Weekly.Utilization
+		reading.weeklyResetAt = parseResetTime(payload.Weekly.ResetsAt)
 	}
 	return reading, nil
 }
