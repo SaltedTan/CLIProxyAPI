@@ -253,7 +253,7 @@ func (s *Service) applyManagerConfig(ctx context.Context, commit configCommit) b
 	}
 	routingState := normalizedRoutingRuntimeState(commit.cfg)
 	if s.appliedRoutingState == nil || *s.appliedRoutingState != routingState {
-		s.coreManager.SetSelector(newRoutingSelector(routingState, s.claudeUsage))
+		s.replaceRoutingSelector(newRoutingSelector(routingState, s.claudeUsage), time.Now())
 		s.appliedRoutingState = &routingState
 	}
 	s.applyRetryConfig(commit.cfg)
@@ -263,6 +263,30 @@ func (s *Service) applyManagerConfig(ctx context.Context, commit configCommit) b
 	}
 	s.coreManager.SetOAuthModelAlias(commit.cfg.OAuthModelAlias)
 	return true
+}
+
+// replaceRoutingSelector installs next for a routing settings change. When both the
+// current and the next selector are session affinity selectors, the session bindings
+// are carried over, so live sessions keep their credential (and its prompt cache).
+// Turning session affinity off drops them.
+func (s *Service) replaceRoutingSelector(next coreauth.Selector, now time.Time) {
+	current, _ := s.coreManager.Selector().(*coreauth.SessionAffinitySelector)
+	nextAffinity, _ := next.(*coreauth.SessionAffinitySelector)
+	var bindings []coreauth.SessionBinding
+	if current != nil && nextAffinity != nil {
+		// Snapshot before the swap, which stops the current selector. A pick that lands
+		// on it between the snapshot and the swap is not carried over; that session is
+		// re-picked on its next request.
+		bindings = current.SessionBindings(now)
+	}
+	s.coreManager.SetSelector(next)
+	if len(bindings) == 0 {
+		return
+	}
+	// Restore after the swap: bindings made on the new selector in between are live and
+	// win, and expiries are capped at the new TTL.
+	kept := nextAffinity.RestoreSessionBindings(bindings, now, usableBindingAuth(s.coreManager))
+	log.Infof("session affinity: kept %d of %d bindings across a routing change", kept, len(bindings))
 }
 
 // ensureRoutingSelector installs the configured routing selector when none has been

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
 func newSessionAffinityTestManager(t *testing.T, auths ...*coreauth.Auth) (*coreauth.Manager, *coreauth.SessionAffinitySelector) {
@@ -304,5 +306,95 @@ func TestServiceShutdownSavesSessionAffinityBindings(t *testing.T) {
 	loaded, errLoad := loadSessionAffinityState(path)
 	if errLoad != nil || len(loaded) != 1 || loaded[0].AuthID != "auth-a" {
 		t.Fatalf("bindings saved at shutdown = %+v, %v; want the auth-a binding", loaded, errLoad)
+	}
+}
+
+// A config reload that changes the routing settings replaces the selector. Bindings to
+// credentials that still exist and are enabled are carried over to the new session
+// affinity selector, with expiries capped at its TTL; turning affinity off drops them.
+func TestRoutingChangeKeepsSessionAffinityBindings(t *testing.T) {
+	authA := &coreauth.Auth{ID: "routing-change-a", Provider: "claude", Status: coreauth.StatusActive}
+	authB := &coreauth.Auth{ID: "routing-change-b", Provider: "claude", Status: coreauth.StatusActive}
+	disabled := &coreauth.Auth{ID: "routing-change-disabled", Provider: "claude", Status: coreauth.StatusDisabled, Disabled: true}
+	manager := coreauth.NewManager(nil, nil, nil)
+	for _, auth := range []*coreauth.Auth{authA, authB, disabled} {
+		if _, errRegister := manager.Register(coreauth.WithSkipPersist(context.Background()), auth); errRegister != nil {
+			t.Fatalf("Register(%s): %v", auth.ID, errRegister)
+		}
+	}
+	service := &Service{coreManager: manager}
+	sequence := uint64(0)
+	apply := func(routing config.RoutingConfig) coreauth.Selector {
+		t.Helper()
+		sequence++
+		if !service.applyManagerConfig(context.Background(), configCommit{cfg: &config.Config{Routing: routing}, sequence: sequence}) {
+			t.Fatal("applyManagerConfig failed")
+		}
+		selector := manager.Selector()
+		if affinity, ok := selector.(*coreauth.SessionAffinitySelector); ok {
+			t.Cleanup(affinity.Stop)
+		}
+		return selector
+	}
+	opts := func() cliproxyexecutor.Options {
+		return cliproxyexecutor.Options{Headers: http.Header{"X-Claude-Code-Session-Id": []string{"routing-change-session"}}}
+	}
+
+	before, ok := apply(config.RoutingConfig{Strategy: "round-robin", SessionAffinity: true, SessionAffinityTTL: "1h"}).(*coreauth.SessionAffinitySelector)
+	if !ok {
+		t.Fatalf("selector = %T, want *SessionAffinitySelector", manager.Selector())
+	}
+	// Only authB is offered, so a real pick binds the session to it for an hour.
+	if picked, errPick := before.Pick(context.Background(), "claude", "claude-model", opts(), []*coreauth.Auth{authB}); errPick != nil || picked == nil || picked.ID != authB.ID {
+		t.Fatalf("initial Pick() = %v, %v; want %s", picked, errPick, authB.ID)
+	}
+	now := time.Now()
+	shortExpiry := now.Add(5 * time.Minute)
+	seeded := []coreauth.SessionBinding{
+		{Keys: []string{"claude::short::claude-model"}, AuthID: authA.ID, ExpiresAt: shortExpiry},
+		{Keys: []string{"claude::removed::claude-model"}, AuthID: "routing-change-removed", ExpiresAt: now.Add(30 * time.Minute)},
+		{Keys: []string{"claude::disabled::claude-model"}, AuthID: disabled.ID, ExpiresAt: now.Add(30 * time.Minute)},
+	}
+	if restored := before.RestoreSessionBindings(seeded, now, nil); restored != len(seeded) {
+		t.Fatalf("seed RestoreSessionBindings() = %d, want %d", restored, len(seeded))
+	}
+
+	// A new strategy and a shorter TTL replace the selector. The swap reads the clock
+	// once, between swapStart and swapEnd.
+	swapStart := time.Now()
+	after, ok := apply(config.RoutingConfig{Strategy: "quota-aware", SessionAffinity: true, SessionAffinityTTL: "10m"}).(*coreauth.SessionAffinitySelector)
+	swapEnd := time.Now()
+	if !ok || after == before {
+		t.Fatalf("selector after routing change = %T (same=%v), want a new *SessionAffinitySelector", manager.Selector(), after == before)
+	}
+	got := make(map[string]coreauth.SessionBinding)
+	for _, binding := range after.SessionBindings(swapEnd) {
+		got[binding.AuthID] = binding
+	}
+	if len(got) != 2 {
+		t.Fatalf("bindings after routing change = %+v, want the %s and %s bindings only", got, authA.ID, authB.ID)
+	}
+	if binding, found := got[authA.ID]; !found || !binding.ExpiresAt.Equal(shortExpiry) {
+		t.Fatalf("%s binding = %+v, want its expiry %v kept", authA.ID, binding, shortExpiry)
+	}
+	binding, found := got[authB.ID]
+	if !found || binding.ExpiresAt.Before(swapStart.Add(10*time.Minute)) || binding.ExpiresAt.After(swapEnd.Add(10*time.Minute)) {
+		t.Fatalf("%s binding = %+v, want its hour-long expiry capped at the new 10m TTL", authB.ID, binding)
+	}
+	// On a miss the new selector would pick authA, which sorts first.
+	if picked, errPick := after.Pick(context.Background(), "claude", "claude-model", opts(), []*coreauth.Auth{authA, authB}); errPick != nil || picked == nil || picked.ID != authB.ID {
+		t.Fatalf("Pick() after routing change = %v, %v; want the session kept on %s", picked, errPick, authB.ID)
+	}
+
+	// Turning affinity off drops the bindings, so turning it back on starts empty.
+	if _, isAffinity := apply(config.RoutingConfig{Strategy: "quota-aware"}).(*coreauth.SessionAffinitySelector); isAffinity {
+		t.Fatalf("selector with affinity off = %T, want no session affinity", manager.Selector())
+	}
+	reenabled, ok := apply(config.RoutingConfig{Strategy: "quota-aware", SessionAffinity: true, SessionAffinityTTL: "10m"}).(*coreauth.SessionAffinitySelector)
+	if !ok {
+		t.Fatalf("selector after re-enabling affinity = %T, want *SessionAffinitySelector", manager.Selector())
+	}
+	if bindings := reenabled.SessionBindings(time.Now()); len(bindings) != 0 {
+		t.Fatalf("bindings after re-enabling affinity = %+v, want none", bindings)
 	}
 }

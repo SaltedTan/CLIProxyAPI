@@ -133,8 +133,17 @@ func (st *sessionAffinityStore) restore(manager *coreauth.Manager, now time.Time
 		}
 		return 0
 	}
+	restored := selector.RestoreSessionBindings(bindings, now, usableBindingAuth(manager))
+	log.Infof("session affinity: restored %d of %d saved bindings", restored, len(bindings))
+	return restored
+}
+
+// usableBindingAuth returns the filter for bindings carried into a session affinity
+// selector, at startup or across a routing change: a binding is kept only while its
+// credential still exists and is enabled. Lookups are memoized per auth ID.
+func usableBindingAuth(manager *coreauth.Manager) func(authID string) bool {
 	usable := make(map[string]bool)
-	keep := func(authID string) bool {
+	return func(authID string) bool {
 		enabled, seen := usable[authID]
 		if !seen {
 			auth, exists := manager.GetByID(authID)
@@ -143,9 +152,6 @@ func (st *sessionAffinityStore) restore(manager *coreauth.Manager, now time.Time
 		}
 		return enabled
 	}
-	restored := selector.RestoreSessionBindings(bindings, now, keep)
-	log.Infof("session affinity: restored %d of %d saved bindings", restored, len(bindings))
-	return restored
 }
 
 // save writes the bindings of the manager's session affinity selector. It does nothing
