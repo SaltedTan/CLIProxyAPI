@@ -43,10 +43,12 @@ const (
 // StartAutoRefresh launches a background loop that evaluates auth freshness
 // every few seconds and triggers refresh operations when required.
 // Only one loop is kept alive; starting a new one cancels the previous run.
+// It also lifts a previous DrainRefreshes, so refreshes can start again.
 func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = refreshCheckInterval
 	}
+	m.refreshFlights.setDraining(false)
 
 	m.mu.Lock()
 	cancelPrev := m.refreshCancel
@@ -70,7 +72,9 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 	go loop.run(ctx)
 }
 
-// StopAutoRefresh cancels the background refresh loop, if running.
+// StopAutoRefresh cancels the background refresh loop, if running, and returns
+// without waiting. A refresh that has already started still finishes and
+// persists its result; use DrainRefreshes to wait for it.
 // It also stops the selector if it implements StoppableSelector.
 func (m *Manager) StopAutoRefresh() {
 	m.mu.Lock()
@@ -511,6 +515,8 @@ func (m *Manager) RefreshHomeSelectionAfterUnauthorized(_ context.Context, selec
 
 // tryRefreshAfterUnauthorized refreshes local OAuth credentials once after a
 // 401 so the current auth can be retried before fallback/suspend.
+// The refresh outlives a cancelled ctx, so callers must check their request
+// context afterwards and stop without retrying or recording the stale error.
 func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, execErr error, alreadyTried bool) (*Auth, bool) {
 	if m == nil || auth == nil || alreadyTried || execErr == nil {
 		return auth, false
@@ -632,6 +638,17 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 			return auth.Clone(), nil
 		}
 	}
+
+	// Once the exchange is sent, the provider may already have rotated the refresh
+	// token. The exchange and the persist of its result must therefore outlive the
+	// caller: a stopped auto-refresh loop, a disconnected client or a shutdown would
+	// otherwise drop the new tokens, and the next start fails with invalid_grant.
+	// The detached context keeps the caller's values; DrainRefreshes waits for it.
+	if !m.refreshFlights.begin(id) {
+		return nil, errRefreshDraining
+	}
+	defer m.refreshFlights.end(id)
+	ctx = context.WithoutCancel(ctx)
 
 	base := auth.Clone()
 	updated, err := exec.Refresh(ctx, base.Clone())

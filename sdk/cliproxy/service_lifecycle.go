@@ -232,6 +232,7 @@ func (s *Service) Run(ctx context.Context) error {
 }
 
 // Shutdown stops background workers and immediately closes the HTTP server.
+// It then waits, within ctx, for in-flight token refreshes to persist.
 // It ensures all resources are properly cleaned up and connections are closed.
 // The shutdown is idempotent and can be called multiple times safely.
 //
@@ -352,6 +353,15 @@ func (s *Service) Shutdown(ctx context.Context) error {
 				if shutdownErr == nil {
 					shutdownErr = errStop
 				}
+			}
+		}
+
+		// Token refreshes started by the auto-refresh loop or by request handlers
+		// keep running after their caller is gone. Let them persist the rotated
+		// tokens before the executors and the process go away.
+		if s.coreManager != nil {
+			if errDrain := s.coreManager.DrainRefreshes(ctx); errDrain != nil {
+				log.Warnf("shutdown: %v", errDrain)
 			}
 		}
 

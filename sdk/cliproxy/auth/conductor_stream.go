@@ -253,6 +253,11 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if allowRetry && !ephemeralResult {
 				alreadyTried := didRefreshOnUnauthorized
 				refreshed, okRefresh := m.tryRefreshAfterUnauthorized(newUpstreamAttemptContext(ctx), auth, errStream, alreadyTried)
+				// The refresh outlives the request; a client gone meanwhile gets no
+				// retry and no result recorded from the stale error.
+				if errCtx := ctx.Err(); errCtx != nil {
+					return nil, errCtx
+				}
 				if okRefresh {
 					auth = refreshed
 					publishSelectedAuthMetadata(execOpts.Metadata, auth)
@@ -329,6 +334,12 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if allowRetry && !ephemeralResult {
 				alreadyTried := didRefreshOnUnauthorized
 				refreshed, okRefresh := m.tryRefreshAfterUnauthorized(newUpstreamAttemptContext(ctx), auth, bootstrapErr, alreadyTried)
+				// The refresh outlives the request; a client gone meanwhile gets no
+				// retry and no result recorded from the stale error.
+				if errCtx := ctx.Err(); errCtx != nil {
+					discardStreamChunks(streamResult.Chunks)
+					return nil, errCtx
+				}
 				if okRefresh {
 					discardStreamChunks(streamResult.Chunks)
 					auth = refreshed
