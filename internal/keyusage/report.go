@@ -148,6 +148,9 @@ func (r Report) Line(color bool) string {
 		parts = append(parts, "Fable: n/a")
 	default:
 		text := paint(fable.RemainingPercent, "Fable "+wholePercent(fable.RemainingPercent)+"% left")
+		if fable.Partial {
+			text += " (partial)"
+		}
 		if fable.NextResetAt != nil {
 			text += " · +" + wholePercent(fable.NextResetRestoresPercent) + "% in " + r.until(*fable.NextResetAt)
 		}

@@ -10,9 +10,11 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/keyusage"
 )
 
-// keyUsageFableWait is how long a key usage report waits for Fable accounts that
-// have never been read. Their lookups continue in the background either way.
-const keyUsageFableWait = 3 * time.Second
+// keyUsageFableWait is how long after their lookup started a key usage report waits
+// for Fable accounts that have never been read. It stays under the 3 seconds the
+// example status line script allows a request. The lookups continue in the
+// background either way.
+const keyUsageFableWait = 2 * time.Second
 
 // keyUsage serves GET /v1/key/usage to the holder of a client API key: the key's own
 // Claude allowance and the Fable allowance left across the accounts, as JSON, as

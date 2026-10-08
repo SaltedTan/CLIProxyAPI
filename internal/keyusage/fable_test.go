@@ -172,9 +172,17 @@ type fakeFetcher struct {
 	calls  map[string]int
 	result map[string]fableReading
 	fail   map[string]bool
+	// gate, when set, holds lookups until it is closed.
+	gate chan struct{}
 }
 
 func (f *fakeFetcher) fetch(_ context.Context, auth *coreauth.Auth) (fableReading, error) {
+	f.mu.Lock()
+	gate := f.gate
+	f.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls[auth.ID]++
@@ -247,12 +255,15 @@ func TestFablePoolCachesLookups(t *testing.T) {
 
 	// A stale reading is served while it refreshes in the background.
 	now = testNow.Add(refreshAfter + time.Second)
+	gate := make(chan struct{})
 	fetcher.mu.Lock()
 	fetcher.result["a"] = fableReading{hasFable: true, used: 100, resetAt: testNow.Add(48 * time.Hour)}
+	fetcher.gate = gate
 	fetcher.mu.Unlock()
 	if stale := pool.Summary(context.Background(), time.Minute); stale.RemainingPercent != 75 {
 		t.Fatalf("stale summary = %+v, want the cached figure", stale)
 	}
+	close(gate)
 	settle(pool)
 	if fresh := pool.Summary(context.Background(), time.Minute); fresh.RemainingPercent != 50 || fetcher.count("a") != 2 {
 		t.Fatalf("fresh summary = %+v after %d lookups", fresh, fetcher.count("a"))
@@ -364,5 +375,47 @@ func TestFablePoolForgetsAccountsThatLeave(t *testing.T) {
 	defer mu.Unlock()
 	if !cancelled || len(pool.tried) != 0 || len(pool.inflight) != 0 || len(pool.readings) != 0 {
 		t.Fatalf("cancelled = %v, tried = %v, inflight = %v, readings = %v", cancelled, pool.tried, pool.inflight, pool.readings)
+	}
+}
+
+func TestFablePoolWaitsForAHangingLookupOnlyOnce(t *testing.T) {
+	now := testNow
+	release := make(chan struct{})
+	fetcher := &fakeFetcher{calls: map[string]int{}, result: map[string]fableReading{"good": fable(50, 24*time.Hour)}}
+	pool := newTestPool(&now, fetcher, claudeOAuth("good"), claudeOAuth("hanging"))
+	pool.fetch = func(ctx context.Context, auth *coreauth.Auth) (fableReading, error) {
+		if auth.ID == "hanging" {
+			<-release
+			return fableReading{}, errors.New("hung")
+		}
+		return fetcher.fetch(ctx, auth)
+	}
+	defer func() {
+		close(release)
+		settle(pool)
+	}()
+
+	// The first reader waits up to wait for the lookups it started.
+	if first := pool.Summary(context.Background(), 20*time.Millisecond); !first.Partial {
+		t.Fatalf("first summary = %+v, want a partial figure", first)
+	}
+	pool.mu.Lock()
+	good := pool.inflight["good"]
+	pool.mu.Unlock()
+	if good != nil {
+		<-good.done
+	}
+
+	// Once wait has passed since the hanging lookup started, readers no longer wait.
+	now = testNow.Add(2 * time.Minute)
+	done := make(chan FableSummary, 1)
+	go func() { done <- pool.Summary(context.Background(), time.Minute) }()
+	select {
+	case later := <-done:
+		if !later.Partial || later.RemainingPercent != 50 {
+			t.Fatalf("later summary = %+v", later)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a later reader waited for the hanging lookup")
 	}
 }

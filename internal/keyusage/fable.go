@@ -139,9 +139,10 @@ func NewFablePool(list func() []*coreauth.Auth, cfg func() *config.Config) *Fabl
 }
 
 // Summary combines the cached readings. Accounts whose reading is stale are refreshed
-// in the background; when wait is positive, Summary waits up to wait (or until ctx
-// ends) for accounts that have never been read. The lookups themselves continue
-// after Summary returns.
+// in the background. Summary waits (until ctx ends at the latest) for accounts that
+// have never been read, but only until wait has passed since their lookup started, so
+// a lookup that hangs delays the first readers rather than every reader. The lookups
+// themselves continue after Summary returns.
 func (p *FablePool) Summary(ctx context.Context, wait time.Duration) FableSummary {
 	if p == nil || p.list == nil {
 		return FableSummary{}
@@ -152,14 +153,22 @@ func (p *FablePool) Summary(ctx context.Context, wait time.Duration) FableSummar
 	p.mu.Lock()
 	known := make(map[string]struct{}, len(accounts))
 	var pending []chan struct{}
+	var waitUntil time.Time
 	for _, auth := range accounts {
 		known[auth.ID] = struct{}{}
 		reading, ok := p.readings[auth.ID]
 		if ok && now.Sub(reading.at) < refreshAfter {
 			continue
 		}
-		if done := p.refreshLocked(auth, now); done != nil && !ok {
+		done := p.refreshLocked(auth, now)
+		if done == nil || ok {
+			continue
+		}
+		if until := p.tried[auth.ID].Add(wait); until.After(now) {
 			pending = append(pending, done)
+			if until.After(waitUntil) {
+				waitUntil = until
+			}
 		}
 	}
 	// Every reading and lookup has a tried entry.
@@ -176,8 +185,8 @@ func (p *FablePool) Summary(ctx context.Context, wait time.Duration) FableSummar
 	}
 	p.mu.Unlock()
 
-	if wait > 0 && len(pending) > 0 {
-		waitAll(ctx, pending, wait)
+	if len(pending) > 0 {
+		waitAll(ctx, pending, waitUntil.Sub(now))
 	}
 
 	p.mu.Lock()

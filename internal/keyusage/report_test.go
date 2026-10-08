@@ -91,6 +91,11 @@ func TestReportLine(t *testing.T) {
 		t.Fatalf("colored line = %q, want %q", got, want)
 	}
 
+	report.Fable.Partial = true
+	if got, want := report.Line(false), "Claude 63% left · resets in 4d22h │ Fable 12% left (partial) · +<1% in 19h30m"; got != want {
+		t.Fatalf("partial line = %q, want %q", got, want)
+	}
+
 	report.Claude = clientusage.KeyAllowance{Limited: true, LimitProUnits: ptr(5), RemainingProUnits: ptr(0), RemainingPercent: ptr(0), LimitReached: true, WindowResetsAt: timePtr(testNow.Add(26 * time.Hour))}
 	report.Fable = FableSummary{}
 	if got, want := report.Line(false), "Claude: limit reached · back in 1d2h │ Fable: n/a"; got != want {
