@@ -364,6 +364,74 @@ func TestQuotaAwareSelector_ZeroWeightIsLastResort(t *testing.T) {
 	assertPickSequence(t, newTestQuotaAwareSelector(now, nil), cliproxyexecutor.Options{}, auths[:1], "a")
 }
 
+// claudeQuotaAuth builds a Claude credential with the given plan metadata, weekly usage and
+// time until the weekly reset, and a lightly used 5h window.
+func claudeQuotaAuth(id string, metadata map[string]any, now time.Time, weeklyUsed string, weeklyResetIn time.Duration) *Auth {
+	return &Auth{ID: id, Provider: "claude", Status: StatusActive, Metadata: metadata, Quota: QuotaState{ObservedAt: now, Signals: map[string]string{
+		"Anthropic-Ratelimit-Unified-7d-Utilization": weeklyUsed,
+		"Anthropic-Ratelimit-Unified-7d-Reset":       strconv.FormatInt(now.Add(weeklyResetIn).Unix(), 10),
+		"Anthropic-Ratelimit-Unified-5h-Utilization": "0.1",
+		"Anthropic-Ratelimit-Unified-5h-Reset":       strconv.FormatInt(now.Add(4*time.Hour).Unix(), 10),
+	}}}
+}
+
+// A Claude plan sizes the credential without a weight: 1% of Max 5x is worth four times
+// 1% of Team, so a Max account with less left per hour still outranks the Team account.
+func TestQuotaAwareSelector_ClaudePlanSetsPlanSize(t *testing.T) {
+	t.Parallel()
+	now := quotaAwareTestBase()
+	maxPlan := map[string]any{"organization_type": "claude_max", "rate_limit_tier": "default_claude_max_5x"}
+	teamPlan := map[string]any{"organization_type": "claude_team", "rate_limit_tier": "default_raven"}
+	// Unsized, Team needs 0.93%/h and Max 0.64%/h. Sized, Team is 1.16 Pro units/h and Max 3.18.
+	auths := []*Auth{
+		claudeQuotaAuth("a-team", teamPlan, now, "0", 108*time.Hour),
+		claudeQuotaAuth("b-max", maxPlan, now, "0.39", 96*time.Hour),
+	}
+	assertPickSequence(t, newTestQuotaAwareSelector(now, nil), cliproxyexecutor.Options{}, auths, "b-max", "b-max", "b-max")
+
+	// Without plan metadata the same pool follows unsized pace.
+	unsized := []*Auth{
+		claudeQuotaAuth("a-team", nil, now, "0", 108*time.Hour),
+		claudeQuotaAuth("b-max", nil, now, "0.39", 96*time.Hour),
+	}
+	assertPickSequence(t, newTestQuotaAwareSelector(now, nil), cliproxyexecutor.Options{}, unsized, "a-team", "a-team")
+
+	// A weight does not resize a known plan; a plan without a known allowance uses it.
+	weightedTeam := claudeQuotaAuth("a-team", map[string]any{"organization_type": "claude_team", "weight": float64(8)}, now, "0", 108*time.Hour)
+	assertPickSequence(t, newTestQuotaAwareSelector(now, nil), cliproxyexecutor.Options{}, []*Auth{weightedTeam, auths[1]}, "b-max", "b-max")
+	enterprise := claudeQuotaAuth("a-enterprise", map[string]any{"organization_type": "claude_enterprise", "weight": float64(8)}, now, "0", 108*time.Hour)
+	assertPickSequence(t, newTestQuotaAwareSelector(now, nil), cliproxyexecutor.Options{}, []*Auth{enterprise, auths[1]}, "a-enterprise", "a-enterprise")
+}
+
+func TestQuotaAwarePlanSize(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		auth *Auth
+		want float64
+	}{
+		{name: "nil", auth: nil, want: 1},
+		{name: "claude max 5x tier", auth: &Auth{Provider: "claude", Metadata: map[string]any{"organization_type": "claude_max", "rate_limit_tier": "default_claude_max_5x"}}, want: 5},
+		{name: "claude max 20x tier", auth: &Auth{Provider: "claude", Metadata: map[string]any{"rate_limit_tier": "default_claude_max_20x"}}, want: 10},
+		{name: "claude team", auth: &Auth{Provider: "claude", Metadata: map[string]any{"organization_type": "claude_team"}}, want: 1.25},
+		{name: "claude pro", auth: &Auth{Provider: "claude", Metadata: map[string]any{"organization_type": "claude_pro"}}, want: 1},
+		{name: "claude plan_type override", auth: &Auth{Provider: "claude", Metadata: map[string]any{"plan_type": "max-20x", "organization_type": "claude_team"}}, want: 10},
+		{name: "claude known plan ignores weight", auth: &Auth{Provider: "claude", Attributes: map[string]string{AttributeWeight: "3"}, Metadata: map[string]any{"organization_type": "claude_team"}}, want: 1.25},
+		{name: "claude zero weight is last resort", auth: &Auth{Provider: "claude", Attributes: map[string]string{AttributeWeight: "0"}, Metadata: map[string]any{"rate_limit_tier": "default_claude_max_5x"}}, want: 0},
+		{name: "claude unknown plan uses weight", auth: &Auth{Provider: "claude", Metadata: map[string]any{"organization_type": "claude_enterprise", "weight": float64(4)}}, want: 4},
+		{name: "claude without plan defaults to one", auth: &Auth{Provider: "claude"}, want: 1},
+		{name: "codex plan_type is not a Claude plan", auth: &Auth{Provider: "codex", Metadata: map[string]any{"plan_type": "team"}}, want: 1},
+		{name: "codex weight", auth: &Auth{Provider: "codex", Metadata: map[string]any{"plan_type": "pro", "weight": float64(5)}}, want: 5},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := quotaAwarePlanSize(tc.auth); got != tc.want {
+				t.Fatalf("quotaAwarePlanSize() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestQuotaAwareSelector_SessionAffinityKeepsExistingBinding(t *testing.T) {
 	t.Parallel()
 	now := quotaAwareTestBase()

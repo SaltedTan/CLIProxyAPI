@@ -3,32 +3,25 @@ package clientusage
 import (
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/claudeplan"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
-// Claude plan identifiers and their weekly allowance relative to Claude Pro. The
-// allowances are approximate: Max 5x has about five times the weekly usage of Pro,
-// and Max 20x about twice that of Max 5x.
+// Claude plan identifiers. The allowances are approximate: Max 5x has about five times
+// the weekly usage of Pro, and Max 20x about twice that of Max 5x.
 const (
-	PlanPro     = "pro"
-	PlanTeam    = "team"
-	PlanMax5x   = "max_5x"
-	PlanMax20x  = "max_20x"
-	PlanUnknown = "unknown"
+	PlanPro     = claudeplan.Pro
+	PlanTeam    = claudeplan.Team
+	PlanMax5x   = claudeplan.Max5x
+	PlanMax20x  = claudeplan.Max20x
+	PlanUnknown = claudeplan.Unknown
 )
-
-var claudePlanProUnits = map[string]float64{
-	PlanPro:    1,
-	PlanTeam:   1.25,
-	PlanMax5x:  5,
-	PlanMax20x: 10,
-}
 
 // Plan sources reported with CredentialInfo.
 const (
-	PlanSourcePlanType         = "plan_type"
-	PlanSourceRateLimitTier    = "rate_limit_tier"
-	PlanSourceOrganizationType = "organization_type"
+	PlanSourcePlanType         = claudeplan.SourcePlanType
+	PlanSourceRateLimitTier    = claudeplan.SourceRateLimitTier
+	PlanSourceOrganizationType = claudeplan.SourceOrganizationType
 	PlanSourceWeight           = "weight"
 )
 
@@ -49,7 +42,8 @@ type CredentialInfo struct {
 
 // CredentialInfoFromAuth resolves the report details of a credential. An explicit
 // plan_type metadata value (pro, team, max_5x, max_20x) overrides the plan recorded
-// from the Claude OAuth profile (rate_limit_tier and organization_type).
+// from the Claude OAuth profile (rate_limit_tier and organization_type); see
+// claudeplan.Resolve.
 func CredentialInfoFromAuth(auth *coreauth.Auth) CredentialInfo {
 	if auth == nil {
 		return CredentialInfo{Plan: PlanUnknown, PlanProUnits: 1, PlanSource: PlanSourceWeight}
@@ -58,8 +52,8 @@ func CredentialInfoFromAuth(auth *coreauth.Auth) CredentialInfo {
 	if info.Label == "" {
 		info.Label = metadataString(auth.Metadata, "email")
 	}
-	plan, source := resolveClaudePlan(auth.Metadata)
-	if units, ok := claudePlanProUnits[plan]; ok {
+	plan, source := claudeplan.Resolve(auth.Metadata)
+	if units, ok := claudeplan.ProUnits(plan); ok {
 		info.Plan, info.PlanProUnits, info.PlanSource = plan, units, source
 		return info
 	}
@@ -72,44 +66,6 @@ func CredentialInfoFromAuth(auth *coreauth.Auth) CredentialInfo {
 		info.PlanProUnits = 1
 	}
 	return info
-}
-
-func resolveClaudePlan(metadata map[string]any) (string, string) {
-	if plan := normalizeClaudePlan(metadataString(metadata, "plan_type")); plan != "" {
-		return plan, PlanSourcePlanType
-	}
-	organizationType := strings.ToLower(metadataString(metadata, "organization_type"))
-	// The tier only sizes Max plans; a stale Max tier must not override a newer plan.
-	if organizationType == "" || organizationType == "claude_max" {
-		tier := strings.ToLower(metadataString(metadata, "rate_limit_tier"))
-		switch {
-		case strings.Contains(tier, "max_20x"):
-			return PlanMax20x, PlanSourceRateLimitTier
-		case strings.Contains(tier, "max_5x"):
-			return PlanMax5x, PlanSourceRateLimitTier
-		}
-	}
-	if organizationType == "claude_pro" {
-		return PlanPro, PlanSourceOrganizationType
-	}
-	if plan := strings.TrimPrefix(organizationType, "claude_"); plan != "" {
-		return plan, PlanSourceOrganizationType
-	}
-	return "", ""
-}
-
-func normalizeClaudePlan(raw string) string {
-	plan := strings.ToLower(strings.TrimSpace(raw))
-	plan = strings.NewReplacer("-", "_", " ", "_").Replace(plan)
-	plan = strings.TrimPrefix(plan, "claude_")
-	switch plan {
-	case "max5x":
-		return PlanMax5x
-	case "max20x":
-		return PlanMax20x
-	default:
-		return plan
-	}
 }
 
 func metadataString(metadata map[string]any, key string) string {

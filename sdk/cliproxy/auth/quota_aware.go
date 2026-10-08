@@ -10,6 +10,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/claudeplan"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
@@ -41,24 +42,26 @@ const (
 // long-lived (weekly) quota must be used to avoid losing it at the reset:
 //
 //	required pace = remaining weekly fraction / time until the weekly reset
-//	score         = required pace * credential weight
+//	score         = required pace * plan size
 //
-// Usage is reported as a percentage of each subscription's own limit, so the credential
-// weight (default 1) expresses relative plan size: a weight-4 credential's remaining
-// percent is worth four times a weight-1 credential's. A weight of zero leaves the
-// credential with no quota to protect, so it is only used as a last resort.
+// Usage is reported as a percentage of each subscription's own limit, so the plan size
+// expresses its relative weekly allowance: a size-4 credential's remaining percent is worth
+// four times a size-1 credential's. A Claude credential with a known plan is sized by the
+// plan's allowance in Claude Pro units (Pro 1, Team 1.25, Max 5x 5, Max 20x 10); any other
+// credential by its weight (default 1). A weight of zero leaves the credential with no quota
+// to protect, so it is only used as a last resort.
 //
 // Selection, applied only to credentials the shared eligibility checks consider available:
 //  1. Credentials whose short window (5h, or Devin's daily quota) is at least 85% used and
 //     does not reset within 15 minutes are skipped, unless every candidate is in that state.
-//  2. Credentials with weekly data, quota left, and a positive weight rank first, by highest
+//  2. Credentials with weekly data, quota left, and a positive plan size rank first, by highest
 //     score. Credentials within 80% of the highest score are rotated by the fallback selector.
 //  3. Credentials without usable weekly data come next, then credentials whose weekly quota
-//     is used up or whose weight is zero; each group is rotated by the fallback selector.
+//     is used up or whose plan size is zero; each group is rotated by the fallback selector.
 //
 // Because quota is only observed from responses, rule 2 alone would starve a credential that
 // has no data yet (for example after a restart, or once its weekly window rolled over). So
-// while some candidates have weekly data, a positive-weight credential without it is probed:
+// while some candidates have weekly data, a positive-size credential without it is probed:
 // it takes precedence over the ranking for one new session per quotaAwareProbeInterval.
 //
 // The selector is stateless with respect to sessions. When session affinity is enabled it
@@ -124,7 +127,7 @@ func (u quotaUsage) shortSaturated(now time.Time) bool {
 type quotaAwareCandidate struct {
 	auth  *Auth
 	usage quotaUsage
-	score float64 // required pace scaled by the credential weight
+	score float64 // required pace scaled by the plan size
 }
 
 // quotaAwareDecision describes which candidates remain after ranking.
@@ -143,7 +146,7 @@ func rankQuotaAware(auths []*Auth, now time.Time) quotaAwareDecision {
 	for _, auth := range auths {
 		candidate := quotaAwareCandidate{auth: auth, usage: authQuotaUsage(auth, now)}
 		if candidate.usage.hasLong {
-			candidate.score = candidate.usage.requiredPace(now) * float64(authWeight(auth))
+			candidate.score = candidate.usage.requiredPace(now) * quotaAwarePlanSize(auth)
 		}
 		all = append(all, candidate)
 	}
@@ -269,7 +272,7 @@ func (s *QuotaAwareSelector) Pick(ctx context.Context, provider, model string, o
 		fields["weekly_used_pct"] = roundPercent(picked.usage.long.used)
 		fields["weekly_reset_at"] = picked.usage.long.resetAt.UTC().Format(time.RFC3339)
 		fields["required_pct_per_hour"] = math.Round(picked.usage.requiredPace(now)*10000) / 100
-		fields["weight"] = authWeight(picked.auth)
+		fields["plan_size"] = quotaAwarePlanSize(picked.auth)
 	}
 	if picked.usage.hasShort {
 		fields["short_window"] = picked.usage.short.label
@@ -285,7 +288,7 @@ func (s *QuotaAwareSelector) Pick(ctx context.Context, provider, model string, o
 
 // dueProbes returns the candidates without usable weekly data that are due a probe. Probes
 // are only needed while other candidates have weekly data; otherwise the unknown group is
-// already the one rotated. Zero-weight credentials are last resorts and are never probed.
+// already the one rotated. Zero-size credentials are last resorts and are never probed.
 func (s *QuotaAwareSelector) dueProbes(decision quotaAwareDecision, now time.Time) []quotaAwareCandidate {
 	if s == nil || decision.withWeekly == 0 || len(decision.unknown) == 0 {
 		return nil
@@ -294,7 +297,7 @@ func (s *QuotaAwareSelector) dueProbes(decision quotaAwareDecision, now time.Tim
 	defer s.mu.Unlock()
 	var due []quotaAwareCandidate
 	for _, candidate := range decision.unknown {
-		if authWeight(candidate.auth) <= 0 {
+		if quotaAwarePlanSize(candidate.auth) <= 0 {
 			continue
 		}
 		if last, ok := s.probedAt[candidate.auth.ID]; ok && now.Sub(last) < quotaAwareProbeInterval {
@@ -322,6 +325,24 @@ func (s *QuotaAwareSelector) recordProbe(authID string, now time.Time) {
 		}
 	}
 	s.probedAt[authID] = now
+}
+
+// quotaAwarePlanSize returns the credential's weekly allowance relative to the others. A
+// Claude credential with a known plan uses the plan's allowance in Claude Pro units, the
+// same figure the client usage report shows; any other credential uses its weight. A
+// non-positive weight always yields zero, which makes the credential a last resort.
+func quotaAwarePlanSize(auth *Auth) float64 {
+	weight := authWeight(auth)
+	if weight <= 0 {
+		return 0
+	}
+	if auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
+		plan, _ := claudeplan.Resolve(auth.Metadata)
+		if units, ok := claudeplan.ProUnits(plan); ok {
+			return units
+		}
+	}
+	return float64(weight)
 }
 
 func roundPercent(fraction float64) float64 {

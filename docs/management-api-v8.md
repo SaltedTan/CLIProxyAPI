@@ -320,6 +320,8 @@ process stops may be lost. Usage is not tracked in Home mode.
   from the plan Claude reports at login and token refresh (`rate_limit_tier`,
   `organization_type`). Plans without a known allowance (for example
   `enterprise`) use the credential `weight` as their allowance, defaulting to 1.
+  The `quota-aware` routing strategy sizes Claude credentials by the same
+  allowance.
 
 `DELETE /observability/usage/clients?id=<id>` resets one key and returns 404
 for an unknown id. `DELETE /observability/usage/clients?all=true` resets every
