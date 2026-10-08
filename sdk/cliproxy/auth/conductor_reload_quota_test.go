@@ -34,15 +34,20 @@ func updateAfterReload(t *testing.T, existing, incoming *Auth) *Auth {
 	return updated
 }
 
+// claudeReloadMetadata is the metadata of a Claude auth file; an empty identity value is
+// left out.
 func claudeReloadMetadata(token, account, organization, email string) map[string]any {
-	return map[string]any{
-		"type":              "claude",
-		"access_token":      "access-" + token,
-		"refresh_token":     "refresh-" + token,
-		"account_uuid":      account,
-		"organization_uuid": organization,
-		"email":             email,
+	metadata := map[string]any{
+		"type":          "claude",
+		"access_token":  "access-" + token,
+		"refresh_token": "refresh-" + token,
 	}
+	for key, value := range map[string]string{"account_uuid": account, "organization_uuid": organization, "email": email} {
+		if value != "" {
+			metadata[key] = value
+		}
+	}
+	return metadata
 }
 
 func TestManagerUpdateQuotaSnapshotFollowsAccount(t *testing.T) {
@@ -97,7 +102,8 @@ func TestManagerUpdateQuotaSnapshotFollowsAccount(t *testing.T) {
 			wantKept:         true,
 		},
 		{
-			// Config credentials gain identity metadata at runtime that a config reload lacks.
+			// Config credentials gain identity metadata at runtime that a config reload lacks:
+			// it proves nothing, so the unchanged key decides.
 			name:               "runtime identity on one side with same key",
 			provider:           "claude",
 			existingMetadata:   map[string]any{"account_uuid": "acc-1", "organization_uuid": "org-1", "email": "user@example.com"},
@@ -113,12 +119,26 @@ func TestManagerUpdateQuotaSnapshotFollowsAccount(t *testing.T) {
 			incomingAttributes: map[string]string{AttributeAPIKey: "sk-ant-oat-2"},
 		},
 		{
-			name:     "organization on one side only",
-			provider: "claude",
-			existingMetadata: map[string]any{
-				"access_token": "access-1", "organization_uuid": "org-1", "email": "user@example.com",
-			},
-			incomingMetadata: map[string]any{"access_token": "access-2", "email": "user@example.com"},
+			// The file may now hold another organization of the same user: the email no
+			// longer proves the account, and the tokens changed.
+			name:             "claude organization dropped with new tokens",
+			provider:         "claude",
+			existingMetadata: claudeReloadMetadata("1", "acc-1", "org-1", "user@example.com"),
+			incomingMetadata: claudeReloadMetadata("2", "acc-1", "", "user@example.com"),
+		},
+		{
+			name:             "claude organization dropped with same tokens",
+			provider:         "claude",
+			existingMetadata: claudeReloadMetadata("1", "acc-1", "org-1", "user@example.com"),
+			incomingMetadata: claudeReloadMetadata("1", "acc-1", "", "user@example.com"),
+			wantKept:         true,
+		},
+		{
+			// An older file gains the organization from the proxy's refresh.
+			name:             "claude organization gained with new tokens",
+			provider:         "claude",
+			existingMetadata: claudeReloadMetadata("1", "acc-1", "", "user@example.com"),
+			incomingMetadata: claudeReloadMetadata("2", "acc-1", "org-1", "user@example.com"),
 			wantKept:         true,
 		},
 		{
@@ -135,7 +155,7 @@ func TestManagerUpdateQuotaSnapshotFollowsAccount(t *testing.T) {
 			wantKept: true,
 		},
 		{
-			// CredentialsChanged does not compare session_token, and the identity is one-sided.
+			// CredentialsChanged does not compare session_token, and incoming dropped the identity.
 			name:             "devin session token replaced",
 			provider:         "devin",
 			existingMetadata: map[string]any{"email": "a@example.com", "org_id": "org-a", "session_token": "session-a"},
@@ -458,10 +478,12 @@ func TestManagerReplaceWithAnEditedCloneDoesNotKeepTheQuotaAccount(t *testing.T)
 		t.Fatal("an edit that keeps the credentials must keep the account")
 	}
 
-	// An edit of the tokens may hold another account. The clone's own snapshot is cleared
-	// so that only the carry-over decides the snapshot.
+	// An edit of the tokens may hold another account. The clone carries the previous
+	// account's snapshot, which must not survive either.
 	edited := withTokens(currentForLineage(t, manager, stored.ID), "3")
-	edited.Quota = QuotaState{}
+	if !edited.Quota.ObservedAt.Equal(reloadQuotaObservedAt) {
+		t.Fatalf("edited clone quota snapshot = %+v, want the previous account's", edited.Quota)
+	}
 	if _, errUpdate := manager.Update(ctx, edited); errUpdate != nil {
 		t.Fatalf("Update() error = %v", errUpdate)
 	}
@@ -471,5 +493,69 @@ func TestManagerReplaceWithAnEditedCloneDoesNotKeepTheQuotaAccount(t *testing.T)
 	}
 	if SameQuotaAccount(stored, current) || SameQuotaAccount(refreshed, current) {
 		t.Fatal("quota data taken before the token edit must not describe the edited auth")
+	}
+}
+
+// A config credential holding a Claude OAuth token gains identity metadata at runtime from
+// its request preparation, and a config reload rebuilds it without that metadata. With an
+// unchanged key the reload keeps the account: its snapshot, its quota lineage, and quota
+// data taken after the preparation still describe it. Another key drops them.
+func TestManagerConfigReloadKeepsTheQuotaAccountOfRuntimeIdentity(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	configAuth := func(apiKey string) *Auth {
+		return &Auth{
+			ID:         "config-claude",
+			Provider:   "claude",
+			Status:     StatusActive,
+			Attributes: map[string]string{AttributeAPIKey: apiKey, "source": "config:claude[test]"},
+		}
+	}
+	manager := NewManager(nil, nil, nil)
+	prepare := func() *Auth {
+		t.Helper()
+		current := currentForLineage(t, manager, "config-claude")
+		prepared := current.Clone()
+		prepared.Metadata = map[string]any{"account_uuid": "acc-1", "organization_uuid": "org-1", "email": "user@example.com"}
+		if _, errUpdate := manager.UpdatePreparedAuth(ctx, current, prepared); errUpdate != nil {
+			t.Fatalf("UpdatePreparedAuth() error = %v", errUpdate)
+		}
+		identified := currentForLineage(t, manager, "config-claude")
+		if authMetadataString(identified, "organization_uuid") != "org-1" || identified.quotaLineage != current.quotaLineage {
+			t.Fatalf("prepared auth = %v (lineage %d), want the identity and lineage %d", identified.Metadata, identified.quotaLineage, current.quotaLineage)
+		}
+		return identified
+	}
+	reload := func(apiKey string) *Auth {
+		t.Helper()
+		if _, errUpdate := manager.Update(ctx, configAuth(apiKey)); errUpdate != nil {
+			t.Fatalf("Update() error = %v", errUpdate)
+		}
+		reloaded := currentForLineage(t, manager, "config-claude")
+		if authMetadataString(reloaded, "organization_uuid") != "" {
+			t.Fatalf("metadata = %v, want the rebuilt auth without identity", reloaded.Metadata)
+		}
+		return reloaded
+	}
+
+	registered := configAuth("sk-ant-oat-1")
+	registered.Quota = reloadQuotaSnapshot(reloadQuotaObservedAt, "0.95")
+	registerForLineage(t, manager, registered)
+	identified := prepare()
+	reloaded := reload("sk-ant-oat-1")
+	if !SameQuotaAccount(identified, reloaded) || reloaded.quotaLineage != identified.quotaLineage {
+		t.Fatalf("lineage = %d, want %d kept with the account", reloaded.quotaLineage, identified.quotaLineage)
+	}
+	if !reloaded.Quota.ObservedAt.Equal(reloadQuotaObservedAt) {
+		t.Fatalf("quota snapshot = %+v, want it kept", reloaded.Quota)
+	}
+
+	identified = prepare()
+	replaced := reload("sk-ant-oat-2")
+	if SameQuotaAccount(identified, replaced) || replaced.quotaLineage == identified.quotaLineage {
+		t.Fatal("quota data taken before the key changed must not describe the new key")
+	}
+	if len(replaced.Quota.Signals) != 0 || !replaced.Quota.ObservedAt.IsZero() {
+		t.Fatalf("quota snapshot = %+v, want cleared", replaced.Quota)
 	}
 }

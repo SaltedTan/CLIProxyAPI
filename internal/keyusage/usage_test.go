@@ -568,6 +568,49 @@ func TestUsageCacheDropsTheReadingOfAReplacedAccount(t *testing.T) {
 	}
 }
 
+// Claude quota is per organization. An auth file that drops its organization_uuid may now
+// hold another organization of the same user, so the matching email does not prove the
+// account: with the same tokens the reading is kept, with other tokens it is dropped and
+// the account is looked up again at once.
+func TestUsageCacheDropsTheReadingWhenTheOrganizationIsDropped(t *testing.T) {
+	now := testNow
+	fetcher := &fakeFetcher{calls: map[string]int{}, result: map[string]usageReading{"x": weeklyUsed(40)}}
+	withOrganization := claudeAccount("x", "a@example.com", "token-1")
+	withOrganization.Metadata["organization_uuid"] = "org-a"
+	auths := []*coreauth.Auth{withOrganization}
+	cache := NewUsageCache(func() []*coreauth.Auth { return auths }, nil)
+	cache.fetch = fetcher.fetch
+	cache.nowFunc = func() time.Time { return now }
+	cache.refresh(now)
+	settle(cache)
+	if reading, ok := cache.QuotaReading(withOrganization); !ok || reading.Weekly == nil || reading.Weekly.Used != 0.4 {
+		t.Fatalf("reading = %+v (%v), want the first lookup's", reading, ok)
+	}
+
+	sameTokens := claudeAccount("x", "a@example.com", "token-1")
+	auths = []*coreauth.Auth{sameTokens}
+	now = testNow.Add(time.Minute)
+	cache.refresh(now)
+	settle(cache)
+	if reading, ok := cache.QuotaReading(sameTokens); !ok || reading.Weekly == nil || reading.Weekly.Used != 0.4 || fetcher.count("x") != 1 {
+		t.Fatalf("same tokens: reading %+v (%v) after %d lookups, want the kept reading", reading, ok, fetcher.count("x"))
+	}
+
+	fetcher.mu.Lock()
+	fetcher.result["x"] = weeklyUsed(70)
+	fetcher.mu.Unlock()
+	otherTokens := claudeAccount("x", "a@example.com", "token-2")
+	auths = []*coreauth.Auth{otherTokens}
+	if reading, ok := cache.QuotaReading(otherTokens); ok {
+		t.Fatalf("the file without its organization read the previous reading %+v", reading)
+	}
+	cache.refresh(now)
+	settle(cache)
+	if reading, ok := cache.QuotaReading(otherTokens); !ok || reading.Weekly == nil || reading.Weekly.Used != 0.7 || fetcher.count("x") != 2 {
+		t.Fatalf("other tokens: reading %+v (%v) after %d lookups, want a new lookup at once", reading, ok, fetcher.count("x"))
+	}
+}
+
 // A lookup of the old account that is still running when the auth file is replaced is
 // cancelled, and its late result is not published over the new account's reading.
 func TestUsageCacheReplacementCancelsTheOldAccountsLookup(t *testing.T) {

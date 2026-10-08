@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -292,6 +293,88 @@ func TestPatchAuthFileFields_ArbitraryFieldsPersistToFile(t *testing.T) {
 	}
 	if got := fgh["ijk"]; got != true {
 		t.Fatalf("fgh.ijk = %#v, want true", got)
+	}
+}
+
+// A field patch edits a clone of the manager's auth, passive quota snapshot included. An
+// edit that may change the account (tokens of another organization, organization_uuid
+// removed, email kept) drops the previous organization's snapshot, also after the watcher
+// reloads the edited file. An edit of other fields keeps it.
+func TestPatchAuthFileFields_QuotaSnapshotFollowsTheEditedAccount(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	observedAt := time.Unix(1_800_000_000, 0)
+	tests := []struct {
+		name     string
+		body     string
+		wantKept bool
+	}{
+		{
+			name: "account edit",
+			body: `{"name":"claude.json","access_token":"access-2","refresh_token":"refresh-2","organization_uuid":null}`,
+		},
+		{name: "prefix edit", body: `{"name":"claude.json","prefix":"team"}`, wantKept: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			manager := coreauth.NewManager(&memoryAuthStore{}, nil, nil)
+			record := &coreauth.Auth{
+				ID:       "claude.json",
+				FileName: "claude.json",
+				Provider: "claude",
+				Status:   coreauth.StatusActive,
+				Metadata: map[string]any{
+					"type": "claude", "access_token": "access-1", "refresh_token": "refresh-1",
+					"organization_uuid": "org-1", "email": "user@example.com",
+				},
+				Quota: coreauth.QuotaState{
+					ObservedAt: observedAt,
+					Signals:    map[string]string{"Anthropic-Ratelimit-Unified-7d-Utilization": "0.90"},
+				},
+			}
+			if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+				t.Fatalf("Register() error = %v", errRegister)
+			}
+			h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+			rec := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(rec)
+			req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			ctx.Request = req
+			h.PatchAuthFileFields(ctx)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d with body %s, want %d", rec.Code, rec.Body.String(), http.StatusOK)
+			}
+
+			expect := func(step string) *coreauth.Auth {
+				t.Helper()
+				current, ok := manager.GetByID("claude.json")
+				if !ok || current == nil {
+					t.Fatalf("%s: auth missing", step)
+				}
+				kept := current.Quota.ObservedAt.Equal(observedAt) && current.Quota.Signals["Anthropic-Ratelimit-Unified-7d-Utilization"] == "0.90"
+				cleared := current.Quota.ObservedAt.IsZero() && len(current.Quota.Signals) == 0
+				if tt.wantKept && !kept {
+					t.Fatalf("%s: quota snapshot = %+v, want it kept", step, current.Quota)
+				}
+				if !tt.wantKept && !cleared {
+					t.Fatalf("%s: quota snapshot = %+v, want cleared", step, current.Quota)
+				}
+				return current
+			}
+			patched := expect("patch")
+
+			// The watcher reloads the edited file, which carries no snapshot.
+			metadata := make(map[string]any, len(patched.Metadata))
+			for key, value := range patched.Metadata {
+				metadata[key] = value
+			}
+			reloaded := &coreauth.Auth{ID: "claude.json", FileName: "claude.json", Provider: "claude", Status: coreauth.StatusActive, Metadata: metadata}
+			if _, errUpdate := manager.Update(context.Background(), reloaded); errUpdate != nil {
+				t.Fatalf("Update() error = %v", errUpdate)
+			}
+			expect("reload")
+		})
 	}
 }
 

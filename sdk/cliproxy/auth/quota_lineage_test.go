@@ -81,7 +81,25 @@ func TestManagerQuotaLineage(t *testing.T) {
 	if _, errRegister := manager.Register(ctx, withTokens(current, "6")); errRegister != nil {
 		t.Fatalf("Register() error = %v", errRegister)
 	}
-	expect("register with other tokens", false)
+	current = expect("register with other tokens", false)
+
+	// A reload that gains identity with the same tokens keeps the lineage.
+	identified := withTokens(current, "6")
+	identified.Metadata["organization_uuid"] = "org-1"
+	identified.Metadata["email"] = "user@example.com"
+	if _, errUpdate := manager.Update(ctx, identified); errUpdate != nil {
+		t.Fatalf("Update() error = %v", errUpdate)
+	}
+	current = expect("replace that gains identity", true)
+
+	// A replace that drops the organization with other tokens may hold another organization
+	// of the same user, though the email matches.
+	dropped := withTokens(current, "7")
+	delete(dropped.Metadata, "organization_uuid")
+	if _, errUpdate := manager.Update(ctx, dropped); errUpdate != nil {
+		t.Fatalf("Update() error = %v", errUpdate)
+	}
+	expect("replace that drops the organization with other tokens", false)
 }
 
 func TestManagerLoadAssignsQuotaLineages(t *testing.T) {
@@ -154,6 +172,41 @@ func TestSameQuotaAccountByLineage(t *testing.T) {
 			existing: claude(7, "1", map[string]any{"organization_uuid": "org-1"}),
 			incoming: claude(8, "2", map[string]any{"organization_uuid": "org-1"}),
 			want:     true,
+		},
+		{
+			name:     "other lineage with a dropped organization and other tokens",
+			existing: claude(7, "1", map[string]any{"organization_uuid": "org-1", "email": "a@example.com"}),
+			incoming: claude(8, "2", map[string]any{"email": "a@example.com"}),
+		},
+		{
+			name:     "other lineage with a dropped organization and unchanged tokens",
+			existing: claude(7, "1", map[string]any{"organization_uuid": "org-1", "email": "a@example.com"}),
+			incoming: claude(8, "1", map[string]any{"email": "a@example.com"}),
+			want:     true,
+		},
+		{
+			name:     "other lineage with a gained organization and other tokens",
+			existing: claude(7, "1", map[string]any{"email": "a@example.com"}),
+			incoming: claude(8, "2", map[string]any{"organization_uuid": "org-1", "email": "a@example.com"}),
+			want:     true,
+		},
+		{
+			name:     "other lineage with a dropped account uuid and other tokens",
+			existing: claude(7, "1", map[string]any{"account_uuid": "acc-1", "email": "a@example.com"}),
+			incoming: claude(8, "2", map[string]any{"email": "a@example.com"}),
+			want:     true,
+		},
+		{
+			// The Manager keeps a lineage across a replace only when the content rule proved it.
+			name:     "same lineage with a dropped organization",
+			existing: claude(7, "1", map[string]any{"organization_uuid": "org-1", "email": "a@example.com"}),
+			incoming: claude(7, "2", map[string]any{"email": "a@example.com"}),
+			want:     true,
+		},
+		{
+			name:     "dropped organization with conflicting email",
+			existing: claude(7, "1", map[string]any{"organization_uuid": "org-1", "email": "a@example.com"}),
+			incoming: claude(7, "1", map[string]any{"email": "b@example.com"}),
 		},
 	}
 	for _, tt := range tests {

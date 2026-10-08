@@ -247,6 +247,10 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 		auth.Quota = mergeQuotaObservation(auth.Quota, existing.Quota)
 		auth.quotaLineage = keptQuotaLineage(existing)
 	} else {
+		// auth may be a clone of existing, with its snapshot, whose account was edited (a
+		// management field patch): that snapshot describes existing's account. Drop it, or
+		// the next reload of the edited file, whose credentials match, would keep it.
+		auth.Quota = withoutQuotaObservation(auth.Quota)
 		auth.quotaLineage = nextQuotaLineage()
 	}
 	cooldownStateChanged := false

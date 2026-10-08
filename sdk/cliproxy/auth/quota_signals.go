@@ -227,6 +227,14 @@ func mergeQuotaObservation(target, source QuotaState) QuotaState {
 	return target
 }
 
+// withoutQuotaObservation returns quota without its observation snapshot. The cooldown
+// fields are kept.
+func withoutQuotaObservation(quota QuotaState) QuotaState {
+	quota.ObservedAt = time.Time{}
+	quota.Signals = nil
+	return quota
+}
+
 // quotaAccountMetadataKeys identify the upstream account a credential draws quota from.
 // Claude quota is per organization, so the organization is compared as well as the account.
 var quotaAccountMetadataKeys = []string{"account_uuid", "organization_uuid", "account_id", "org_id", "user_id", "email"}
@@ -239,8 +247,9 @@ var quotaAccountMetadataKeys = []string{"account_uuid", "organization_uuid", "ac
 //   - sameQuotaAccountByIdentity, which decides from the auths' contents;
 //   - the same quota lineage: since existing was cloned, the Manager changed the auth only
 //     by its own token refreshes and request preparations, and by replaces that
-//     sameQuotaAccountByIdentity proved (see Auth.quotaLineage). Different lineages prove
-//     nothing either way.
+//     sameQuotaAccountByIdentity proved (see Auth.quotaLineage). Only a conflict disproves
+//     it: a replace that dropped an identity key kept the lineage only when that rule
+//     proved the account. Different lineages prove nothing either way.
 func sameQuotaAccount(existing, incoming *Auth) bool {
 	if sameQuotaAccountByIdentity(existing, incoming) {
 		return true
@@ -257,9 +266,9 @@ func sameQuotaAccount(existing, incoming *Auth) bool {
 
 // sameQuotaAccountByIdentity is sameQuotaAccount without the quota lineage: it decides from
 // the auths' contents alone. A token refresh changes the credentials but not the account,
-// so identity metadata decides first (see quotaAccountMetadata). Without proof, the
-// credentials must be present and unchanged, including a Devin session_token, which
-// CredentialsChanged does not compare.
+// so identity metadata decides first (see quotaAccountMetadata). Without proof, including
+// when incoming lacks an identity key that existing has, the credentials must be present
+// and unchanged, including a Devin session_token, which CredentialsChanged does not compare.
 func sameQuotaAccountByIdentity(existing, incoming *Auth) bool {
 	if !sameQuotaProvider(existing, incoming) {
 		return false
@@ -283,17 +292,28 @@ func sameQuotaProvider(existing, incoming *Auth) bool {
 	return strings.EqualFold(strings.TrimSpace(existing.Provider), strings.TrimSpace(incoming.Provider))
 }
 
-// quotaAccountMetadata compares the identity metadata of two auths:
+// quotaAccountMetadata compares the identity metadata of existing with that of incoming,
+// which follows it:
 //   - a key present on both sides with different values is a conflict: another account;
-//   - a key present on one side only is ignored, since it may have been added at runtime
-//     without being persisted (config credentials) or be missing from an older file;
-//   - a matching key other than account_uuid proves the same account. account_uuid alone is
-//     no proof, because it is synthesized from the auth ID when no profile is available.
+//   - a matching key other than account_uuid proves the same account. account_uuid is no
+//     proof, because it is synthesized from the auth ID when no profile is available;
+//   - a proof key (any key but account_uuid) that existing has and incoming lacks voids the
+//     proof, without a conflict: a file that dropped its organization_uuid may now hold
+//     another organization of the same user, whose quota differs. A config credential
+//     loses the identity it gained at runtime on a config reload, but keeps its
+//     credentials, so the unchanged-credentials rule of sameQuotaAccountByIdentity still
+//     proves it;
+//   - a key only incoming has is ignored: an older file gains identity when the proxy fills
+//     it from the profile.
 func quotaAccountMetadata(existing, incoming *Auth) (proven, conflict bool) {
+	dropped := false
 	for _, key := range quotaAccountMetadataKeys {
 		existingValue := authMetadataString(existing, key)
 		incomingValue := authMetadataString(incoming, key)
 		if existingValue == "" || incomingValue == "" {
+			if existingValue != "" && key != "account_uuid" {
+				dropped = true
+			}
 			continue
 		}
 		if !strings.EqualFold(existingValue, incomingValue) {
@@ -303,7 +323,7 @@ func quotaAccountMetadata(existing, incoming *Auth) (proven, conflict bool) {
 			proven = true
 		}
 	}
-	return proven, false
+	return proven && !dropped, false
 }
 
 // quotaLineageCounter issues quota lineages (see Auth.quotaLineage).
