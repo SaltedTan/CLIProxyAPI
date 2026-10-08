@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clientusage"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/synthesizer"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
@@ -73,7 +74,11 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 		selector = &coreauth.FillFirstSelector{}
 	case "quota-aware":
 		// Round-robin rotates equally urgent credentials and pools without quota data.
-		selector = coreauth.NewQuotaAwareSelector(&coreauth.RoundRobinSelector{})
+		quotaAware := coreauth.NewQuotaAwareSelector(&coreauth.RoundRobinSelector{})
+		// The client usage tracker keeps each Claude credential's last weekly reading
+		// across restarts, so credentials are ranked before their next response.
+		quotaAware.SetWeeklyQuotaSource(clientusage.Default().ClaudeWeeklyQuota)
+		selector = quotaAware
 	default:
 		selector = &coreauth.RoundRobinSelector{}
 	}

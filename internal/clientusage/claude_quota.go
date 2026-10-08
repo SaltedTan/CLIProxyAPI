@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
@@ -265,6 +266,22 @@ func (t *Tracker) applyClaudeObservationLocked(authID string, credential *claude
 		credential.ResetAt = observation.resetAt
 	}
 	credential.ObservedAt = now
+}
+
+// ClaudeWeeklyQuota returns the last weekly window reading of a Claude credential by
+// auth ID. The reading is saved with the usage state, so quota-aware routing keeps it
+// across restarts and auth file reloads, which clear the credential's own snapshot.
+func (t *Tracker) ClaudeWeeklyQuota(authID string) (coreauth.WeeklyQuotaReading, bool) {
+	if t == nil {
+		return coreauth.WeeklyQuotaReading{}, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	credential := t.claude[strings.TrimSpace(authID)]
+	if credential == nil || credential.ResetAt.IsZero() {
+		return coreauth.WeeklyQuotaReading{}, false
+	}
+	return coreauth.WeeklyQuotaReading{Used: credential.Utilization, ResetAt: credential.ResetAt, ObservedAt: credential.ObservedAt}, true
 }
 
 func (c *claudeCredential) startEpoch(resetAt, now time.Time) {

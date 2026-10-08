@@ -533,6 +533,13 @@ func TestTrackerPersistsAcrossRestart(t *testing.T) {
 	if errOpen := restarted.Open(path); errOpen != nil {
 		t.Fatalf("reopen: %v", errOpen)
 	}
+	// The credential's weekly reading survives for quota-aware routing.
+	if reading, ok := restarted.ClaudeWeeklyQuota("claude-1"); !ok || reading.Used != 0.10 || !reading.ResetAt.Equal(resetAt) || !reading.ObservedAt.Equal(testNow) {
+		t.Fatalf("weekly reading after restart = %+v (%v)", reading, ok)
+	}
+	if _, ok := restarted.ClaudeWeeklyQuota("claude-2"); ok {
+		t.Fatal("unknown credential must have no weekly reading")
+	}
 	// The window baseline and pending weight survive, so the next increase is attributed.
 	restarted.HandleUsage(context.Background(), claudeRecord("secret-key", "claude-1", testNow.Add(time.Minute), claudeObs{0.20, resetAt}, breakdown(100, 0, 0, 0, 0)))
 	snapshot := restarted.Snapshot(SnapshotOptions{APIKeys: []string{"secret-key"}})

@@ -403,6 +403,48 @@ func TestQuotaAwareSelector_ClaudePlanSetsPlanSize(t *testing.T) {
 	assertPickSequence(t, newTestQuotaAwareSelector(now, nil), cliproxyexecutor.Options{}, []*Auth{enterprise, auths[1]}, "a-enterprise", "a-enterprise")
 }
 
+// After a restart only the credential that served a request has a snapshot. The weekly
+// quota source supplies the others' last readings, so they are ranked instead of probed:
+// Max, with the most quota at risk, keeps new sessions; Team takes over once Max is
+// drained; PLDI, used up, is a last resort. A source reading never replaces a snapshot.
+func TestQuotaAwareSelector_WeeklyQuotaSourceRanksCredentialsWithoutSnapshot(t *testing.T) {
+	t.Parallel()
+	now := quotaAwareTestBase()
+	teamPlan := map[string]any{"organization_type": "claude_team"}
+	maxAuth := claudeQuotaAuth("claude-max", map[string]any{"organization_type": "claude_max", "rate_limit_tier": "default_claude_max_5x"}, now, "0.39", 47*time.Hour)
+	pldi := &Auth{ID: "claude-pldi", Provider: "claude", Status: StatusActive, Metadata: teamPlan}
+	team := &Auth{ID: "claude-team", Provider: "claude", Status: StatusActive, Metadata: teamPlan}
+	auths := []*Auth{maxAuth, pldi, team}
+	readings := map[string]WeeklyQuotaReading{
+		"claude-max":  {Used: 1, ResetAt: now.Add(47 * time.Hour), ObservedAt: now.Add(-3 * time.Hour)},
+		"claude-pldi": {Used: 1, ResetAt: now.Add(68 * time.Hour), ObservedAt: now.Add(-2 * time.Hour)},
+		"claude-team": {Used: 0.55, ResetAt: now.Add(82 * time.Hour), ObservedAt: now.Add(-2 * time.Hour)},
+	}
+	source := func(authID string) (WeeklyQuotaReading, bool) {
+		reading, ok := readings[authID]
+		return reading, ok
+	}
+
+	// Without the source the credentials lacking a snapshot are probed ahead of Max.
+	if got := mustPick(t, newTestQuotaAwareSelector(now, nil), cliproxyexecutor.Options{}, auths); got == maxAuth {
+		t.Fatalf("pick without source = %s, want a probe of a credential without data", got.ID)
+	}
+
+	selector := newTestQuotaAwareSelector(now, nil)
+	selector.SetWeeklyQuotaSource(source)
+	assertPickSequence(t, selector, cliproxyexecutor.Options{}, auths, "claude-max", "claude-max", "claude-max")
+	if len(selector.probedAt) != 0 {
+		t.Fatalf("probedAt = %v, want no probes when the source has every credential", selector.probedAt)
+	}
+
+	drained := claudeQuotaAuth("claude-max", maxAuth.Metadata, now, "0.98", 47*time.Hour)
+	assertPickSequence(t, selector, cliproxyexecutor.Options{}, []*Auth{drained, pldi, team}, "claude-team", "claude-team")
+
+	// A reading whose reset has passed says nothing about the new window: Team is probed.
+	readings["claude-team"] = WeeklyQuotaReading{Used: 0.55, ResetAt: now.Add(-time.Hour), ObservedAt: now.Add(-8 * 24 * time.Hour)}
+	assertPickSequence(t, selector, cliproxyexecutor.Options{}, auths, "claude-team", "claude-max")
+}
+
 func TestQuotaAwarePlanSize(t *testing.T) {
 	t.Parallel()
 	cases := []struct {

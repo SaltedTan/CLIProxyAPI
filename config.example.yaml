@@ -153,11 +153,12 @@ routing:
   # Credentials whose 5h window is at least 85% used (and not resetting within 15 minutes)
   # get no new work unless every credential is in that state. Usage comes from the quota
   # headers of each credential's last upstream response (Claude 5h/7d, Codex 5h/weekly,
-  # Devin daily/weekly). Credentials without that data rank after those with it, but each
-  # still gets one new session every 30 minutes so its quota is observed (for example after
-  # a restart); when no credential has it, selection is round-robin. Cooling-down or
-  # disabled credentials are never chosen. Combine with session-affinity so a conversation
-  # stays on its credential.
+  # Devin daily/weekly). Claude credentials fall back to the last weekly reading saved in
+  # client-usage.json, so they are ranked right after a restart. Credentials without any
+  # data rank after those with it, but each still gets one new session every 30 minutes so
+  # its quota is observed; when no credential has it, selection is round-robin.
+  # Cooling-down or disabled credentials are never chosen. Combine with session-affinity so
+  # a conversation stays on its credential.
   # Usage is a percentage of each plan's own weekly limit, so each credential is scaled by
   # its relative weekly allowance. Claude credentials with a known plan use its approximate
   # allowance in Claude Pro units (Pro 1, Team 1.25, Max 5x 5, Max 20x 10), the same figure
