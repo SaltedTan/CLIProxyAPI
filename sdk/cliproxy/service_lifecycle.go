@@ -99,6 +99,10 @@ func (s *Service) Run(ctx context.Context) error {
 		interval := 15 * time.Minute
 		s.coreManager.StartAutoRefresh(ctx, interval)
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
+		if s.claudeUsage != nil {
+			// Reads the Claude accounts' usage endpoint while routing is quota-aware.
+			go s.claudeUsage.Run(ctx, s.quotaAwareActive)
+		}
 	}
 
 	if !homeEnabled {

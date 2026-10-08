@@ -32,14 +32,14 @@ const (
 	// quotaAwareMinHorizon bounds the required pace for resets that are moments away.
 	quotaAwareMinHorizon = time.Minute
 	// quotaAwareProbeInterval is how often a credential without usable weekly data is sent a
-	// new session while others have data. Quota is only observed from responses, so without
-	// probes such a credential would never be chosen and never report its quota.
+	// new session while others have data. Its quota is then only observed from its responses,
+	// so without probes such a credential would never be chosen and never report its quota.
 	quotaAwareProbeInterval = 30 * time.Minute
 )
 
 // QuotaAwareSelector routes new work by subscription pace. For each eligible credential it
-// reads the passive quota snapshot (Auth.Quota.Signals) and computes how fast the remaining
-// long-lived (weekly) quota must be used to avoid losing it at the reset:
+// reads the quota windows (see below) and computes how fast the remaining long-lived
+// (weekly) quota must be used to avoid losing it at the reset:
 //
 //	required pace = remaining weekly fraction / time until the weekly reset
 //	score         = required pace * plan size
@@ -59,15 +59,19 @@ const (
 //  3. Credentials without usable weekly data come next, then credentials whose weekly quota
 //     is used up or whose plan size is zero; each group is rotated by the fallback selector.
 //
-// The snapshot is cleared by a restart and by an auth file reload that changes the account;
-// other reloads (such as the token refreshes that rewrite the file) keep it. A credential
-// whose snapshot has no usable weekly window uses the reading of the weekly quota source,
-// when one is set (see SetWeeklyQuotaSource), under the same rules.
+// Each of the weekly and short windows comes from the newest usable of several readings:
+// the passive quota snapshot (Auth.Quota.Signals) and the readings of the quota sources
+// (see SetQuotaSources), such as a usage endpoint or a reading saved across restarts.
+// Source readings follow the snapshot's rules; on equal observation times the snapshot
+// wins, then the earlier source. The snapshot is cleared by a restart and by an auth file
+// reload that changes the account; other reloads (such as the token refreshes that rewrite
+// the file) keep it.
 //
-// Because quota is only observed from responses, rule 2 alone would starve a credential that
-// has no data yet (for example after a restart, or once its weekly window rolled over). So
-// while some candidates have weekly data, a positive-size credential without it is probed:
-// it takes precedence over the ranking for one new session per quotaAwareProbeInterval.
+// Rule 2 alone would starve a credential without weekly data from any reading (for example
+// after a restart, or once its weekly window rolled over), since its quota is then only
+// observed from its responses. So while some candidates have weekly data, a positive-size
+// credential without it is probed: it takes precedence over the ranking for one new session
+// per quotaAwareProbeInterval.
 //
 // The selector is stateless with respect to sessions. When session affinity is enabled it
 // runs only for unbound sessions and failover rebinding; established bindings never reach it.
@@ -75,24 +79,42 @@ type QuotaAwareSelector struct {
 	fallback Selector
 	nowFunc  func() time.Time
 
-	mu           sync.Mutex
-	probedAt     map[string]time.Time // last probe time by auth ID
-	weeklySource WeeklyQuotaSource
+	mu       sync.Mutex
+	probedAt map[string]time.Time // last probe time by auth ID
+	sources  []QuotaSource
 }
 
-// WeeklyQuotaReading is the last known weekly window of a credential, kept outside its
-// passive quota snapshot (for example by a usage tracker that saves it across restarts).
-type WeeklyQuotaReading struct {
-	// Used is the fraction of the weekly quota consumed.
+// QuotaWindowReading is one quota window outside the passive snapshot.
+type QuotaWindowReading struct {
+	// Used is the fraction of the window's quota consumed.
 	Used    float64
 	ResetAt time.Time
-	// ObservedAt is when a response last reported the reading.
-	ObservedAt time.Time
 }
 
-// WeeklyQuotaSource returns the last known weekly window of a credential by auth ID.
-// The quota-aware selector calls it without holding manager locks.
-type WeeklyQuotaSource func(authID string) (WeeklyQuotaReading, bool)
+// QuotaReading is a credential's quota windows as known outside its passive quota
+// snapshot, for example from a usage endpoint or a reading saved across restarts.
+type QuotaReading struct {
+	// Weekly is the weekly window; nil when unknown.
+	Weekly *QuotaWindowReading
+	// Short is the 5h window; nil when unknown.
+	Short *QuotaWindowReading
+	// ObservedAt is when the reading was taken.
+	ObservedAt time.Time
+	// Source prefixes the reading's window labels in logs, for example "oauth-usage".
+	Source string
+}
+
+// QuotaSource returns a credential's quota reading. It is called on the selection path
+// without manager locks and must not block on the network. A source keyed by auth ID
+// should check that its reading describes the credential's current upstream account
+// (see SameQuotaAccount).
+type QuotaSource func(auth *Auth) (QuotaReading, bool)
+
+// SameQuotaAccount reports whether incoming draws quota from the same upstream account as
+// existing (see sameQuotaAccount).
+func SameQuotaAccount(existing, incoming *Auth) bool {
+	return sameQuotaAccount(existing, incoming)
+}
 
 // NewQuotaAwareSelector creates a quota-aware selector. A nil fallback defaults to round-robin.
 func NewQuotaAwareSelector(fallback Selector) *QuotaAwareSelector {
@@ -102,24 +124,30 @@ func NewQuotaAwareSelector(fallback Selector) *QuotaAwareSelector {
 	return &QuotaAwareSelector{fallback: fallback}
 }
 
-// SetWeeklyQuotaSource sets where the weekly window of a credential whose quota snapshot
-// has none is read from. Nil disables the fallback.
-func (s *QuotaAwareSelector) SetWeeklyQuotaSource(source WeeklyQuotaSource) {
+// SetQuotaSources sets the readings consulted besides each credential's quota snapshot,
+// replacing earlier ones. Nil sources are ignored.
+func (s *QuotaAwareSelector) SetQuotaSources(sources ...QuotaSource) {
 	if s == nil {
 		return
 	}
+	kept := make([]QuotaSource, 0, len(sources))
+	for _, source := range sources {
+		if source != nil {
+			kept = append(kept, source)
+		}
+	}
 	s.mu.Lock()
-	s.weeklySource = source
+	s.sources = kept
 	s.mu.Unlock()
 }
 
-func (s *QuotaAwareSelector) weeklyQuotaSource() WeeklyQuotaSource {
+func (s *QuotaAwareSelector) quotaSources() []QuotaSource {
 	if s == nil {
 		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.weeklySource
+	return s.sources
 }
 
 func (s *QuotaAwareSelector) now() time.Time {
@@ -138,12 +166,13 @@ func (s *QuotaAwareSelector) fallbackSelector() Selector {
 
 // quotaWindow is one observed quota window of a credential.
 type quotaWindow struct {
-	label   string
-	used    float64 // fraction of the window's quota consumed, clamped to [0, 1]
-	resetAt time.Time
+	label      string
+	used       float64 // fraction of the window's quota consumed, clamped to [0, 1]
+	resetAt    time.Time
+	observedAt time.Time
 }
 
-// quotaUsage is the subscription state read from one credential's quota snapshot.
+// quotaUsage is the subscription state of one credential.
 type quotaUsage struct {
 	long     quotaWindow
 	hasLong  bool
@@ -181,14 +210,12 @@ type quotaAwareDecision struct {
 
 // rankQuotaAware applies the selection rules to available candidates. Input order only
 // matters within the returned group, which keeps the ID-sorted availability order.
-// source, when set, fills in the weekly window of credentials whose snapshot has none.
-func rankQuotaAware(auths []*Auth, now time.Time, source WeeklyQuotaSource) quotaAwareDecision {
+// sources supply readings besides the snapshot; per window the newest usable one wins.
+func rankQuotaAware(auths []*Auth, now time.Time, sources []QuotaSource) quotaAwareDecision {
 	all := make([]quotaAwareCandidate, 0, len(auths))
 	for _, auth := range auths {
 		candidate := quotaAwareCandidate{auth: auth, usage: authQuotaUsage(auth, now)}
-		if !candidate.usage.hasLong {
-			candidate.usage.long, candidate.usage.hasLong = sourcedWeeklyWindow(auth, source, now)
-		}
+		applyQuotaSources(auth, sources, now, &candidate.usage)
 		if candidate.usage.hasLong {
 			candidate.score = candidate.usage.requiredPace(now) * quotaAwarePlanSize(auth)
 		}
@@ -260,7 +287,7 @@ func (s *QuotaAwareSelector) Pick(ctx context.Context, provider, model string, o
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 
-	decision := rankQuotaAware(available, now, s.weeklyQuotaSource())
+	decision := rankQuotaAware(available, now, s.quotaSources())
 	probes := s.dueProbes(decision, now)
 	if len(probes) > 0 {
 		decision.chosen = probes
@@ -437,18 +464,34 @@ func authQuotaUsage(auth *Auth, now time.Time) quotaUsage {
 	return usage
 }
 
-// sourcedWeeklyWindow reads a credential's weekly window from source. The reading must be
-// as usable as a snapshot's: its reset lies in the future and within a week of the
-// response that reported it.
-func sourcedWeeklyWindow(auth *Auth, source WeeklyQuotaSource, now time.Time) (quotaWindow, bool) {
-	if auth == nil || source == nil {
+// applyQuotaSources replaces the weekly and short windows of usage, each on its own, by a
+// usable source reading observed strictly later. Ties keep the window already held, so the
+// snapshot wins over a source and an earlier source over a later one.
+func applyQuotaSources(auth *Auth, sources []QuotaSource, now time.Time, usage *quotaUsage) {
+	if auth == nil {
+		return
+	}
+	for _, source := range sources {
+		reading, ok := source(auth)
+		if !ok {
+			continue
+		}
+		if window, okWindow := sourcedQuotaWindow(reading.Source+"-weekly", reading.Weekly, 7*24*time.Hour, reading.ObservedAt, now); okWindow && (!usage.hasLong || window.observedAt.After(usage.long.observedAt)) {
+			usage.long, usage.hasLong = window, true
+		}
+		if window, okWindow := sourcedQuotaWindow(reading.Source+"-5h", reading.Short, 5*time.Hour, reading.ObservedAt, now); okWindow && (!usage.hasShort || window.observedAt.After(usage.short.observedAt)) {
+			usage.short, usage.hasShort = window, true
+		}
+	}
+}
+
+// sourcedQuotaWindow reads one window of a source reading. It must be as usable as a
+// snapshot's: known usage and a reset in the future, within one window of the reading.
+func sourcedQuotaWindow(label string, reading *QuotaWindowReading, window time.Duration, observedAt, now time.Time) (quotaWindow, bool) {
+	if reading == nil || math.IsNaN(reading.Used) || reading.Used < 0 || !validQuotaWindowReset(reading.ResetAt, window, observedAt, now) {
 		return quotaWindow{}, false
 	}
-	reading, ok := source(auth.ID)
-	if !ok || math.IsNaN(reading.Used) || reading.Used < 0 || !validQuotaWindowReset(reading.ResetAt, 7*24*time.Hour, reading.ObservedAt, now) {
-		return quotaWindow{}, false
-	}
-	return quotaWindow{label: "last-known-weekly", used: math.Min(reading.Used, 1), resetAt: reading.ResetAt}, true
+	return quotaWindow{label: label, used: math.Min(reading.Used, 1), resetAt: reading.ResetAt, observedAt: observedAt}, true
 }
 
 func codexQuotaUsage(signals map[string]string, observedAt, now time.Time, usage *quotaUsage) bool {
@@ -473,10 +516,10 @@ func codexQuotaUsage(signals map[string]string, observedAt, now time.Time, usage
 		label := "codex-" + strings.ToLower(name)
 		if window >= quotaAwareLongWindowMin {
 			if window > longWindow {
-				usage.long, usage.hasLong, longWindow = quotaWindow{label: label, used: used, resetAt: resetAt}, true, window
+				usage.long, usage.hasLong, longWindow = quotaWindow{label: label, used: used, resetAt: resetAt, observedAt: observedAt}, true, window
 			}
 		} else if window > shortWindow {
-			usage.short, usage.hasShort, shortWindow = quotaWindow{label: label, used: used, resetAt: resetAt}, true, window
+			usage.short, usage.hasShort, shortWindow = quotaWindow{label: label, used: used, resetAt: resetAt, observedAt: observedAt}, true, window
 		}
 	}
 	return found
@@ -490,7 +533,7 @@ func observedQuotaWindow(label string, used float64, rawReset string, window tim
 	if !ok || !validQuotaWindowReset(resetAt, window, observedAt, now) {
 		return quotaWindow{}, false
 	}
-	return quotaWindow{label: label, used: used, resetAt: resetAt}, true
+	return quotaWindow{label: label, used: used, resetAt: resetAt, observedAt: observedAt}, true
 }
 
 // claudeUsed returns the Claude window utilization, or -1 when unknown.

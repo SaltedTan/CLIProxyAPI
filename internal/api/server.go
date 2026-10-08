@@ -195,12 +195,16 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 
 		exampleAPIKeySafeModeEnabled: optionState.exampleAPIKeySafeMode,
 	}
-	s.fablePool = keyusage.NewFablePool(func() []*auth.Auth {
-		if s.handlers == nil || s.handlers.AuthManager == nil {
-			return nil
-		}
-		return s.handlers.AuthManager.List()
-	}, s.getConfig)
+	claudeUsage := optionState.claudeUsage
+	if claudeUsage == nil {
+		claudeUsage = keyusage.NewUsageCache(func() []*auth.Auth {
+			if s.handlers == nil || s.handlers.AuthManager == nil {
+				return nil
+			}
+			return s.handlers.AuthManager.List()
+		}, s.getConfig)
+	}
+	s.fablePool = keyusage.NewFablePool(claudeUsage)
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	s.exampleAPIKeySafeModeActive.Store(s.exampleAPIKeySafeModeRequired(cfg))
 	s.handlers.SetPluginHost(optionState.pluginHost)

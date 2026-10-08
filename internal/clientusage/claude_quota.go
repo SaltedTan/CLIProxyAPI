@@ -268,20 +268,24 @@ func (t *Tracker) applyClaudeObservationLocked(authID string, credential *claude
 	credential.ObservedAt = now
 }
 
-// ClaudeWeeklyQuota returns the last weekly window reading of a Claude credential by
-// auth ID. The reading is saved with the usage state, so quota-aware routing keeps it
-// across restarts and auth file reloads, which clear the credential's own snapshot.
-func (t *Tracker) ClaudeWeeklyQuota(authID string) (coreauth.WeeklyQuotaReading, bool) {
-	if t == nil {
-		return coreauth.WeeklyQuotaReading{}, false
+// ClaudeQuota returns the last weekly window reading of a Claude credential, by its
+// auth ID, for quota-aware routing. The reading is saved with the usage state, so it
+// survives restarts, which clear the credential's own quota snapshot.
+func (t *Tracker) ClaudeQuota(auth *coreauth.Auth) (coreauth.QuotaReading, bool) {
+	if t == nil || auth == nil {
+		return coreauth.QuotaReading{}, false
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	credential := t.claude[strings.TrimSpace(authID)]
+	credential := t.claude[strings.TrimSpace(auth.ID)]
 	if credential == nil || credential.ResetAt.IsZero() {
-		return coreauth.WeeklyQuotaReading{}, false
+		return coreauth.QuotaReading{}, false
 	}
-	return coreauth.WeeklyQuotaReading{Used: credential.Utilization, ResetAt: credential.ResetAt, ObservedAt: credential.ObservedAt}, true
+	return coreauth.QuotaReading{
+		Weekly:     &coreauth.QuotaWindowReading{Used: credential.Utilization, ResetAt: credential.ResetAt},
+		ObservedAt: credential.ObservedAt,
+		Source:     "last-known",
+	}, true
 }
 
 func (c *claudeCredential) startEpoch(resetAt, now time.Time) {

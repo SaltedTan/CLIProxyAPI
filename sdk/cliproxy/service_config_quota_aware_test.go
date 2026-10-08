@@ -3,12 +3,15 @@ package cliproxy
 import (
 	"context"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clientusage"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/keyusage"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
@@ -22,8 +25,8 @@ func TestQuotaAwareRoutingSelector(t *testing.T) {
 		if state.strategy != "quota-aware" {
 			t.Fatalf("strategy(%q) = %q, want quota-aware", raw, state.strategy)
 		}
-		if _, ok := newRoutingSelector(state).(*coreauth.QuotaAwareSelector); !ok {
-			t.Fatalf("selector type = %T, want *auth.QuotaAwareSelector", newRoutingSelector(state))
+		if _, ok := newRoutingSelector(state, nil).(*coreauth.QuotaAwareSelector); !ok {
+			t.Fatalf("selector type = %T, want *auth.QuotaAwareSelector", newRoutingSelector(state, nil))
 		}
 	}
 }
@@ -38,9 +41,9 @@ func TestQuotaAwareRoutingSelectorWrappedBySessionAffinity(t *testing.T) {
 			SessionAffinitySubagents: &subagents,
 		},
 	})
-	selector, ok := newRoutingSelector(state).(*coreauth.SessionAffinitySelector)
+	selector, ok := newRoutingSelector(state, nil).(*coreauth.SessionAffinitySelector)
 	if !ok {
-		t.Fatalf("selector type = %T, want *auth.SessionAffinitySelector", newRoutingSelector(state))
+		t.Fatalf("selector type = %T, want *auth.SessionAffinitySelector", newRoutingSelector(state, nil))
 	}
 	defer selector.Stop()
 
@@ -86,9 +89,10 @@ func TestQuotaAwareRoutingSelectorReadsClientUsageWeeklyQuota(t *testing.T) {
 			},
 		})
 	}
+	usageCache := keyusage.NewUsageCache(func() []*coreauth.Auth { return nil }, nil)
 	selector := newRoutingSelector(normalizedRoutingRuntimeState(&internalconfig.Config{
 		Routing: internalconfig.RoutingConfig{Strategy: "quota-aware"},
-	}))
+	}), usageCache)
 	// "a" sorts first, so round-robin over credentials without data would pick it.
 	auths := []*coreauth.Auth{
 		{ID: "qa-tracker-a", Provider: "claude", Status: coreauth.StatusActive},
@@ -101,5 +105,73 @@ func TestQuotaAwareRoutingSelectorReadsClientUsageWeeklyQuota(t *testing.T) {
 			pickedID = picked.ID
 		}
 		t.Fatalf("Pick() = %q, %v; want qa-tracker-b", pickedID, errPick)
+	}
+}
+
+// Quota-aware routing reads the tracker's saved readings first and the usage cache's
+// endpoint readings second, so the saved reading wins a tie.
+func TestQuotaAwareRoutingSourcesTrackerThenUsageCache(t *testing.T) {
+	now := time.Now()
+	clientusage.Default().HandleUsage(context.Background(), usage.Record{
+		Provider:    "claude",
+		AuthID:      "qa-sources-a",
+		RequestedAt: now,
+		ResponseHeaders: http.Header{
+			"Anthropic-Ratelimit-Unified-7d-Utilization": []string{"0.3"},
+			"Anthropic-Ratelimit-Unified-7d-Reset":       []string{strconv.FormatInt(now.Add(50*time.Hour).Unix(), 10)},
+		},
+	})
+
+	if sources := quotaSources(nil); len(sources) != 1 {
+		t.Fatalf("sources without a usage cache = %d, want the tracker only", len(sources))
+	}
+	sources := quotaSources(keyusage.NewUsageCache(func() []*coreauth.Auth { return nil }, nil))
+	if len(sources) != 2 {
+		t.Fatalf("sources = %d, want the tracker and the usage cache", len(sources))
+	}
+	auth := &coreauth.Auth{ID: "qa-sources-a", Provider: "claude"}
+	if reading, ok := sources[0](auth); !ok || reading.Source != "last-known" || reading.Weekly == nil || reading.Weekly.Used != 0.3 {
+		t.Fatalf("first source reading = %+v (%v), want the tracker's", reading, ok)
+	}
+	// The usage cache has not read the account, unlike the tracker.
+	if reading, ok := sources[1](auth); ok {
+		t.Fatalf("second source reading = %+v, want the usage cache's (none)", reading)
+	}
+}
+
+// The service's usage cache lists the service's credentials and runs only while the
+// current config routes with quota-aware.
+func TestBuilderBindsTheClaudeUsageCacheToTheService(t *testing.T) {
+	cfg := &internalconfig.Config{AuthDir: t.TempDir(), Routing: internalconfig.RoutingConfig{Strategy: "quota-aware"}}
+	service, errBuild := NewBuilder().WithConfig(cfg).WithConfigPath(filepath.Join(t.TempDir(), "config.yaml")).Build()
+	if errBuild != nil {
+		t.Fatalf("Build() error = %v", errBuild)
+	}
+	if service.claudeUsage == nil || !service.quotaAwareActive() {
+		t.Fatalf("claudeUsage = %v, quotaAwareActive = %v", service.claudeUsage, service.quotaAwareActive())
+	}
+
+	const authID = "qa-builder-claude"
+	registry.GetGlobalRegistry().RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: "claude-fable-5-1"}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+	// The token has expired, so the summary starts no lookup.
+	expired := &coreauth.Auth{ID: authID, Provider: "claude", Status: coreauth.StatusActive, Metadata: map[string]any{
+		"access_token": "expired-token",
+		"expired":      time.Now().Add(-time.Hour).Format(time.RFC3339),
+	}}
+	if _, errRegister := service.coreManager.Register(coreauth.WithSkipPersist(context.Background()), expired); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	if summary := keyusage.NewFablePool(service.claudeUsage).Summary(context.Background(), 0); !summary.Partial {
+		t.Fatalf("summary = %+v, want the service's unread Claude account counted", summary)
+	}
+
+	roundRobin := *cfg
+	roundRobin.Routing.Strategy = "round-robin"
+	service.cfgMu.Lock()
+	service.cfg = &roundRobin
+	service.cfgMu.Unlock()
+	if service.quotaAwareActive() {
+		t.Fatal("quotaAwareActive() = true under round-robin")
 	}
 }

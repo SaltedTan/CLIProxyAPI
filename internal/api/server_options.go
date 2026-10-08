@@ -7,6 +7,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/keyusage"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
@@ -27,6 +28,7 @@ type serverOptionConfig struct {
 	pluginHost            *pluginhost.Host
 	configReloadHook      func(context.Context, *config.Config)
 	exampleAPIKeySafeMode bool
+	claudeUsage           *keyusage.UsageCache
 }
 
 // ServerOption customises HTTP server construction.
@@ -125,6 +127,14 @@ func WithPluginHost(host *pluginhost.Host) ServerOption {
 func WithConfigReloadHook(hook func(context.Context, *config.Config)) ServerOption {
 	return func(cfg *serverOptionConfig) {
 		cfg.configReloadHook = hook
+	}
+}
+
+// WithClaudeUsage shares a Claude OAuth usage cache with the server, so the key usage
+// Fable figure and quota-aware routing use the same account readings.
+func WithClaudeUsage(cache *keyusage.UsageCache) ServerOption {
+	return func(cfg *serverOptionConfig) {
+		cfg.claudeUsage = cache
 	}
 }
 

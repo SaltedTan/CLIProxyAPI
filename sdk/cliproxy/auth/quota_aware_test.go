@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"math"
 	"net/http"
 	"strconv"
 	"testing"
@@ -403,11 +404,24 @@ func TestQuotaAwareSelector_ClaudePlanSetsPlanSize(t *testing.T) {
 	assertPickSequence(t, newTestQuotaAwareSelector(now, nil), cliproxyexecutor.Options{}, []*Auth{enterprise, auths[1]}, "a-enterprise", "a-enterprise")
 }
 
-// After a restart only the credential that served a request has a snapshot. The weekly
-// quota source supplies the others' last readings, so they are ranked instead of probed:
+// weeklyReading is a source reading with only a weekly window.
+func weeklyReading(source string, used float64, resetAt, observedAt time.Time) QuotaReading {
+	return QuotaReading{Weekly: &QuotaWindowReading{Used: used, ResetAt: resetAt}, ObservedAt: observedAt, Source: source}
+}
+
+// mapQuotaSource serves the readings by auth ID.
+func mapQuotaSource(readings map[string]QuotaReading) QuotaSource {
+	return func(auth *Auth) (QuotaReading, bool) {
+		reading, ok := readings[auth.ID]
+		return reading, ok
+	}
+}
+
+// After a restart only the credential that served a request has a snapshot. The saved
+// readings supply the others' weekly windows, so they are ranked instead of probed:
 // Max, with the most quota at risk, keeps new sessions; Team takes over once Max is
-// drained; PLDI, used up, is a last resort. A source reading never replaces a snapshot.
-func TestQuotaAwareSelector_WeeklyQuotaSourceRanksCredentialsWithoutSnapshot(t *testing.T) {
+// drained; PLDI, used up, is a last resort. An older reading never replaces a snapshot.
+func TestQuotaAwareSelector_QuotaSourceRanksCredentialsWithoutSnapshot(t *testing.T) {
 	t.Parallel()
 	now := quotaAwareTestBase()
 	teamPlan := map[string]any{"organization_type": "claude_team"}
@@ -415,14 +429,10 @@ func TestQuotaAwareSelector_WeeklyQuotaSourceRanksCredentialsWithoutSnapshot(t *
 	pldi := &Auth{ID: "claude-pldi", Provider: "claude", Status: StatusActive, Metadata: teamPlan}
 	team := &Auth{ID: "claude-team", Provider: "claude", Status: StatusActive, Metadata: teamPlan}
 	auths := []*Auth{maxAuth, pldi, team}
-	readings := map[string]WeeklyQuotaReading{
-		"claude-max":  {Used: 1, ResetAt: now.Add(47 * time.Hour), ObservedAt: now.Add(-3 * time.Hour)},
-		"claude-pldi": {Used: 1, ResetAt: now.Add(68 * time.Hour), ObservedAt: now.Add(-2 * time.Hour)},
-		"claude-team": {Used: 0.55, ResetAt: now.Add(82 * time.Hour), ObservedAt: now.Add(-2 * time.Hour)},
-	}
-	source := func(authID string) (WeeklyQuotaReading, bool) {
-		reading, ok := readings[authID]
-		return reading, ok
+	readings := map[string]QuotaReading{
+		"claude-max":  weeklyReading("last-known", 1, now.Add(47*time.Hour), now.Add(-3*time.Hour)),
+		"claude-pldi": weeklyReading("last-known", 1, now.Add(68*time.Hour), now.Add(-2*time.Hour)),
+		"claude-team": weeklyReading("last-known", 0.55, now.Add(82*time.Hour), now.Add(-2*time.Hour)),
 	}
 
 	// Without the source the credentials lacking a snapshot are probed ahead of Max.
@@ -431,7 +441,7 @@ func TestQuotaAwareSelector_WeeklyQuotaSourceRanksCredentialsWithoutSnapshot(t *
 	}
 
 	selector := newTestQuotaAwareSelector(now, nil)
-	selector.SetWeeklyQuotaSource(source)
+	selector.SetQuotaSources(nil, mapQuotaSource(readings))
 	assertPickSequence(t, selector, cliproxyexecutor.Options{}, auths, "claude-max", "claude-max", "claude-max")
 	if len(selector.probedAt) != 0 {
 		t.Fatalf("probedAt = %v, want no probes when the source has every credential", selector.probedAt)
@@ -441,8 +451,207 @@ func TestQuotaAwareSelector_WeeklyQuotaSourceRanksCredentialsWithoutSnapshot(t *
 	assertPickSequence(t, selector, cliproxyexecutor.Options{}, []*Auth{drained, pldi, team}, "claude-team", "claude-team")
 
 	// A reading whose reset has passed says nothing about the new window: Team is probed.
-	readings["claude-team"] = WeeklyQuotaReading{Used: 0.55, ResetAt: now.Add(-time.Hour), ObservedAt: now.Add(-8 * 24 * time.Hour)}
+	readings["claude-team"] = weeklyReading("last-known", 0.55, now.Add(-time.Hour), now.Add(-8*24*time.Hour))
 	assertPickSequence(t, selector, cliproxyexecutor.Options{}, auths, "claude-team", "claude-max")
+}
+
+// claudeSnapshotAuth builds a Claude credential whose snapshot, observed at observedAt,
+// reports the given weekly and 5h usage fractions; an empty usage omits the window.
+func claudeSnapshotAuth(id string, now, observedAt time.Time, weeklyUsed string, weeklyResetIn time.Duration, shortUsed string, shortResetIn time.Duration) *Auth {
+	signals := map[string]string{}
+	if weeklyUsed != "" {
+		signals["Anthropic-Ratelimit-Unified-7d-Utilization"] = weeklyUsed
+		signals["Anthropic-Ratelimit-Unified-7d-Reset"] = strconv.FormatInt(now.Add(weeklyResetIn).Unix(), 10)
+	}
+	if shortUsed != "" {
+		signals["Anthropic-Ratelimit-Unified-5h-Utilization"] = shortUsed
+		signals["Anthropic-Ratelimit-Unified-5h-Reset"] = strconv.FormatInt(now.Add(shortResetIn).Unix(), 10)
+	}
+	return &Auth{ID: id, Provider: "claude", Status: StatusActive, Quota: QuotaState{ObservedAt: observedAt, Signals: signals}}
+}
+
+// Each window is taken from the newest usable reading among the snapshot, the endpoint
+// reading and the saved reading, independently of the other window.
+func TestApplyQuotaSources_NewestReadingWinsPerWindow(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	at := func(minutesAgo int) time.Time { return now.Add(-time.Duration(minutesAgo) * time.Minute) }
+	endpoint := func(observedAt time.Time) QuotaReading {
+		return QuotaReading{
+			Weekly:     &QuotaWindowReading{Used: 0.6, ResetAt: now.Add(50 * time.Hour)},
+			Short:      &QuotaWindowReading{Used: 0.3, ResetAt: now.Add(2 * time.Hour)},
+			ObservedAt: observedAt,
+			Source:     "oauth-usage",
+		}
+	}
+	saved := func(observedAt time.Time) QuotaReading {
+		return weeklyReading("last-known", 0.7, now.Add(50*time.Hour), observedAt)
+	}
+	tests := []struct {
+		name       string
+		snapshotAt time.Time // zero: no snapshot
+		endpoint   *QuotaReading
+		saved      *QuotaReading
+		long       string
+		longUsed   float64
+		short      string
+		shortUsed  float64
+	}{
+		{name: "snapshot only", snapshotAt: at(10), long: "claude-7d", longUsed: 0.5, short: "claude-5h", shortUsed: 0.2},
+		{name: "newer endpoint replaces both windows", snapshotAt: at(10), endpoint: ptr(endpoint(at(5))), long: "oauth-usage-weekly", longUsed: 0.6, short: "oauth-usage-5h", shortUsed: 0.3},
+		{name: "newest per window", snapshotAt: at(10), endpoint: ptr(endpoint(at(5))), saved: ptr(saved(at(1))), long: "last-known-weekly", longUsed: 0.7, short: "oauth-usage-5h", shortUsed: 0.3},
+		{name: "older endpoint loses to a newer snapshot", snapshotAt: at(5), endpoint: ptr(endpoint(at(10))), saved: ptr(saved(at(20))), long: "claude-7d", longUsed: 0.5, short: "claude-5h", shortUsed: 0.2},
+		{name: "tie keeps the snapshot", snapshotAt: at(10), endpoint: ptr(endpoint(at(10))), saved: ptr(saved(at(10))), long: "claude-7d", longUsed: 0.5, short: "claude-5h", shortUsed: 0.2},
+		{name: "tie between sources keeps the earlier source", endpoint: ptr(endpoint(at(5))), saved: ptr(saved(at(5))), long: "last-known-weekly", longUsed: 0.7, short: "oauth-usage-5h", shortUsed: 0.3},
+		{name: "saved older than endpoint without snapshot", endpoint: ptr(endpoint(at(5))), saved: ptr(saved(at(30))), long: "oauth-usage-weekly", longUsed: 0.6, short: "oauth-usage-5h", shortUsed: 0.3},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			auth := &Auth{ID: "a", Provider: "claude", Status: StatusActive}
+			if !tc.snapshotAt.IsZero() {
+				auth = claudeSnapshotAuth("a", now, tc.snapshotAt, "0.5", 50*time.Hour, "0.2", 2*time.Hour)
+			}
+			// The service installs the saved readings before the endpoint readings.
+			var sources []QuotaSource
+			for _, reading := range []*QuotaReading{tc.saved, tc.endpoint} {
+				if reading != nil {
+					sources = append(sources, mapQuotaSource(map[string]QuotaReading{"a": *reading}))
+				}
+			}
+			usage := authQuotaUsage(auth, now)
+			applyQuotaSources(auth, sources, now, &usage)
+			if !usage.hasLong || usage.long.label != tc.long || math.Abs(usage.long.used-tc.longUsed) > 1e-9 {
+				t.Fatalf("long = %+v (%v), want %s at %v", usage.long, usage.hasLong, tc.long, tc.longUsed)
+			}
+			if !usage.hasShort || usage.short.label != tc.short || math.Abs(usage.short.used-tc.shortUsed) > 1e-9 {
+				t.Fatalf("short = %+v (%v), want %s at %v", usage.short, usage.hasShort, tc.short, tc.shortUsed)
+			}
+		})
+	}
+
+	// A newer saved reading without a short window fills in the snapshot's missing weekly
+	// window and leaves its short window alone.
+	auth := claudeSnapshotAuth("a", now, at(10), "", 0, "0.2", 2*time.Hour)
+	usage := authQuotaUsage(auth, now)
+	applyQuotaSources(auth, []QuotaSource{mapQuotaSource(map[string]QuotaReading{"a": saved(at(1))})}, now, &usage)
+	if usage.long.label != "last-known-weekly" || usage.short.label != "claude-5h" {
+		t.Fatalf("usage = %+v, want the saved weekly and the snapshot 5h window", usage)
+	}
+}
+
+func ptr[T any](value T) *T {
+	return &value
+}
+
+func TestApplyQuotaSources_IgnoresUnusableWindows(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	observedAt := now.Add(-time.Minute)
+	tests := []struct {
+		name   string
+		window QuotaWindowReading
+		length time.Duration
+	}{
+		{name: "NaN usage", window: QuotaWindowReading{Used: math.NaN(), ResetAt: now.Add(time.Hour)}},
+		{name: "negative usage", window: QuotaWindowReading{Used: -0.1, ResetAt: now.Add(time.Hour)}},
+		{name: "elapsed reset", window: QuotaWindowReading{Used: 0.4, ResetAt: now.Add(-time.Minute)}},
+		{name: "no reset", window: QuotaWindowReading{Used: 0.4}},
+		{name: "weekly reset beyond window and slack", window: QuotaWindowReading{Used: 0.4, ResetAt: observedAt.Add(7*24*time.Hour + quotaAwareWindowSlack + time.Minute)}, length: 7 * 24 * time.Hour},
+		{name: "5h reset beyond window and slack", window: QuotaWindowReading{Used: 0.4, ResetAt: observedAt.Add(5*time.Hour + quotaAwareWindowSlack + time.Minute)}, length: 5 * time.Hour},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			window := tc.window
+			reading := QuotaReading{ObservedAt: observedAt, Source: "oauth-usage"}
+			if tc.length != 5*time.Hour {
+				reading.Weekly = &window
+			}
+			if tc.length != 7*24*time.Hour {
+				reading.Short = &window
+			}
+			source := mapQuotaSource(map[string]QuotaReading{"a": reading})
+
+			bare := &Auth{ID: "a", Provider: "claude", Status: StatusActive}
+			usage := authQuotaUsage(bare, now)
+			applyQuotaSources(bare, []QuotaSource{source}, now, &usage)
+			if usage.hasLong || usage.hasShort {
+				t.Fatalf("usage = %+v, want the unusable windows ignored", usage)
+			}
+
+			snapshot := claudeSnapshotAuth("a", now, now.Add(-time.Hour), "0.5", 50*time.Hour, "0.2", 2*time.Hour)
+			usage = authQuotaUsage(snapshot, now)
+			applyQuotaSources(snapshot, []QuotaSource{source}, now, &usage)
+			if usage.long.label != "claude-7d" || usage.short.label != "claude-5h" {
+				t.Fatalf("usage = %+v, want the older snapshot kept", usage)
+			}
+		})
+	}
+
+	// A usable reading is accepted, with overdrawn usage clamped.
+	reading := QuotaReading{Short: &QuotaWindowReading{Used: 1.3, ResetAt: now.Add(time.Hour)}, ObservedAt: observedAt, Source: "oauth-usage"}
+	auth := &Auth{ID: "a", Provider: "claude", Status: StatusActive}
+	usage := authQuotaUsage(auth, now)
+	applyQuotaSources(auth, []QuotaSource{mapQuotaSource(map[string]QuotaReading{"a": reading})}, now, &usage)
+	if !usage.hasShort || usage.short.used != 1 || usage.hasLong {
+		t.Fatalf("usage = %+v, want a clamped 5h window only", usage)
+	}
+}
+
+// An endpoint 5h reading saturates a credential whose snapshot has no 5h window, so it
+// gets no new session; an endpoint reading older than the snapshot does not.
+func TestQuotaAwareSelector_EndpointShortWindowSaturationSkipsCredential(t *testing.T) {
+	t.Parallel()
+	now := quotaAwareTestBase()
+	urgent := claudeSnapshotAuth("a-urgent", now, now, "0.3", 10*time.Hour, "", 0)
+	relaxed := claudeSnapshotAuth("b-relaxed", now, now, "0.3", 100*time.Hour, "", 0)
+	auths := []*Auth{urgent, relaxed}
+	assertPickSequence(t, newTestQuotaAwareSelector(now, nil), cliproxyexecutor.Options{}, auths, "a-urgent", "a-urgent")
+
+	readings := map[string]QuotaReading{
+		"a-urgent": {Short: &QuotaWindowReading{Used: 0.9, ResetAt: now.Add(2 * time.Hour)}, ObservedAt: now.Add(-time.Minute), Source: "oauth-usage"},
+	}
+	selector := newTestQuotaAwareSelector(now, nil)
+	selector.SetQuotaSources(mapQuotaSource(readings))
+	assertPickSequence(t, selector, cliproxyexecutor.Options{}, auths, "b-relaxed", "b-relaxed")
+
+	// A response since then reported the 5h window as lightly used.
+	fresh := claudeSnapshotAuth("a-urgent", now, now, "0.3", 10*time.Hour, "0.1", 2*time.Hour)
+	assertPickSequence(t, selector, cliproxyexecutor.Options{}, []*Auth{fresh, relaxed}, "a-urgent", "a-urgent")
+}
+
+// A Claude credential with only an endpoint weekly reading has weekly data: it is ranked
+// by it and never probed.
+func TestQuotaAwareSelector_EndpointWeeklyReadingIsRankedNotProbed(t *testing.T) {
+	t.Parallel()
+	now := quotaAwareTestBase()
+	unread := &Auth{ID: "a-unread", Provider: "claude", Status: StatusActive}
+	urgent := claudeSnapshotAuth("b-urgent", now, now, "0.3", 10*time.Hour, "0.1", 2*time.Hour)
+	auths := []*Auth{unread, urgent}
+
+	// Without the reading the credential is probed ahead of the ranking.
+	assertPickSequence(t, newTestQuotaAwareSelector(now, nil), cliproxyexecutor.Options{}, auths, "a-unread", "b-urgent")
+
+	readings := map[string]QuotaReading{
+		"a-unread": {
+			Weekly:     &QuotaWindowReading{Used: 0.9, ResetAt: now.Add(100 * time.Hour)},
+			ObservedAt: now.Add(-2 * time.Minute),
+			Source:     "oauth-usage",
+		},
+	}
+	selector := newTestQuotaAwareSelector(now, nil)
+	selector.SetQuotaSources(mapQuotaSource(readings))
+	assertPickSequence(t, selector, cliproxyexecutor.Options{}, auths, "b-urgent", "b-urgent", "b-urgent")
+	if len(selector.probedAt) != 0 {
+		t.Fatalf("probedAt = %v, want no probe of a credential with an endpoint reading", selector.probedAt)
+	}
+
+	// Once it is the most urgent, it takes the new sessions.
+	readings["a-unread"] = QuotaReading{
+		Weekly:     &QuotaWindowReading{Used: 0.1, ResetAt: now.Add(5 * time.Hour)},
+		ObservedAt: now.Add(-time.Minute),
+		Source:     "oauth-usage",
+	}
+	assertPickSequence(t, selector, cliproxyexecutor.Options{}, auths, "a-unread", "a-unread")
 }
 
 func TestQuotaAwarePlanSize(t *testing.T) {

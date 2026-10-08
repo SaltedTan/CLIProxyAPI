@@ -534,10 +534,14 @@ func TestTrackerPersistsAcrossRestart(t *testing.T) {
 		t.Fatalf("reopen: %v", errOpen)
 	}
 	// The credential's weekly reading survives for quota-aware routing.
-	if reading, ok := restarted.ClaudeWeeklyQuota("claude-1"); !ok || reading.Used != 0.10 || !reading.ResetAt.Equal(resetAt) || !reading.ObservedAt.Equal(testNow) {
+	if reading, ok := restarted.ClaudeQuota(&coreauth.Auth{ID: "claude-1"}); !ok || reading.Weekly == nil || reading.Weekly.Used != 0.10 || !reading.Weekly.ResetAt.Equal(resetAt) ||
+		reading.Short != nil || !reading.ObservedAt.Equal(testNow) || reading.Source != "last-known" {
 		t.Fatalf("weekly reading after restart = %+v (%v)", reading, ok)
 	}
-	if _, ok := restarted.ClaudeWeeklyQuota("claude-2"); ok {
+	if _, ok := restarted.ClaudeQuota(nil); ok {
+		t.Fatal("a nil credential must have no weekly reading")
+	}
+	if _, ok := restarted.ClaudeQuota(&coreauth.Auth{ID: "claude-2"}); ok {
 		t.Fatal("unknown credential must have no weekly reading")
 	}
 	// The window baseline and pending weight survive, so the next increase is attributed.

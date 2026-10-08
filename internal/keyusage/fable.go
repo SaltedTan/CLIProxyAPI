@@ -2,29 +2,20 @@ package keyusage
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"io"
 	"math"
-	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clientusage"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
-	log "github.com/sirupsen/logrus"
 )
 
 // Anthropic reports the weekly Fable allowance of a Claude account only through the
-// account's OAuth usage endpoint, never in response headers the proxy sees. The
-// pool reads that endpoint for every enabled Claude OAuth account that serves a
-// Fable model, at most once per refreshAfter per account and never on the request
-// path: readers get the cached figures, and a stale figure triggers a background
-// refresh.
+// account's OAuth usage endpoint, never in response headers the proxy sees. The pool
+// reads it from the usage cache for every enabled Claude OAuth account that serves a
+// Fable model: readers get the cached figures, and a stale figure triggers a
+// background refresh.
 //
 // Accounts are combined in Claude Pro units. Each account's Fable percentage is of
 // its own plan's Fable allowance, so percentages are weighted by the plan's weekly
@@ -34,23 +25,8 @@ import (
 // An account whose overall weekly window is used up cannot serve Fable until that
 // window resets, so none of its Fable counts as left until then.
 
-// usageURL is Anthropic's OAuth usage endpoint. It is a variable only so that
-// end-to-end test builds can point it at a local server with -ldflags -X.
-var usageURL = "https://api.anthropic.com/api/oauth/usage"
-
-const (
-	usageBeta   = "oauth-2025-04-20"
-	usageAgent  = "claude-cli/2.1.280 (external, cli)"
-	maxBodySize = 1 << 20
-
-	// refreshAfter is how long a reading is reused, and the least time between two
-	// lookups of one account whether or not the previous one succeeded.
-	refreshAfter = 5 * time.Minute
-	// maxReadingAge is how long a reading still counts while refreshes fail.
-	maxReadingAge = time.Hour
-	// resetGroup merges accounts whose windows reset within it into one top-up.
-	resetGroup = time.Minute
-)
+// resetGroup merges accounts whose windows reset within it into one top-up.
+const resetGroup = time.Minute
 
 // FableSummary is the Fable allowance left across the accounts that serve Fable, as
 // one figure. It names no account.
@@ -71,70 +47,22 @@ type FableSummary struct {
 	Partial bool `json:"partial"`
 }
 
-// fableReading is one account's Fable window as last read.
-type fableReading struct {
-	at       time.Time
-	hasFable bool
-	// used is the percentage of the account's Fable allowance used, 0 to 100.
-	used    float64
-	resetAt time.Time
-	// weeklyUsed and weeklyResetAt describe the account's overall weekly window.
-	weeklyUsed    float64
-	weeklyResetAt time.Time
-}
-
-// fableEnded reports whether the reading's Fable window has reset since it was read.
-func (r fableReading) fableEnded(now time.Time) bool {
-	return r.hasFable && !r.resetAt.IsZero() && !r.resetAt.After(now)
-}
-
-// weeklyBlocked reports whether the account's overall weekly window is used up,
-// which stops the account serving Fable until that window resets.
-func (r fableReading) weeklyBlocked(now time.Time) bool {
-	return r.weeklyUsed >= 100 && (r.weeklyResetAt.IsZero() || r.weeklyResetAt.After(now))
-}
-
-// FablePool caches the Fable windows of the Claude accounts. The zero value is not
+// FablePool combines the Fable windows of the Claude accounts. The zero value is not
 // usable; create pools with NewFablePool.
 type FablePool struct {
-	mu       sync.Mutex
-	readings map[string]fableReading
-	tried    map[string]time.Time
-	inflight map[string]*lookup
-
-	list        func() []*coreauth.Auth
+	cache       *UsageCache
 	servesFable func(authID string) bool
-	fetch       func(ctx context.Context, auth *coreauth.Auth) (fableReading, error)
 	weight      func(auth *coreauth.Auth) float64
-	nowFunc     func() time.Time
 }
 
-// lookup is a running lookup of one account.
-type lookup struct {
-	done   chan struct{}
-	cancel context.CancelFunc
-}
-
-// NewFablePool creates a pool over the accounts list returns. cfg supplies the
-// global proxy for lookups.
-func NewFablePool(list func() []*coreauth.Auth, cfg func() *config.Config) *FablePool {
+// NewFablePool creates a pool over the accounts of cache.
+func NewFablePool(cache *UsageCache) *FablePool {
 	return &FablePool{
-		readings:    make(map[string]fableReading),
-		tried:       make(map[string]time.Time),
-		inflight:    make(map[string]*lookup),
-		list:        list,
+		cache:       cache,
 		servesFable: registryServesFable,
-		fetch: func(ctx context.Context, auth *coreauth.Auth) (fableReading, error) {
-			var current *config.Config
-			if cfg != nil {
-				current = cfg()
-			}
-			return fetchFableReading(ctx, helps.NewUtlsHTTPClient(ctx, current, auth, 0), usageURL, auth)
-		},
 		weight: func(auth *coreauth.Auth) float64 {
 			return clientusage.CredentialInfoFromAuth(auth).PlanProUnits
 		},
-		nowFunc: time.Now,
 	}
 }
 
@@ -144,119 +72,55 @@ func NewFablePool(list func() []*coreauth.Auth, cfg func() *config.Config) *Fabl
 // a lookup that hangs delays the first readers rather than every reader. The lookups
 // themselves continue after Summary returns.
 func (p *FablePool) Summary(ctx context.Context, wait time.Duration) FableSummary {
-	if p == nil || p.list == nil {
+	if p == nil || p.cache == nil || p.cache.list == nil {
 		return FableSummary{}
 	}
-	accounts := p.accounts()
-	now := p.nowFunc()
+	c := p.cache
+	all := c.accounts()
+	accounts := make([]*coreauth.Auth, 0, len(all))
+	for _, auth := range all {
+		if p.servesFable == nil || p.servesFable(auth.ID) {
+			accounts = append(accounts, auth)
+		}
+	}
+	now := c.nowFunc()
 
-	p.mu.Lock()
-	known := make(map[string]struct{}, len(accounts))
+	c.mu.Lock()
+	c.reconcileLocked(all)
 	var pending []chan struct{}
 	var waitUntil time.Time
 	for _, auth := range accounts {
-		known[auth.ID] = struct{}{}
-		reading, ok := p.readings[auth.ID]
+		reading, ok := c.readings[auth.ID]
 		if ok && now.Sub(reading.at) < refreshAfter {
 			continue
 		}
-		done := p.refreshLocked(auth, now)
+		done := c.refreshLocked(auth, now)
 		if done == nil || ok {
 			continue
 		}
-		if until := p.tried[auth.ID].Add(wait); until.After(now) {
+		if until := c.tried[auth.ID].Add(wait); until.After(now) {
 			pending = append(pending, done)
 			if until.After(waitUntil) {
 				waitUntil = until
 			}
 		}
 	}
-	// Every reading and lookup has a tried entry.
-	for id := range p.tried {
-		if _, ok := known[id]; ok {
-			continue
-		}
-		if running, ok := p.inflight[id]; ok {
-			running.cancel()
-			delete(p.inflight, id)
-		}
-		delete(p.readings, id)
-		delete(p.tried, id)
-	}
-	p.mu.Unlock()
+	c.mu.Unlock()
 
 	if len(pending) > 0 {
 		waitAll(ctx, pending, waitUntil.Sub(now))
 	}
 
-	p.mu.Lock()
+	c.mu.Lock()
 	states := make([]fableAccount, 0, len(accounts))
 	for _, auth := range accounts {
-		reading, ok := p.readings[auth.ID]
-		states = append(states, fableAccount{
-			units:   p.weight(auth),
-			reading: reading,
-			ok:      ok && now.Sub(reading.at) <= maxReadingAge,
-		})
+		reading, ok := c.readings[auth.ID]
+		// A reading of another account that had the same auth ID counts as missing.
+		ok = ok && coreauth.SameQuotaAccount(reading.auth, auth) && now.Sub(reading.at) <= maxReadingAge
+		states = append(states, fableAccount{units: p.weight(auth), reading: reading, ok: ok})
 	}
-	p.mu.Unlock()
-	return combineFable(p.nowFunc(), states)
-}
-
-// accounts lists the enabled Claude OAuth accounts that serve a Fable model.
-func (p *FablePool) accounts() []*coreauth.Auth {
-	var out []*coreauth.Auth
-	for _, auth := range p.list() {
-		if auth == nil || auth.Disabled || auth.Status == coreauth.StatusDisabled {
-			continue
-		}
-		if !strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") || oauthToken(auth) == "" {
-			continue
-		}
-		if p.servesFable != nil && !p.servesFable(auth.ID) {
-			continue
-		}
-		out = append(out, auth)
-	}
-	return out
-}
-
-// refreshLocked starts a lookup of the account unless one is running or one started
-// within refreshAfter. It returns the running lookup's done channel, or nil. p.mu
-// must be held.
-func (p *FablePool) refreshLocked(auth *coreauth.Auth, now time.Time) chan struct{} {
-	if running, ok := p.inflight[auth.ID]; ok {
-		return running.done
-	}
-	if last, ok := p.tried[auth.ID]; ok && now.Sub(last) < refreshAfter {
-		return nil
-	}
-	// The lookup is not tied to the reader's request: it fills the cache for the
-	// next reader too. It has no deadline, like other upstream calls, and is
-	// cancelled only when the account leaves the pool.
-	ctx, cancel := context.WithCancel(context.Background())
-	running := &lookup{done: make(chan struct{}), cancel: cancel}
-	p.inflight[auth.ID] = running
-	p.tried[auth.ID] = now
-	go func() {
-		defer close(running.done)
-		defer cancel()
-		reading, errFetch := p.fetch(ctx, auth)
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		if p.inflight[auth.ID] != running {
-			// The account left the pool during the lookup.
-			return
-		}
-		delete(p.inflight, auth.ID)
-		if errFetch != nil {
-			log.Debugf("key usage: Fable lookup failed for credential %s: %v", auth.ID, errFetch)
-			return
-		}
-		reading.at = p.nowFunc()
-		p.readings[auth.ID] = reading
-	}()
-	return running.done
+	c.mu.Unlock()
+	return combineFable(c.nowFunc(), states)
 }
 
 func waitAll(ctx context.Context, pending []chan struct{}, wait time.Duration) {
@@ -280,7 +144,7 @@ func waitAll(ctx context.Context, pending []chan struct{}, wait time.Duration) {
 // when it has no usable reading.
 type fableAccount struct {
 	units   float64
-	reading fableReading
+	reading usageReading
 	ok      bool
 }
 
@@ -302,10 +166,10 @@ func combineFable(now time.Time, accounts []fableAccount) FableSummary {
 			continue
 		}
 		reading := account.reading
-		if !reading.hasFable || account.units <= 0 {
+		if !reading.fable.ok || account.units <= 0 {
 			continue
 		}
-		share := math.Min(math.Max(reading.used, 0), 100) / 100
+		share := math.Min(math.Max(reading.fable.used, 0), 100) / 100
 		if reading.fableEnded(now) {
 			// Anthropic restarted the window empty.
 			share = 0
@@ -316,24 +180,24 @@ func combineFable(now time.Time, accounts []fableAccount) FableSummary {
 		}
 		if !reading.weeklyBlocked(now) {
 			remaining += account.units * (1 - share)
-			if share > 0 && !reading.resetAt.IsZero() {
-				topUps = append(topUps, topUp{at: reading.resetAt, units: account.units * share})
+			if share > 0 && !reading.fable.resetAt.IsZero() {
+				topUps = append(topUps, topUp{at: reading.fable.resetAt, units: account.units * share})
 			}
 			continue
 		}
 		// None of the account's Fable is usable before its weekly window resets.
-		if reading.weeklyResetAt.IsZero() {
+		if reading.weekly.resetAt.IsZero() {
 			continue
 		}
-		if share > 0 && (reading.resetAt.IsZero() || reading.resetAt.After(reading.weeklyResetAt)) {
-			topUps = append(topUps, topUp{at: reading.weeklyResetAt, units: account.units * (1 - share)})
-			if !reading.resetAt.IsZero() {
-				topUps = append(topUps, topUp{at: reading.resetAt, units: account.units * share})
+		if share > 0 && (reading.fable.resetAt.IsZero() || reading.fable.resetAt.After(reading.weekly.resetAt)) {
+			topUps = append(topUps, topUp{at: reading.weekly.resetAt, units: account.units * (1 - share)})
+			if !reading.fable.resetAt.IsZero() {
+				topUps = append(topUps, topUp{at: reading.fable.resetAt, units: account.units * share})
 			}
 			continue
 		}
 		// The Fable window has reset by then too.
-		topUps = append(topUps, topUp{at: reading.weeklyResetAt, units: account.units})
+		topUps = append(topUps, topUp{at: reading.weekly.resetAt, units: account.units})
 	}
 	if capacity <= 0 {
 		return summary
@@ -383,109 +247,4 @@ func isFableModel(model *registry.ModelInfo) bool {
 		id = model.ID
 	}
 	return strings.Contains(strings.ToLower(id), "fable")
-}
-
-// oauthToken returns the OAuth access token of a Claude account, or "" for API key
-// credentials, which have no usage endpoint.
-func oauthToken(auth *coreauth.Auth) string {
-	if auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != "" {
-		return ""
-	}
-	token, _ := auth.Metadata["access_token"].(string)
-	return strings.TrimSpace(token)
-}
-
-func fetchFableReading(ctx context.Context, client *http.Client, url string, auth *coreauth.Auth) (fableReading, error) {
-	req, errRequest := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if errRequest != nil {
-		return fableReading{}, fmt.Errorf("build usage request: %w", errRequest)
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+oauthToken(auth))
-	req.Header.Set("Anthropic-Beta", usageBeta)
-	req.Header.Set("User-Agent", usageAgent)
-	resp, errDo := client.Do(req)
-	if errDo != nil {
-		return fableReading{}, fmt.Errorf("usage request: %w", errDo)
-	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("key usage: close usage response: %v", errClose)
-		}
-	}()
-	body, errRead := io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
-	if errRead != nil {
-		return fableReading{}, fmt.Errorf("read usage response: %w", errRead)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return fableReading{}, fmt.Errorf("usage request returned status %d", resp.StatusCode)
-	}
-	return parseFableReading(body)
-}
-
-type usageWindow struct {
-	Utilization *float64 `json:"utilization"`
-	ResetsAt    string   `json:"resets_at"`
-}
-
-type usagePayload struct {
-	Weekly *usageWindow `json:"seven_day"`
-	Legacy *usageWindow `json:"iguana_necktie"`
-	Limits []struct {
-		Kind     string   `json:"kind"`
-		Percent  *float64 `json:"percent"`
-		ResetsAt string   `json:"resets_at"`
-		IsActive bool     `json:"is_active"`
-		Scope    *struct {
-			Model *struct {
-				DisplayName string `json:"display_name"`
-			} `json:"model"`
-		} `json:"scope"`
-	} `json:"limits"`
-}
-
-// parseFableReading reads the Fable window of an OAuth usage payload the way the
-// management panel does: the active weekly_scoped limit of the Fable model family
-// (any version), else the first valid one, else the legacy iguana_necktie window.
-// It also reads the account's overall seven_day window.
-func parseFableReading(body []byte) (fableReading, error) {
-	var payload usagePayload
-	if errUnmarshal := json.Unmarshal(body, &payload); errUnmarshal != nil {
-		return fableReading{}, fmt.Errorf("decode usage response: %w", errUnmarshal)
-	}
-	found := false
-	var reading fableReading
-	for _, limit := range payload.Limits {
-		if !strings.EqualFold(strings.TrimSpace(limit.Kind), "weekly_scoped") || limit.Percent == nil || limit.Scope == nil || limit.Scope.Model == nil {
-			continue
-		}
-		family := strings.Fields(strings.ToLower(limit.Scope.Model.DisplayName))
-		if len(family) == 0 || family[0] != "fable" {
-			continue
-		}
-		if found && !limit.IsActive {
-			continue
-		}
-		reading = fableReading{hasFable: true, used: *limit.Percent, resetAt: parseResetTime(limit.ResetsAt)}
-		found = true
-		if limit.IsActive {
-			break
-		}
-	}
-	if !found && payload.Legacy != nil && payload.Legacy.Utilization != nil {
-		reading = fableReading{hasFable: true, used: *payload.Legacy.Utilization, resetAt: parseResetTime(payload.Legacy.ResetsAt)}
-	}
-	if payload.Weekly != nil && payload.Weekly.Utilization != nil {
-		reading.weeklyUsed = *payload.Weekly.Utilization
-		reading.weeklyResetAt = parseResetTime(payload.Weekly.ResetsAt)
-	}
-	return reading, nil
-}
-
-func parseResetTime(raw string) time.Time {
-	parsed, errParse := time.Parse(time.RFC3339, strings.TrimSpace(raw))
-	if errParse != nil {
-		return time.Time{}
-	}
-	return parsed
 }

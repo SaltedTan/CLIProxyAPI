@@ -12,6 +12,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/homeplugins"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/keyusage"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/wsrelay"
@@ -102,6 +103,10 @@ type Service struct {
 
 	// sessionAffinityState saves session affinity bindings across restarts; nil in Home mode.
 	sessionAffinityState atomic.Pointer[sessionAffinityStore]
+
+	// claudeUsage caches the Claude OAuth usage endpoint readings shared by quota-aware
+	// routing and the key usage Fable pool.
+	claudeUsage *keyusage.UsageCache
 
 	// pluginHost owns dynamic plugin lifecycle and runtime capability adapters.
 	pluginHost *pluginhost.Host

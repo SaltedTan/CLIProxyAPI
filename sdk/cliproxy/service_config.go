@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clientusage"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/keyusage"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/synthesizer"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
@@ -65,7 +66,25 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	return state
 }
 
-func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
+// quotaAwareActive reports whether the current configuration routes with quota-aware.
+func (s *Service) quotaAwareActive() bool {
+	return normalizedRoutingRuntimeState(s.currentConfig()).strategy == "quota-aware"
+}
+
+// quotaSources lists the readings quota-aware routing consults besides each
+// credential's quota snapshot, in tie-break order. The client usage tracker keeps each
+// Claude credential's last weekly reading across restarts, so credentials are ranked
+// before their next response; the usage cache reads the Claude OAuth usage endpoint,
+// which also counts usage made outside the proxy.
+func quotaSources(usage *keyusage.UsageCache) []coreauth.QuotaSource {
+	sources := []coreauth.QuotaSource{clientusage.Default().ClaudeQuota}
+	if usage != nil {
+		sources = append(sources, usage.QuotaReading)
+	}
+	return sources
+}
+
+func newRoutingSelector(state routingRuntimeState, usage *keyusage.UsageCache) coreauth.Selector {
 	var selector coreauth.Selector
 	switch state.strategy {
 	case "weighted-round-robin":
@@ -75,9 +94,7 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 	case "quota-aware":
 		// Round-robin rotates equally urgent credentials and pools without quota data.
 		quotaAware := coreauth.NewQuotaAwareSelector(&coreauth.RoundRobinSelector{})
-		// The client usage tracker keeps each Claude credential's last weekly reading
-		// across restarts, so credentials are ranked before their next response.
-		quotaAware.SetWeeklyQuotaSource(clientusage.Default().ClaudeWeeklyQuota)
+		quotaAware.SetQuotaSources(quotaSources(usage)...)
 		selector = quotaAware
 	default:
 		selector = &coreauth.RoundRobinSelector{}
@@ -130,6 +147,16 @@ func (s *Service) commitConfigUpdate(newCfg *config.Config) configCommit {
 	s.cancelStaleAntigravityProbes("")
 	s.configSequence++
 	return configCommit{cfg: newCfg, sequence: s.configSequence}
+}
+
+// currentConfig returns the configuration in effect.
+func (s *Service) currentConfig() *config.Config {
+	if s == nil {
+		return nil
+	}
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg
 }
 
 func (s *Service) configCommitCurrent(commit configCommit) bool {
@@ -226,7 +253,7 @@ func (s *Service) applyManagerConfig(ctx context.Context, commit configCommit) b
 	}
 	routingState := normalizedRoutingRuntimeState(commit.cfg)
 	if s.appliedRoutingState == nil || *s.appliedRoutingState != routingState {
-		s.coreManager.SetSelector(newRoutingSelector(routingState))
+		s.coreManager.SetSelector(newRoutingSelector(routingState, s.claudeUsage))
 		s.appliedRoutingState = &routingState
 	}
 	s.applyRetryConfig(commit.cfg)
@@ -257,7 +284,7 @@ func (s *Service) ensureRoutingSelector() {
 		return
 	}
 	routingState := normalizedRoutingRuntimeState(cfg)
-	s.coreManager.SetSelector(newRoutingSelector(routingState))
+	s.coreManager.SetSelector(newRoutingSelector(routingState, s.claudeUsage))
 	s.appliedRoutingState = &routingState
 }
 

@@ -9,6 +9,7 @@ import (
 
 	configaccess "github.com/router-for-me/CLIProxyAPI/v8/internal/access/config_access"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/keyusage"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
@@ -247,6 +248,18 @@ func (b *Builder) Build() (*Service, error) {
 	}
 	accessManager.SetProviders(sdkaccess.RegisteredProviders())
 
+	// The Claude usage cache exists before the routing selector that reads it. It lists
+	// the service's credentials and reads its config, both set before it is first used.
+	var service *Service
+	claudeUsage := keyusage.NewUsageCache(func() []*coreauth.Auth {
+		if service == nil || service.coreManager == nil {
+			return nil
+		}
+		return service.coreManager.List()
+	}, func() *config.Config {
+		return service.currentConfig()
+	})
+
 	coreManager := b.coreManager
 	cooldownStateStore := b.cooldownStateStore
 	var appliedRoutingState *routingRuntimeState
@@ -262,7 +275,7 @@ func (b *Builder) Build() (*Service, error) {
 		}
 
 		routingState := normalizedRoutingRuntimeState(b.cfg)
-		coreManager = coreauth.NewManager(tokenStore, newRoutingSelector(routingState), nil)
+		coreManager = coreauth.NewManager(tokenStore, newRoutingSelector(routingState, claudeUsage), nil)
 		appliedRoutingState = &routingState
 	}
 	// Attach a default RoundTripper provider so providers can opt-in per-auth transports.
@@ -276,7 +289,7 @@ func (b *Builder) Build() (*Service, error) {
 		coreManager.SetResultPolicy(b.resultPolicy)
 	}
 
-	service := &Service{
+	service = &Service{
 		cfg:                 b.cfg,
 		configPath:          b.configPath,
 		tokenProvider:       tokenProvider,
@@ -287,6 +300,7 @@ func (b *Builder) Build() (*Service, error) {
 		accessManager:       accessManager,
 		coreManager:         coreManager,
 		cooldownStateStore:  cooldownStateStore,
+		claudeUsage:         claudeUsage,
 		pluginHost:          pluginHost,
 		discoveryManager:    newDiscoveryAdvertiserManager(),
 		appliedRoutingState: appliedRoutingState,
@@ -298,6 +312,7 @@ func (b *Builder) Build() (*Service, error) {
 	service.serverOptions = append(service.serverOptions,
 		api.WithPostAuthPersistHook(service.runtimeAuthSyncHook()),
 		api.WithPluginHost(pluginHost),
+		api.WithClaudeUsage(claudeUsage),
 		api.WithConfigReloadHook(func(_ context.Context, _ *config.Config) {
 			service.reloadConfigFromWatcher()
 		}),

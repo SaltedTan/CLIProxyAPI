@@ -11,6 +11,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clientusage"
 	proxyconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/keyusage"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 )
 
@@ -71,6 +72,24 @@ func TestKeyUsageReportsTheCallersOwnKey(t *testing.T) {
 	server.engine.ServeHTTP(line, request)
 	if got, want := line.Body.String(), "Claude 100% left · 7d window starts on next use │ Fable: n/a\n"; got != want {
 		t.Fatalf("line report = %q, want %q", got, want)
+	}
+}
+
+// The Fable pool reads the usage cache the service shares with quota-aware routing.
+func TestKeyUsageFablePoolUsesTheInjectedClaudeUsage(t *testing.T) {
+	listed := 0
+	cache := keyusage.NewUsageCache(func() []*auth.Auth {
+		listed++
+		return nil
+	}, nil)
+	server := newTestServerWithConfig(t, &proxyconfig.Config{SDKConfig: sdkconfig.SDKConfig{APIKeys: []string{"test-key"}}}, WithClaudeUsage(cache))
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/v1/key/usage", nil)
+	request.Header.Set("X-Api-Key", "test-key")
+	server.engine.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || listed != 1 {
+		t.Fatalf("status = %d, cache listed %d times, want one Fable summary from the injected cache", recorder.Code, listed)
 	}
 }
 
