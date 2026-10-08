@@ -486,8 +486,11 @@ func (c *SessionCache) Bindings(now time.Time) []SessionBinding {
 }
 
 // RestoreBindings inserts saved bindings in order and returns how many were restored.
-// Bindings that are expired, have no keys, or whose auth keep rejects are skipped, and
-// so is any binding with a key that is already bound: live bindings win. Expiries are
+// Bindings that are expired, have no keys, or whose auth keep rejects are skipped.
+// Live bindings always win: a binding with a key that is bound when the restore starts
+// is skipped, and a restore never evicts a live binding. When the saved bindings do not
+// all fit beside the live ones, the restored ones least recently used are evicted
+// first, and a binding that cannot fit beside the live ones is skipped. Expiries are
 // capped at now plus the cache TTL, in case the TTL was shortened since they were saved.
 func (c *SessionCache) RestoreBindings(bindings []SessionBinding, now time.Time, keep func(authID string) bool) int {
 	if c == nil || len(bindings) == 0 {
@@ -508,36 +511,63 @@ func (c *SessionCache) RestoreBindings(bindings []SessionBinding, now time.Time,
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.ensureInitializedLocked()
+	// Expired groups are dropped so they neither shadow a restored binding nor take up
+	// room. The live keys are taken once, before anything is restored, so restoring
+	// cannot change which keys count as live.
+	for _, group := range c.groups {
+		if !now.Before(group.expiresAt) {
+			c.removeAliasGroupLocked(group)
+		}
+	}
+	bound := make(map[string]struct{}, len(c.entries))
+	for key, entry := range c.entries {
+		if now.Before(entry.expiresAt) {
+			bound[key] = struct{}{}
+		}
+	}
+	// Restored bindings may use only the room the live ones leave, so inserting one
+	// never makes the cache evict a live binding.
+	room := c.maxEntries - len(c.entries)
 	maxExpiresAt := now.Add(c.ttl)
-	restored := 0
+	var restored []sessionEntry // oldest first
+	restoredAliases := 0
 	for _, binding := range candidates {
 		keys := mergeSessionAliases(nil, binding.Keys...)
-		if len(keys) == 0 || c.anyKeyBoundLocked(keys, now) {
+		if len(keys) == 0 || anySessionKeyIn(bound, keys) {
 			continue
 		}
 		aliases := compactSessionAliases(keys)
+		if c.maxEntries > 0 {
+			if len(aliases) > room {
+				continue
+			}
+			for len(restored) > 0 && restoredAliases+len(aliases) > room {
+				c.removeAliasGroupLocked(restored[0])
+				restoredAliases -= len(restored[0].aliases)
+				restored = restored[1:]
+			}
+		}
 		expiresAt := binding.ExpiresAt
 		if expiresAt.After(maxExpiresAt) {
 			expiresAt = maxExpiresAt
 		}
 		c.replaceAliasGroupsLocked(binding.AuthID, expiresAt, aliases)
-		restored++
+		restored = append(restored, sessionEntry{authID: binding.AuthID, expiresAt: expiresAt, aliases: aliases})
+		restoredAliases += len(aliases)
+		// Restored keys count as bound too, so two restored groups never share a key:
+		// the first saved binding with a key wins.
+		for _, alias := range aliases {
+			bound[alias] = struct{}{}
+		}
 	}
-	return restored
+	return len(restored)
 }
 
-// anyKeyBoundLocked reports whether any key is bound to an unexpired entry. Expired
-// entries found on the way are removed so they cannot shadow the restored binding.
-func (c *SessionCache) anyKeyBoundLocked(keys []string, now time.Time) bool {
+func anySessionKeyIn(set map[string]struct{}, keys []string) bool {
 	for _, key := range keys {
-		entry, ok := c.entries[key]
-		if !ok {
-			continue
-		}
-		if now.Before(entry.expiresAt) {
+		if _, ok := set[key]; ok {
 			return true
 		}
-		c.removeAliasGroupLocked(entry)
 	}
 	return false
 }

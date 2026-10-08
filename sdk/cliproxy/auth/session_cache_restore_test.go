@@ -131,7 +131,9 @@ func TestSessionCacheRestoreBindingsKeepsEvictionOrder(t *testing.T) {
 
 	target := NewSessionCacheWithCapacity(time.Hour, 2)
 	defer target.Stop()
-	target.RestoreBindings(bindings, now, nil)
+	if restored := target.RestoreBindings(bindings, now, nil); restored != 2 {
+		t.Fatalf("RestoreBindings() = %d, want 2 kept", restored)
+	}
 	if _, ok := target.Get("s2"); ok {
 		t.Fatal("expected least recently used s2 to be evicted on restore")
 	}
@@ -139,6 +141,74 @@ func TestSessionCacheRestoreBindingsKeepsEvictionOrder(t *testing.T) {
 		if _, ok := target.Get(key); !ok {
 			t.Fatalf("expected %s to survive restore", key)
 		}
+	}
+}
+
+// Restoring into a cache full of live bindings restores nothing. An earlier saved
+// binding must not evict a live one to make room, which would also let a later saved
+// binding with that live binding's key restore over it.
+func TestSessionCacheRestoreBindingsIntoFullCacheKeepsLiveBindings(t *testing.T) {
+	t.Parallel()
+
+	cache := NewSessionCacheWithCapacity(time.Hour, 4)
+	defer cache.Stop()
+	cache.SetAliases("auth-live-1", "live-1", "live-1-parent")
+	cache.Set("live-2", "auth-live-2")
+	cache.Set("live-3", "auth-live-3")
+	now := time.Now()
+	live := cache.Bindings(now)
+	if cache.Len() != 4 || len(live) != 3 {
+		t.Fatalf("live cache = %d aliases in %d bindings, want 4 in 3", cache.Len(), len(live))
+	}
+
+	saved := []SessionBinding{
+		{Keys: []string{"saved-new"}, AuthID: "auth-saved", ExpiresAt: now.Add(30 * time.Minute)},
+		{Keys: []string{"saved-other", "live-1"}, AuthID: "auth-saved", ExpiresAt: now.Add(30 * time.Minute)},
+	}
+	restored := cache.RestoreBindings(saved, now, nil)
+	if got := cache.Bindings(now); !reflect.DeepEqual(got, live) {
+		t.Fatalf("bindings after restore = %+v, want the live bindings unchanged %+v", got, live)
+	}
+	if restored != 0 {
+		t.Fatalf("RestoreBindings() = %d, want 0", restored)
+	}
+}
+
+// With room for some saved bindings beside the live ones, restoring evicts only
+// bindings it restored itself, least recently used first, and counts those kept.
+func TestSessionCacheRestoreBindingsEvictsOnlyRestoredBindings(t *testing.T) {
+	t.Parallel()
+
+	cache := NewSessionCacheWithCapacity(time.Hour, 5)
+	defer cache.Stop()
+	cache.SetAliases("auth-live-1", "live-1", "live-1-parent")
+	cache.Set("live-2", "auth-live-2")
+	now := time.Now()
+	live := cache.Bindings(now)
+	if cache.Len() != 3 || len(live) != 2 {
+		t.Fatalf("live cache = %d aliases in %d bindings, want 3 in 2", cache.Len(), len(live))
+	}
+
+	saved := []SessionBinding{
+		{Keys: []string{"saved-1"}, AuthID: "auth-saved", ExpiresAt: now.Add(10 * time.Minute)},
+		{Keys: []string{"saved-2"}, AuthID: "auth-saved", ExpiresAt: now.Add(20 * time.Minute)},
+		// The live bindings leave room for two aliases, so saved-1 is evicted for it.
+		{Keys: []string{"saved-3"}, AuthID: "auth-saved", ExpiresAt: now.Add(30 * time.Minute)},
+		// Shares a key with a live binding.
+		{Keys: []string{"saved-4", "live-1-parent"}, AuthID: "auth-saved", ExpiresAt: now.Add(30 * time.Minute)},
+		// Does not fit beside the live bindings.
+		{Keys: []string{"saved-5a", "saved-5b", "saved-5c"}, AuthID: "auth-saved", ExpiresAt: now.Add(30 * time.Minute)},
+	}
+	restored := cache.RestoreBindings(saved, now, nil)
+	want := append(append([]SessionBinding(nil), live...), saved[1], saved[2])
+	if got := cache.Bindings(now); !reflect.DeepEqual(got, want) {
+		t.Fatalf("bindings after restore = %+v, want %+v", got, want)
+	}
+	if restored != 2 {
+		t.Fatalf("RestoreBindings() = %d, want 2", restored)
+	}
+	if cache.Len() != 5 {
+		t.Fatalf("Len() = %d, want 5", cache.Len())
 	}
 }
 
