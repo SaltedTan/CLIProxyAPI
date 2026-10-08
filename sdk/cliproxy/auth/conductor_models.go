@@ -213,6 +213,19 @@ func (m *Manager) selectionModelForAuth(auth *Auth, routeModel string) string {
 	return resolvedModel
 }
 
+// upstreamModelForAuth returns the model local execution sends the credential for the
+// route model: the selection model (credential prefix stripped, OAuth model alias applied)
+// with the credential's API key model alias applied, as executionModelCandidates resolves
+// it. Unlike that function it never advances an OpenAI-compatibility model pool, so it is
+// safe on the selection path.
+func (m *Manager) upstreamModelForAuth(auth *Auth, routeModel string) string {
+	selectionModel := m.selectionModelForAuth(auth, routeModel)
+	if resolved := strings.TrimSpace(m.applyAPIKeyModelAlias(auth, selectionModel)); resolved != "" {
+		return resolved
+	}
+	return selectionModel
+}
+
 func (m *Manager) selectionModelKeyForAuth(auth *Auth, routeModel string) string {
 	return canonicalModelKey(m.selectionModelForAuth(auth, routeModel))
 }

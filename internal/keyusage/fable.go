@@ -231,7 +231,9 @@ func roundPercent(value float64) float64 {
 
 // registryServesFable reports whether the credential registered a Fable model, so
 // accounts whose Fable models are excluded by configuration stay out of the pool.
-// Aliased models count by the upstream model they stand for.
+// Aliased models count by the upstream model they stand for. Quota-aware routing asks
+// another question, whether one request's model is sent to a credential as Fable, and
+// answers it from the manager's per-credential model resolution instead of the registry.
 func registryServesFable(authID string) bool {
 	for _, model := range registry.GetGlobalRegistry().GetModelsForClient(authID) {
 		if model != nil && isFableModel(model) {
@@ -241,8 +243,9 @@ func registryServesFable(authID string) bool {
 	return false
 }
 
-// isFableModel is mirrored by quota-aware routing (quotaAwareFableRequest in
-// sdk/cliproxy/auth); keep the two rules in step.
+// isFableModel is mirrored by quota-aware routing when a selector is called without the
+// manager's resolver (quotaAwareFableRequest in sdk/cliproxy/auth); keep the two rules in
+// step.
 func isFableModel(model *registry.ModelInfo) bool {
 	id := strings.TrimSpace(model.MetadataModelID)
 	if id == "" {

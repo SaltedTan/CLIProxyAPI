@@ -285,14 +285,16 @@ type quotaAwareDecision struct {
 // matters within the returned group, which keeps the ID-sorted availability order.
 // sources supply readings besides the snapshot; per window the newest usable one wins.
 // model is the route model; a Fable request ranks each credential by its Fable window.
-func rankQuotaAware(auths []*Auth, model string, now time.Time, sources []QuotaSource) quotaAwareDecision {
+// resolve, when set, is the manager's per-credential model resolution (see
+// quotaAwareFableRequest).
+func rankQuotaAware(auths []*Auth, model string, now time.Time, sources []QuotaSource, resolve func(auth *Auth) string) quotaAwareDecision {
 	all := make([]quotaAwareCandidate, 0, len(auths))
 	for _, auth := range auths {
 		candidate := quotaAwareCandidate{auth: auth, usage: authQuotaUsage(auth, now)}
 		applyQuotaSources(auth, sources, now, &candidate.usage)
 		// Only a credential with a Fable reading is ranked differently, so only its
-		// registered models are looked up.
-		candidate.fable = (candidate.usage.hasFable || candidate.usage.hasFableExhausted) && quotaAwareFableRequest(auth, model)
+		// model is resolved.
+		candidate.fable = (candidate.usage.hasFable || candidate.usage.hasFableExhausted) && quotaAwareFableRequest(auth, model, resolve)
 		if candidate.fable {
 			candidate.usage.rankByFable()
 		} else {
@@ -369,7 +371,7 @@ func (s *QuotaAwareSelector) Pick(ctx context.Context, provider, model string, o
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 
-	decision := rankQuotaAware(available, model, now, s.quotaSources())
+	decision := rankQuotaAware(available, model, now, s.quotaSources(), upstreamModelResolverFromContext(ctx))
 	probes := s.dueProbes(decision, now)
 	if len(probes) > 0 {
 		decision.chosen = probes
@@ -504,14 +506,51 @@ func quotaAwarePlanSize(auth *Auth) float64 {
 	return float64(weight)
 }
 
+// upstreamModelResolverKey carries the manager's per-credential model resolution for the
+// route model being picked (see Manager.upstreamModelForAuth).
+type upstreamModelResolverKey struct{}
+
+// withUpstreamModelResolver attaches resolve, which returns the upstream model the manager
+// sends a credential for the route model being picked.
+func withUpstreamModelResolver(ctx context.Context, resolve func(auth *Auth) string) context.Context {
+	if resolve == nil {
+		return ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, upstreamModelResolverKey{}, resolve)
+}
+
+// upstreamModelResolverFromContext returns the resolver attached by the manager, or nil when
+// the selector is called outside the manager's pick paths.
+func upstreamModelResolverFromContext(ctx context.Context) func(auth *Auth) string {
+	if ctx == nil {
+		return nil
+	}
+	resolve, _ := ctx.Value(upstreamModelResolverKey{}).(func(auth *Auth) string)
+	return resolve
+}
+
 // quotaAwareFableRequest reports whether a request for the route model asks the credential
-// for a Fable model. It mirrors the Fable pool's rule (keyusage.isFableModel): the model the
-// credential registered under the route model counts by its upstream model (MetadataModelID,
-// set for aliases), else its ID; a credential without such a model is decided by the route
-// model itself. As in alias resolution, a model registered under the exact route model (such
-// as a suffixed alias) comes before one registered under the route model without its
-// thinking suffix.
-func quotaAwareFableRequest(auth *Auth, model string) bool {
+// for a Fable model, that is whether the upstream model contains "fable", ignoring case.
+//
+// With resolve, which the manager sets on its picks, the upstream model is the one the
+// manager sends this credential (Manager.upstreamModelForAuth): the route model with the
+// credential's prefix stripped and its OAuth or API key model alias applied, without the
+// thinking suffix. An alias therefore counts by its target, whatever its own name, and the
+// registry is not consulted.
+//
+// Without resolve (Pick called directly), the credential's registered models stand in, as
+// in the Fable pool's rule (keyusage.isFableModel): the model the credential registered
+// under the route model counts by its upstream model (MetadataModelID, set for aliases),
+// else its ID; a credential without such a model is decided by the route model itself. As
+// in alias resolution, a model registered under the exact route model (such as a suffixed
+// alias) comes before one registered under the route model without its thinking suffix.
+func quotaAwareFableRequest(auth *Auth, model string, resolve func(auth *Auth) string) bool {
+	if resolve != nil {
+		return strings.Contains(strings.ToLower(canonicalModelKey(resolve(auth))), "fable")
+	}
 	model = strings.TrimSpace(model)
 	if auth != nil && model != "" {
 		models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)

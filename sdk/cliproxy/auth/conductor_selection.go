@@ -659,11 +659,19 @@ func selectionArgForSelector(selector Selector, routeModel string) string {
 	return routeModel
 }
 
-func selectorContextForAvailableAuths(ctx context.Context, selector Selector, routeModel string) context.Context {
+// selectorContextForAvailableAuths prepares the context for the configured selector's Pick
+// over candidates the manager has already checked. Session affinity and quota-aware
+// selectors also receive the manager's per-credential upstream model for the route model,
+// which quota-aware routing uses to tell Fable requests apart (see quotaAwareFableRequest);
+// session affinity passes the context on to its fallback.
+func (m *Manager) selectorContextForAvailableAuths(ctx context.Context, selector Selector, routeModel string) context.Context {
 	ctx = withWeightedSelectorStateModel(ctx, selector, routeModel)
 	if !isBuiltInSelector(selector) {
 		switch selector.(type) {
 		case *SessionAffinitySelector, *QuotaAwareSelector:
+			ctx = withUpstreamModelResolver(ctx, func(auth *Auth) string {
+				return m.upstreamModelForAuth(auth, routeModel)
+			})
 		default:
 			return ctx
 		}
@@ -1789,7 +1797,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		return nil, nil, errPick
 	}
 	if !handled {
-		selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
+		selectorCtx := m.selectorContextForAvailableAuths(ctx, selector, model)
 		selected, errPick = selector.Pick(selectorCtx, provider, selectionArgForSelector(selector, model), opts, selectorAuths)
 		if errPick != nil {
 			if isBuiltInSelector(selector) {
@@ -2128,7 +2136,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		note.setCandidates(len(available))
 	} else {
 		note.setCandidates(len(selectorAuths))
-		selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
+		selectorCtx := m.selectorContextForAvailableAuths(ctx, selector, model)
 		selected, errPick = selector.Pick(selectorCtx, "mixed", selectionArgForSelector(selector, model), opts, selectorAuths)
 		if errPick != nil {
 			if isBuiltInSelector(selector) {

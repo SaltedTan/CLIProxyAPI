@@ -1050,7 +1050,7 @@ func TestQuotaAwareSelector_FableRequestRanksByFableWindow(t *testing.T) {
 	assertModelPickSequence(t, selector, testFableModel, auths, y.ID, y.ID, y.ID)
 	assertModelPickSequence(t, selector, testOtherModel, auths, x.ID, x.ID, x.ID)
 
-	decision := rankQuotaAware(auths, testFableModel, now, selector.quotaSources())
+	decision := rankQuotaAware(auths, testFableModel, now, selector.quotaSources(), nil)
 	if len(decision.chosen) != 1 || !decision.chosen[0].fable || decision.chosen[0].usage.long.label != "oauth-usage-fable" ||
 		math.Abs(decision.chosen[0].usage.long.used-0.1) > 1e-9 || decision.reason != "weekly_pace" {
 		t.Fatalf("decision = %+v, want y ranked by its Fable window", decision)
@@ -1073,11 +1073,11 @@ func TestRankQuotaAware_FableRequestOverallWeeklyUsedUp(t *testing.T) {
 	blocked := &Auth{ID: "a-blocked", Provider: "claude", Status: StatusActive}
 	heavy := &Auth{ID: "b-heavy", Provider: "claude", Status: StatusActive}
 
-	decision := rankQuotaAware([]*Auth{blocked, heavy}, testFableModel, now, sources)
+	decision := rankQuotaAware([]*Auth{blocked, heavy}, testFableModel, now, sources, nil)
 	if got := chosenIDs(decision); len(got) != 1 || got[0] != "b-heavy" || decision.reason != "weekly_pace" || decision.withWeekly != 2 {
 		t.Fatalf("chosen = %v (%s, with_weekly %d), want b-heavy ahead of the blocked account", got, decision.reason, decision.withWeekly)
 	}
-	alone := rankQuotaAware([]*Auth{blocked}, testFableModel, now, sources)
+	alone := rankQuotaAware([]*Auth{blocked}, testFableModel, now, sources, nil)
 	if len(alone.chosen) != 1 || alone.reason != "no_weekly_quota_left" || alone.chosen[0].usage.long.label != "oauth-usage-fable" || alone.chosen[0].usage.long.used != 1 {
 		t.Fatalf("decision = %+v, want the blocked account used up", alone)
 	}
@@ -1085,13 +1085,13 @@ func TestRankQuotaAware_FableRequestOverallWeeklyUsedUp(t *testing.T) {
 	// A newer response reporting the overall window used up blocks it as well.
 	snapshotBlocked := claudeSnapshotAuth("a-blocked", now, now, "1", 30*time.Hour, "0.1", 2*time.Hour)
 	readings["a-blocked"] = fableQuotaReading(now, 0.5, unusedFable)
-	decision = rankQuotaAware([]*Auth{snapshotBlocked, heavy}, testFableModel, now, sources)
+	decision = rankQuotaAware([]*Auth{snapshotBlocked, heavy}, testFableModel, now, sources, nil)
 	if got := chosenIDs(decision); len(got) != 1 || got[0] != "b-heavy" {
 		t.Fatalf("chosen = %v, want b-heavy ahead of the account whose snapshot is used up", got)
 	}
 
 	// With overall quota left, the unused Fable allowance ranks first.
-	decision = rankQuotaAware([]*Auth{blocked, heavy}, testFableModel, now, sources)
+	decision = rankQuotaAware([]*Auth{blocked, heavy}, testFableModel, now, sources, nil)
 	if got := chosenIDs(decision); len(got) != 1 || got[0] != "a-blocked" {
 		t.Fatalf("chosen = %v, want a-blocked once its overall window has quota left", got)
 	}
@@ -1122,11 +1122,11 @@ func TestRankQuotaAware_FableRequestOverallWeeklyUsedUpWithoutReset(t *testing.T
 	usedUp := &Auth{ID: "a-used-up", Provider: "claude", Status: StatusActive}
 	heavy := &Auth{ID: "b-heavy", Provider: "claude", Status: StatusActive}
 
-	decision := rankQuotaAware([]*Auth{usedUp, heavy}, testFableModel, now, sources)
+	decision := rankQuotaAware([]*Auth{usedUp, heavy}, testFableModel, now, sources, nil)
 	if got := chosenIDs(decision); len(got) != 1 || got[0] != "b-heavy" || decision.reason != "weekly_pace" || decision.withWeekly != 2 {
 		t.Fatalf("chosen = %v (%s, with_weekly %d), want b-heavy ahead of the used-up account", got, decision.reason, decision.withWeekly)
 	}
-	alone := rankQuotaAware([]*Auth{usedUp}, testFableModel, now, sources)
+	alone := rankQuotaAware([]*Auth{usedUp}, testFableModel, now, sources, nil)
 	if len(alone.chosen) != 1 || alone.reason != "no_weekly_quota_left" || !alone.chosen[0].fable ||
 		alone.chosen[0].usage.long.label != "oauth-usage-fable" || alone.chosen[0].usage.long.used != 1 || alone.chosen[0].score != 0 {
 		t.Fatalf("decision = %+v, want the used-up account ranked as out of Fable", alone)
@@ -1137,7 +1137,7 @@ func TestRankQuotaAware_FableRequestOverallWeeklyUsedUpWithoutReset(t *testing.T
 	saved["a-used-up"] = weeklyReading("last-known", 0.2, now.Add(72*time.Hour), reportedAt.Add(-10*time.Minute))
 	older := claudeSnapshotAuth("a-used-up", now, reportedAt.Add(-5*time.Minute), "0.2", 72*time.Hour, "0.1", 2*time.Hour)
 	for _, auth := range []*Auth{usedUp, older} {
-		decision = rankQuotaAware([]*Auth{auth, heavy}, testFableModel, now, sources)
+		decision = rankQuotaAware([]*Auth{auth, heavy}, testFableModel, now, sources, nil)
 		if got := chosenIDs(decision); len(got) != 1 || got[0] != "b-heavy" {
 			t.Fatalf("chosen = %v, want b-heavy while the report is newer than the usable window", got)
 		}
@@ -1147,14 +1147,14 @@ func TestRankQuotaAware_FableRequestOverallWeeklyUsedUpWithoutReset(t *testing.T
 	// wins: the account is ranked by its Fable window again.
 	for name, observedAt := range map[string]time.Time{"same time": reportedAt, "later": now} {
 		newer := claudeSnapshotAuth("a-used-up", now, observedAt, "0.2", 72*time.Hour, "0.1", 2*time.Hour)
-		decision = rankQuotaAware([]*Auth{newer, heavy}, testFableModel, now, sources)
+		decision = rankQuotaAware([]*Auth{newer, heavy}, testFableModel, now, sources, nil)
 		if got := chosenIDs(decision); len(got) != 1 || got[0] != "a-used-up" || decision.chosen[0].usage.long.label != "oauth-usage-fable" ||
 			math.Abs(decision.chosen[0].usage.long.used-0.1) > 1e-9 {
 			t.Fatalf("%s: chosen = %v (%+v), want a-used-up ranked by its Fable window", name, got, decision.chosen)
 		}
 	}
 	saved["a-used-up"] = weeklyReading("last-known", 0.2, now.Add(72*time.Hour), now)
-	decision = rankQuotaAware([]*Auth{usedUp, heavy}, testFableModel, now, sources)
+	decision = rankQuotaAware([]*Auth{usedUp, heavy}, testFableModel, now, sources, nil)
 	if got := chosenIDs(decision); len(got) != 1 || got[0] != "a-used-up" {
 		t.Fatalf("chosen = %v, want a-used-up once a newer saved reading has overall quota left", got)
 	}
@@ -1178,7 +1178,7 @@ func TestQuotaAwareSelector_OverallWeeklyUsedUpWithoutResetIsLastResort(t *testi
 	unread := &Auth{ID: "c-unread", Provider: "claude", Status: StatusActive}
 
 	assertModelPickSequence(t, selector, testOtherModel, []*Auth{usedUp, heavy}, "b-heavy", "b-heavy")
-	decision := rankQuotaAware([]*Auth{usedUp, unread}, testOtherModel, now, selector.quotaSources())
+	decision := rankQuotaAware([]*Auth{usedUp, unread}, testOtherModel, now, selector.quotaSources(), nil)
 	if got := chosenIDs(decision); len(got) != 1 || got[0] != "c-unread" || decision.reason != "no_weekly_data" || decision.withWeekly != 1 {
 		t.Fatalf("chosen = %v (%s, with_weekly %d), want the credential without weekly data first", got, decision.reason, decision.withWeekly)
 	}
@@ -1218,22 +1218,22 @@ func TestRankQuotaAware_FableWindowUsedUpWithoutReset(t *testing.T) {
 	noFable := &Auth{ID: "a-no-fable", Provider: "claude", Status: StatusActive}
 	heavy := &Auth{ID: "b-heavy", Provider: "claude", Status: StatusActive}
 
-	decision := rankQuotaAware([]*Auth{noFable, heavy}, testFableModel, now, sources)
+	decision := rankQuotaAware([]*Auth{noFable, heavy}, testFableModel, now, sources, nil)
 	if got := chosenIDs(decision); len(got) != 1 || got[0] != "b-heavy" {
 		t.Fatalf("chosen = %v, want b-heavy for a Fable request", got)
 	}
-	alone := rankQuotaAware([]*Auth{noFable}, testFableModel, now, sources)
+	alone := rankQuotaAware([]*Auth{noFable}, testFableModel, now, sources, nil)
 	if len(alone.chosen) != 1 || alone.reason != "no_weekly_quota_left" || alone.chosen[0].usage.long.label != "oauth-usage-fable(used up, reset unknown)" {
 		t.Fatalf("decision = %+v, want the account out of Fable", alone)
 	}
-	decision = rankQuotaAware([]*Auth{noFable, heavy}, testOtherModel, now, sources)
+	decision = rankQuotaAware([]*Auth{noFable, heavy}, testOtherModel, now, sources, nil)
 	if got := chosenIDs(decision); len(got) != 1 || got[0] != "a-no-fable" || decision.chosen[0].usage.long.label != "oauth-usage-weekly" {
 		t.Fatalf("chosen = %v, want a-no-fable ranked by its overall window for other models", got)
 	}
 
 	// A newer usable Fable window wins.
 	other["a-no-fable"] = QuotaReading{Fable: &QuotaWindowReading{Used: 0.1, ResetAt: now.Add(72 * time.Hour)}, ObservedAt: now, Source: "other"}
-	decision = rankQuotaAware([]*Auth{noFable, heavy}, testFableModel, now, sources)
+	decision = rankQuotaAware([]*Auth{noFable, heavy}, testFableModel, now, sources, nil)
 	if got := chosenIDs(decision); len(got) != 1 || got[0] != "a-no-fable" || decision.chosen[0].usage.long.label != "other-fable" {
 		t.Fatalf("chosen = %v, want a-no-fable ranked by its newer Fable window", got)
 	}
@@ -1252,8 +1252,8 @@ func TestRankQuotaAware_FableRequestWithoutFableReadingUsesOverallWindow(t *test
 		{ID: "b-drained", Provider: "claude", Status: StatusActive},
 		claudeSnapshotAuth("c-snapshot", now, now, "0.7", 72*time.Hour, "0.1", 2*time.Hour),
 	}
-	fable := rankQuotaAware(auths, testFableModel, now, sources)
-	other := rankQuotaAware(auths, testOtherModel, now, sources)
+	fable := rankQuotaAware(auths, testFableModel, now, sources, nil)
+	other := rankQuotaAware(auths, testOtherModel, now, sources, nil)
 	for _, decision := range []quotaAwareDecision{fable, other} {
 		if got := chosenIDs(decision); len(got) != 1 || got[0] != "a-roomy" || decision.reason != "weekly_pace" {
 			t.Fatalf("chosen = %v (%s), want a-roomy for Fable and other models alike", got, decision.reason)
@@ -1280,7 +1280,7 @@ func TestQuotaAwareSelector_FableRequestShortWindowSaturationSkipsCredential(t *
 		{ID: "y-more-fable", Provider: "claude", Status: StatusActive},
 	}
 	assertModelPickSequence(t, selector, testFableModel, auths, "x-little-fable", "x-little-fable")
-	if decision := rankQuotaAware(auths, testFableModel, now, selector.quotaSources()); decision.shortSaturated != 1 {
+	if decision := rankQuotaAware(auths, testFableModel, now, selector.quotaSources(), nil); decision.shortSaturated != 1 {
 		t.Fatalf("short saturated = %d, want 1", decision.shortSaturated)
 	}
 }
@@ -1392,7 +1392,7 @@ func TestQuotaAwareFableRequest(t *testing.T) {
 		{name: "empty model", auth: aliased, model: "", want: false},
 	}
 	for _, tc := range cases {
-		if got := quotaAwareFableRequest(tc.auth, tc.model); got != tc.want {
+		if got := quotaAwareFableRequest(tc.auth, tc.model, nil); got != tc.want {
 			t.Errorf("%s: quotaAwareFableRequest(%q) = %v, want %v", tc.name, tc.model, got, tc.want)
 		}
 	}
@@ -1417,9 +1417,93 @@ func TestQuotaAwareFableRequestPrefersExactSuffixedAlias(t *testing.T) {
 		registry.GetGlobalRegistry().RegisterClient(auth.ID, "claude", models)
 		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
 		for model, want := range map[string]bool{"best(high)": true, "Best(High)": true, "best": false, "best(low)": false} {
-			if got := quotaAwareFableRequest(auth, model); got != want {
+			if got := quotaAwareFableRequest(auth, model, nil); got != want {
 				t.Errorf("%s: quotaAwareFableRequest(%q) = %v, want %v", name, model, got, want)
 			}
+		}
+	}
+}
+
+// With a resolver, the resolved upstream model decides, case-insensitively and without its
+// thinking suffix; the route model and the registered models no longer matter.
+func TestQuotaAwareFableRequestWithResolver(t *testing.T) {
+	t.Parallel()
+	auth := &Auth{ID: "fable-resolver-" + t.Name(), Provider: "claude"}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, "claude", []*registry.ModelInfo{
+		{ID: "my-fable", MetadataModelID: testFableModel},
+	})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+	resolveTo := func(upstream string) func(*Auth) string {
+		return func(*Auth) string { return upstream }
+	}
+	cases := []struct {
+		name     string
+		model    string
+		upstream string
+		want     bool
+	}{
+		{name: "alias to a Fable model", model: "big", upstream: "Claude-FABLE-5-1(high)", want: true},
+		{name: "registered Fable alias sent as another model", model: "my-fable", upstream: testOtherModel, want: false},
+		{name: "route name mentioning Fable", model: "fable-fast", upstream: testOtherModel, want: false},
+		{name: "Fable only in the thinking suffix", model: "big", upstream: testOtherModel + "(fable)", want: false},
+	}
+	for _, tc := range cases {
+		if got := quotaAwareFableRequest(auth, tc.model, resolveTo(tc.upstream)); got != tc.want {
+			t.Errorf("%s: quotaAwareFableRequest(%q -> %q) = %v, want %v", tc.name, tc.model, tc.upstream, got, tc.want)
+		}
+	}
+}
+
+// Pick reads the manager's resolver from the context. Only credentials with a Fable window
+// are resolved; without a resolver the registered models decide, as before.
+func TestQuotaAwareSelector_PickUsesUpstreamModelResolver(t *testing.T) {
+	t.Parallel()
+	now := quotaAwareTestBase()
+	x := &Auth{ID: "x-little-fable-" + t.Name(), Provider: "claude", Status: StatusActive}
+	y := &Auth{ID: "y-more-fable-" + t.Name(), Provider: "claude", Status: StatusActive}
+	z := &Auth{ID: "z-no-fable-" + t.Name(), Provider: "claude", Status: StatusActive}
+	for _, auth := range []*Auth{x, y, z} {
+		registry.GetGlobalRegistry().RegisterClient(auth.ID, "claude", []*registry.ModelInfo{
+			{ID: "my-fable", MetadataModelID: testFableModel},
+		})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+	}
+	selector := newTestQuotaAwareSelector(now, nil)
+	selector.SetQuotaSources(mapQuotaSource(map[string]QuotaReading{
+		x.ID: fableQuotaReading(now, 0.2, &QuotaWindowReading{Used: 0.9, ResetAt: now.Add(72 * time.Hour)}),
+		y.ID: fableQuotaReading(now, 0.6, &QuotaWindowReading{Used: 0.1, ResetAt: now.Add(72 * time.Hour)}),
+		z.ID: fableQuotaReading(now, 0.9, nil),
+	}))
+	auths := []*Auth{x, y, z}
+
+	assertModelPickSequence(t, selector, "my-fable", auths, y.ID)
+	assertModelPickSequence(t, selector, "big", auths, x.ID)
+
+	var resolved []string
+	pick := func(model, upstream string) string {
+		t.Helper()
+		ctx := withUpstreamModelResolver(context.Background(), func(auth *Auth) string {
+			resolved = append(resolved, auth.ID)
+			return upstream
+		})
+		picked, errPick := selector.Pick(ctx, "claude", model, cliproxyexecutor.Options{}, auths)
+		if errPick != nil {
+			t.Fatalf("Pick(%s) error = %v", model, errPick)
+		}
+		return picked.ID
+	}
+	if got := pick("my-fable", testOtherModel); got != x.ID {
+		t.Fatalf("pick for my-fable sent as %s = %s, want %s by the overall window", testOtherModel, got, x.ID)
+	}
+	if got := pick("big", testFableModel); got != y.ID {
+		t.Fatalf("pick for big sent as %s = %s, want %s by the Fable window", testFableModel, got, y.ID)
+	}
+	if len(resolved) != 4 {
+		t.Fatalf("resolved %v, want x and y once per pick", resolved)
+	}
+	for _, id := range resolved {
+		if id == z.ID {
+			t.Fatalf("resolved %v, want no resolution for a credential without a Fable window", resolved)
 		}
 	}
 }
