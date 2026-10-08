@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
@@ -206,8 +207,8 @@ func newTestPool(now *time.Time, fetcher *fakeFetcher, auths ...*coreauth.Auth) 
 func settle(pool *FablePool) {
 	pool.mu.Lock()
 	pending := make([]chan struct{}, 0, len(pool.inflight))
-	for _, done := range pool.inflight {
-		pending = append(pending, done)
+	for _, running := range pool.inflight {
+		pending = append(pending, running.done)
 	}
 	pool.mu.Unlock()
 	for _, done := range pending {
@@ -292,5 +293,76 @@ func TestFablePoolBacksOffAndAgesOutFailures(t *testing.T) {
 	}
 	if math.Abs(float64(fetcher.count("a")-fetcher.count("b"))) > 1 {
 		t.Fatalf("calls = %v", fetcher.calls)
+	}
+}
+
+func TestIsFableModelFollowsAliases(t *testing.T) {
+	cases := []struct {
+		model registry.ModelInfo
+		want  bool
+	}{
+		{registry.ModelInfo{ID: "claude-fable-5-1"}, true},
+		{registry.ModelInfo{ID: "premium", MetadataModelID: "claude-fable-5-1"}, true},
+		{registry.ModelInfo{ID: "fable-lite", MetadataModelID: "claude-sonnet-5-5"}, false},
+		{registry.ModelInfo{ID: "claude-sonnet-5-5"}, false},
+	}
+	for _, tc := range cases {
+		if got := isFableModel(&tc.model); got != tc.want {
+			t.Fatalf("isFableModel(%+v) = %v, want %v", tc.model, got, tc.want)
+		}
+	}
+}
+
+func TestFablePoolForgetsAccountsThatLeave(t *testing.T) {
+	now := testNow
+	release := make(chan struct{})
+	var mu sync.Mutex
+	cancelled := false
+	fetcher := &fakeFetcher{calls: map[string]int{}, fail: map[string]bool{"failing": true}}
+	auths := []*coreauth.Auth{claudeOAuth("failing"), claudeOAuth("hanging")}
+	pool := NewFablePool(func() []*coreauth.Auth {
+		mu.Lock()
+		defer mu.Unlock()
+		return auths
+	}, nil)
+	pool.servesFable = nil
+	pool.weight = func(*coreauth.Auth) float64 { return 1 }
+	pool.nowFunc = func() time.Time { return now }
+	pool.fetch = func(ctx context.Context, auth *coreauth.Auth) (fableReading, error) {
+		if auth.ID != "hanging" {
+			return fetcher.fetch(ctx, auth)
+		}
+		select {
+		case <-ctx.Done():
+			mu.Lock()
+			cancelled = true
+			mu.Unlock()
+		case <-release:
+		}
+		return fable(10, 24*time.Hour), nil
+	}
+
+	pool.Summary(context.Background(), 0)
+	pool.mu.Lock()
+	hanging := pool.inflight["hanging"]
+	pool.mu.Unlock()
+	if hanging == nil {
+		t.Fatal("the hanging lookup did not start")
+	}
+
+	mu.Lock()
+	auths = nil
+	mu.Unlock()
+	pool.Summary(context.Background(), 0)
+	<-hanging.done
+	close(release)
+	settle(pool)
+
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	mu.Lock()
+	defer mu.Unlock()
+	if !cancelled || len(pool.tried) != 0 || len(pool.inflight) != 0 || len(pool.readings) != 0 {
+		t.Fatalf("cancelled = %v, tried = %v, inflight = %v, readings = %v", cancelled, pool.tried, pool.inflight, pool.readings)
 	}
 }

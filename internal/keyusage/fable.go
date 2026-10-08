@@ -100,7 +100,7 @@ type FablePool struct {
 	mu       sync.Mutex
 	readings map[string]fableReading
 	tried    map[string]time.Time
-	inflight map[string]chan struct{}
+	inflight map[string]*lookup
 
 	list        func() []*coreauth.Auth
 	servesFable func(authID string) bool
@@ -109,13 +109,19 @@ type FablePool struct {
 	nowFunc     func() time.Time
 }
 
+// lookup is a running lookup of one account.
+type lookup struct {
+	done   chan struct{}
+	cancel context.CancelFunc
+}
+
 // NewFablePool creates a pool over the accounts list returns. cfg supplies the
 // global proxy for lookups.
 func NewFablePool(list func() []*coreauth.Auth, cfg func() *config.Config) *FablePool {
 	return &FablePool{
 		readings:    make(map[string]fableReading),
 		tried:       make(map[string]time.Time),
-		inflight:    make(map[string]chan struct{}),
+		inflight:    make(map[string]*lookup),
 		list:        list,
 		servesFable: registryServesFable,
 		fetch: func(ctx context.Context, auth *coreauth.Auth) (fableReading, error) {
@@ -156,11 +162,17 @@ func (p *FablePool) Summary(ctx context.Context, wait time.Duration) FableSummar
 			pending = append(pending, done)
 		}
 	}
-	for id := range p.readings {
-		if _, ok := known[id]; !ok {
-			delete(p.readings, id)
-			delete(p.tried, id)
+	// Every reading and lookup has a tried entry.
+	for id := range p.tried {
+		if _, ok := known[id]; ok {
+			continue
 		}
+		if running, ok := p.inflight[id]; ok {
+			running.cancel()
+			delete(p.inflight, id)
+		}
+		delete(p.readings, id)
+		delete(p.tried, id)
 	}
 	p.mu.Unlock()
 
@@ -204,22 +216,29 @@ func (p *FablePool) accounts() []*coreauth.Auth {
 // within refreshAfter. It returns the running lookup's done channel, or nil. p.mu
 // must be held.
 func (p *FablePool) refreshLocked(auth *coreauth.Auth, now time.Time) chan struct{} {
-	if done, ok := p.inflight[auth.ID]; ok {
-		return done
+	if running, ok := p.inflight[auth.ID]; ok {
+		return running.done
 	}
 	if last, ok := p.tried[auth.ID]; ok && now.Sub(last) < refreshAfter {
 		return nil
 	}
-	done := make(chan struct{})
-	p.inflight[auth.ID] = done
+	// The lookup is not tied to the reader's request: it fills the cache for the
+	// next reader too. It has no deadline, like other upstream calls, and is
+	// cancelled only when the account leaves the pool.
+	ctx, cancel := context.WithCancel(context.Background())
+	running := &lookup{done: make(chan struct{}), cancel: cancel}
+	p.inflight[auth.ID] = running
 	p.tried[auth.ID] = now
 	go func() {
-		defer close(done)
-		// The lookup is not tied to the reader's request: it fills the cache for
-		// the next reader too. It has no deadline, like other upstream calls.
-		reading, errFetch := p.fetch(context.Background(), auth)
+		defer close(running.done)
+		defer cancel()
+		reading, errFetch := p.fetch(ctx, auth)
 		p.mu.Lock()
 		defer p.mu.Unlock()
+		if p.inflight[auth.ID] != running {
+			// The account left the pool during the lookup.
+			return
+		}
 		delete(p.inflight, auth.ID)
 		if errFetch != nil {
 			log.Debugf("key usage: Fable lookup failed for credential %s: %v", auth.ID, errFetch)
@@ -228,7 +247,7 @@ func (p *FablePool) refreshLocked(auth *coreauth.Auth, now time.Time) chan struc
 		reading.at = p.nowFunc()
 		p.readings[auth.ID] = reading
 	}()
-	return done
+	return running.done
 }
 
 func waitAll(ctx context.Context, pending []chan struct{}, wait time.Duration) {
@@ -339,13 +358,22 @@ func roundPercent(value float64) float64 {
 
 // registryServesFable reports whether the credential registered a Fable model, so
 // accounts whose Fable models are excluded by configuration stay out of the pool.
+// Aliased models count by the upstream model they stand for.
 func registryServesFable(authID string) bool {
 	for _, model := range registry.GetGlobalRegistry().GetModelsForClient(authID) {
-		if model != nil && strings.Contains(strings.ToLower(model.ID), "fable") {
+		if model != nil && isFableModel(model) {
 			return true
 		}
 	}
 	return false
+}
+
+func isFableModel(model *registry.ModelInfo) bool {
+	id := strings.TrimSpace(model.MetadataModelID)
+	if id == "" {
+		id = model.ID
+	}
+	return strings.Contains(strings.ToLower(id), "fable")
 }
 
 // oauthToken returns the OAuth access token of a Claude account, or "" for API key

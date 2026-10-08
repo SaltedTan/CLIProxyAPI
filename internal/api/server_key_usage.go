@@ -19,9 +19,15 @@ const keyUsageFableWait = 3 * time.Second
 // plain text with ?format=text, or as one status bar line with ?format=line
 // (&color=1 for ANSI colors).
 func (s *Server) keyUsage(c *gin.Context) {
+	cfg := s.getConfig()
+	if cfg != nil && cfg.Home.Enabled {
+		// Home tracks client keys and holds the credentials; this node has neither.
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "key usage is not available when CLIProxyAPIHome manages this proxy"})
+		return
+	}
 	apiKey := clientKeyFromGin(c)
 	var names map[string]string
-	if cfg := s.getConfig(); cfg != nil {
+	if cfg != nil {
 		names = cfg.APIKeyNames
 	}
 	report := keyusage.Build(c.Request.Context(), apiKey, keyusage.KeyName(names, apiKey), clientusage.Default(), s.fablePool, keyUsageFableWait)

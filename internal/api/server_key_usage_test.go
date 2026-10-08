@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clientusage"
 	proxyconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/keyusage"
@@ -70,5 +71,21 @@ func TestKeyUsageReportsTheCallersOwnKey(t *testing.T) {
 	server.engine.ServeHTTP(line, request)
 	if got, want := line.Body.String(), "Claude 100% left · 7d window starts on next use │ Fable: n/a\n"; got != want {
 		t.Fatalf("line report = %q, want %q", got, want)
+	}
+}
+
+func TestKeyUsageIsUnavailableUnderHome(t *testing.T) {
+	server := newTestServerWithConfig(t, &proxyconfig.Config{SDKConfig: sdkconfig.SDKConfig{APIKeys: []string{"test-key"}}})
+	cfg := *server.getConfig()
+	cfg.Home.Enabled = true
+	server.cfg = &cfg
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/key/usage", nil)
+	c.Set("userApiKey", "test-key")
+	server.keyUsage(c)
+	if recorder.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d body = %s, want 501", recorder.Code, recorder.Body.String())
 	}
 }

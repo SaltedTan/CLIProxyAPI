@@ -33,8 +33,9 @@ when Fable returns.
 
 The script uses the proxy and key Claude Code already uses (`ANTHROPIC_BASE_URL` and
 `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY`). Set `CPA_BASE_URL` and `CPA_API_KEY`
-to use others. It needs `curl`, and caches the line for 30 seconds
-(`CPA_USAGE_CACHE_SECONDS`).
+to use others. It needs `curl`. It caches the line for 30 seconds
+(`CPA_USAGE_CACHE_SECONDS`) in a private file per proxy and key, when `sha256sum` or
+`shasum` is available.
 
 Without the script, a one-line command works too, with no cache:
 

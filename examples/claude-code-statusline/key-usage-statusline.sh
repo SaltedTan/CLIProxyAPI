@@ -16,12 +16,24 @@ key=${CPA_API_KEY:-${ANTHROPIC_AUTH_TOKEN:-$ANTHROPIC_API_KEY}}
 [ -n "$base" ] && [ -n "$key" ] || exit 0
 ttl=${CPA_USAGE_CACHE_SECONDS:-30}
 
+# Each proxy and key has its own private cache file, named by their SHA-256. Without
+# a SHA-256 tool, or a cache directory, the line is not cached.
+umask 077
+if command -v sha256sum >/dev/null 2>&1; then
+  digest=sha256sum
+else
+  digest='shasum -a 256'
+fi
+cache=
 cache_dir=${XDG_CACHE_HOME:-$HOME/.cache}/cpa-key-usage
-mkdir -p "$cache_dir" 2>/dev/null
-cache="$cache_dir/$(printf '%s %s' "$base" "$key" | cksum | cut -d' ' -f1)"
+name=$(printf '%s\n%s' "$base" "$key" | $digest 2>/dev/null | cut -d' ' -f1)
+if [ ${#name} -eq 64 ] && mkdir -p "$cache_dir" 2>/dev/null && chmod 700 "$cache_dir" 2>/dev/null; then
+  cache="$cache_dir/$name"
+fi
 
 now=$(date +%s)
-if [ -f "$cache" ]; then
+saved_line=
+if [ -n "$cache" ] && [ -f "$cache" ]; then
   { read -r saved_at; read -r saved_line; } <"$cache"
   if [ $((now - ${saved_at:-0})) -lt "$ttl" ]; then
     printf '%s\n' "$saved_line"
@@ -32,7 +44,9 @@ fi
 # The key is passed on stdin so it never appears in the process list.
 if line=$(printf 'x-api-key: %s\n' "$key" |
   curl -fsS --max-time 3 -H @- "${base%/}/v1/key/usage?format=line&color=1" 2>/dev/null); then
-  printf '%s\n%s\n' "$now" "$line" >"$cache.tmp" && mv "$cache.tmp" "$cache"
+  if [ -n "$cache" ]; then
+    printf '%s\n%s\n' "$now" "$line" >"$cache.$$" && mv "$cache.$$" "$cache"
+  fi
   printf '%s\n' "$line"
 elif [ -n "$saved_line" ]; then
   printf '%s (stale)\n' "$saved_line"
