@@ -85,11 +85,15 @@ type pendingWeight struct {
 type claudeCredential struct {
 	AuthIndex string `json:"auth_index,omitempty"`
 	// Info is the last resolved credential description, kept for deleted credentials.
-	Info        *CredentialInfo `json:"info,omitempty"`
-	Epoch       int64           `json:"epoch"`
-	ResetAt     time.Time       `json:"reset_at"`
-	Utilization float64         `json:"utilization"`
-	ObservedAt  time.Time       `json:"observed_at"`
+	Info *CredentialInfo `json:"info,omitempty"`
+	// Account identifies the upstream account the window state was observed for. It is
+	// nil for state saved by a version that did not record it, until the next
+	// observation that resolves the credential.
+	Account     *claudeAccount `json:"account,omitempty"`
+	Epoch       int64          `json:"epoch"`
+	ResetAt     time.Time      `json:"reset_at"`
+	Utilization float64        `json:"utilization"`
+	ObservedAt  time.Time      `json:"observed_at"`
 	// UtilizationSetAt is when the current Utilization was processed. Only a request
 	// that started after it was admitted upstream after that reading, so only such a
 	// request can report a genuine drop; lower values from concurrent requests are
@@ -100,6 +104,36 @@ type claudeCredential struct {
 	EpochStartedAt time.Time                 `json:"epoch_started_at"`
 	Pending        map[string]*pendingWeight `json:"pending,omitempty"`
 	Unattributed   claudeShare               `json:"unattributed"`
+}
+
+// claudeAccount is the identity of a Claude account (see coreauth.QuotaAccountIdentity).
+// Keys is empty for an account without identity metadata, such as a setup token.
+type claudeAccount struct {
+	Keys map[string]string `json:"keys,omitempty"`
+}
+
+// accountDiffers reports whether the recorded account of c differs from the account
+// identified by identity (see coreauth.QuotaIdentityMatch). State saved without an
+// account, or an account that is merely not proven the same, does not differ.
+//
+// account_uuid is ignored: it is synthesized when the profile lookup is refused, and the
+// real one replaces it once a refresh reads the profile, without the account changing.
+// Only the proof keys decide, so two accounts without them that are swapped under one
+// auth ID are still compared with each other.
+func (c *claudeCredential) accountDiffers(identity map[string]string) bool {
+	if c.Account == nil {
+		return false
+	}
+	// Without account_uuid on the observed side, a recorded one never conflicts; a
+	// recorded account_uuid that is missing is no dropped proof either.
+	metadata := make(map[string]any, len(identity))
+	for key, value := range identity {
+		if key != "account_uuid" {
+			metadata[key] = value
+		}
+	}
+	_, differs := coreauth.QuotaIdentityMatch(c.Account.Keys, &coreauth.Auth{Metadata: metadata})
+	return differs
 }
 
 type claudeObservation struct {
@@ -171,12 +205,15 @@ func (t *Tracker) observeClaudeLocked(record coreusage.Record, requestAt, now ti
 	}
 	observation, observed := parseClaudeWeeklyObservation(record.ResponseHeaders, now)
 	credential := t.claude[authID]
-	if credential == nil {
+	switch {
+	case credential == nil:
 		if !observed {
 			return nil
 		}
-		// The first observation is a baseline: usage before it cannot be attributed.
+		// The first observation is a baseline: usage before it cannot be attributed. An
+		// unresolved credential is recorded without identity, so its reading is not used.
 		credential = &claudeCredential{
+			Account:          &claudeAccount{},
 			Epoch:            1,
 			ResetAt:          observation.resetAt,
 			Utilization:      observation.utilization,
@@ -185,11 +222,22 @@ func (t *Tracker) observeClaudeLocked(record coreusage.Record, requestAt, now ti
 			EpochStartedAt:   now,
 		}
 		t.claude[authID] = credential
-	} else if observed {
+	case observed && plan != nil && credential.accountDiffers(plan.Identity):
+		// The auth ID now holds another account, whose usage cannot be compared with the
+		// previous account's: start a new baseline as for a first observation. Pending
+		// weight was queued for the previous account and is dropped.
+		credential.Pending = nil
+		credential.startEpoch(observation.resetAt, now)
+		credential.setUtilization(observation.utilization, now)
+		credential.ObservedAt = now
+	case observed:
 		t.applyClaudeObservationLocked(authID, credential, observation, requestAt, now, plan)
 	}
 	if plan != nil {
 		credential.Info = plan
+		if observed {
+			credential.Account = &claudeAccount{Keys: plan.Identity}
+		}
 	}
 	if index := strings.TrimSpace(record.AuthIndex); index != "" {
 		credential.AuthIndex = index
@@ -270,7 +318,10 @@ func (t *Tracker) applyClaudeObservationLocked(authID string, credential *claude
 
 // ClaudeQuota returns the last weekly window reading of a Claude credential, by its
 // auth ID, for quota-aware routing. The reading is saved with the usage state, so it
-// survives restarts, which clear the credential's own quota snapshot.
+// survives restarts, which clear the credential's own quota snapshot. It is returned
+// only when the identity recorded with it proves auth to be the account it was taken
+// for, so an account without identity metadata gets none. State saved by a version that
+// recorded no identity is returned until its next observation records one.
 func (t *Tracker) ClaudeQuota(auth *coreauth.Auth) (coreauth.QuotaReading, bool) {
 	if t == nil || auth == nil {
 		return coreauth.QuotaReading{}, false
@@ -280,6 +331,11 @@ func (t *Tracker) ClaudeQuota(auth *coreauth.Auth) (coreauth.QuotaReading, bool)
 	credential := t.claude[strings.TrimSpace(auth.ID)]
 	if credential == nil || credential.ResetAt.IsZero() {
 		return coreauth.QuotaReading{}, false
+	}
+	if credential.Account != nil {
+		if proven, _ := coreauth.QuotaIdentityMatch(credential.Account.Keys, auth); !proven {
+			return coreauth.QuotaReading{}, false
+		}
 	}
 	return coreauth.QuotaReading{
 		Weekly:     &coreauth.QuotaWindowReading{Used: credential.Utilization, ResetAt: credential.ResetAt},

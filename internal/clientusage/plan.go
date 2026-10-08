@@ -38,6 +38,9 @@ type CredentialInfo struct {
 	// allowance fall back to the credential weight, which also expresses relative
 	// plan size for quota-aware routing.
 	PlanSource string `json:"plan_source"`
+	// Identity identifies the credential's upstream account (see
+	// coreauth.QuotaAccountIdentity). It is never reported or saved with Info.
+	Identity map[string]string `json:"-"`
 }
 
 // CredentialInfoFromAuth resolves the report details of a credential. An explicit
@@ -48,7 +51,7 @@ func CredentialInfoFromAuth(auth *coreauth.Auth) CredentialInfo {
 	if auth == nil {
 		return CredentialInfo{Plan: PlanUnknown, PlanProUnits: 1, PlanSource: PlanSourceWeight}
 	}
-	info := CredentialInfo{AuthIndex: auth.Index, Label: strings.TrimSpace(auth.Label)}
+	info := CredentialInfo{AuthIndex: auth.Index, Label: strings.TrimSpace(auth.Label), Identity: coreauth.QuotaAccountIdentity(auth)}
 	if info.Label == "" {
 		info.Label = metadataString(auth.Metadata, "email")
 	}

@@ -683,3 +683,65 @@ func TestObserveResponseHeadersKeepsPrimaryWhenTruncatingAdditional(t *testing.T
 		t.Fatalf("snapshot size = %d, want %d", len(quota.Signals), maxQuotaSignalHeaders)
 	}
 }
+
+func TestQuotaIdentityMatchComparesASavedIdentity(t *testing.T) {
+	t.Parallel()
+	identity := map[string]string{"organization_uuid": "org-a", "email": "a@example.com"}
+	cases := []struct {
+		name    string
+		saved   map[string]string
+		current map[string]any
+		proven  bool
+		differs bool
+	}{
+		{name: "match", saved: identity, current: map[string]any{"organization_uuid": "org-a", "email": " A@example.com "}, proven: true},
+		{name: "conflict", saved: identity, current: map[string]any{"organization_uuid": "org-b", "email": "a@example.com"}, differs: true},
+		{name: "dropped key", saved: identity, current: map[string]any{"email": "a@example.com"}, differs: true},
+		{name: "gained key", saved: map[string]string{"email": "a@example.com"}, current: map[string]any{"organization_uuid": "org-a", "email": "a@example.com"}, proven: true},
+		{name: "account_uuid only", saved: map[string]string{"account_uuid": "u-1"}, current: map[string]any{"account_uuid": "u-1"}},
+		{name: "account_uuid conflict", saved: map[string]string{"account_uuid": "u-1"}, current: map[string]any{"account_uuid": "u-2"}, differs: true},
+		{name: "dropped account_uuid", saved: map[string]string{"account_uuid": "u-1", "email": "a@example.com"}, current: map[string]any{"email": "a@example.com"}, proven: true},
+		{name: "empty saved", saved: map[string]string{}, current: map[string]any{"organization_uuid": "org-a"}},
+		{name: "empty both", saved: nil, current: nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			auth := &Auth{ID: "claude-1", Provider: "claude", Metadata: tc.current}
+			proven, differs := QuotaIdentityMatch(tc.saved, auth)
+			if proven != tc.proven || differs != tc.differs {
+				t.Fatalf("QuotaIdentityMatch() = proven %v, differs %v; want %v, %v", proven, differs, tc.proven, tc.differs)
+			}
+			// A saved identity follows the identity rules between two auths.
+			existing := &Auth{ID: "claude-1", Provider: "claude", Metadata: map[string]any{}}
+			for key, value := range tc.saved {
+				existing.Metadata[key] = value
+			}
+			if wantProven, conflict := quotaAccountMetadata(existing, auth); proven != wantProven || (conflict && !differs) {
+				t.Fatalf("QuotaIdentityMatch() = proven %v, differs %v; quotaAccountMetadata() = proven %v, conflict %v", proven, differs, wantProven, conflict)
+			}
+		})
+	}
+}
+
+func TestQuotaAccountIdentity(t *testing.T) {
+	t.Parallel()
+	auth := &Auth{ID: "claude-1", Provider: "claude", Metadata: map[string]any{
+		"organization_uuid": " org-a ",
+		"email":             "a@example.com",
+		"account_uuid":      "",
+		"user_id":           42,
+		"access_token":      "secret",
+	}}
+	want := map[string]string{"organization_uuid": "org-a", "email": "a@example.com"}
+	if got := QuotaAccountIdentity(auth); !reflect.DeepEqual(got, want) {
+		t.Fatalf("QuotaAccountIdentity() = %v, want %v", got, want)
+	}
+	for name, other := range map[string]*Auth{"nil": nil, "no metadata": {ID: "claude-2"}} {
+		if got := QuotaAccountIdentity(other); got == nil || len(got) != 0 {
+			t.Fatalf("QuotaAccountIdentity(%s) = %#v, want an empty map", name, got)
+		}
+	}
+	if proven, differs := QuotaIdentityMatch(QuotaAccountIdentity(auth), auth); !proven || differs {
+		t.Fatalf("an auth's own identity: proven %v, differs %v; want proven", proven, differs)
+	}
+}

@@ -68,10 +68,40 @@ func TestQuotaAwareRoutingSelectorWrappedBySessionAffinity(t *testing.T) {
 	}
 }
 
+// resolveClientUsageCredentials makes the client usage tracker resolve Claude credentials
+// from auths, as the service resolves them from its auth manager, until the test ends.
+func resolveClientUsageCredentials(t *testing.T, auths ...*coreauth.Auth) {
+	t.Helper()
+	byID := make(map[string]*coreauth.Auth, len(auths))
+	for _, auth := range auths {
+		byID[auth.ID] = auth
+	}
+	tracker := clientusage.Default()
+	tracker.SetCredentialResolver(func(authID string) (clientusage.CredentialInfo, bool) {
+		auth, ok := byID[authID]
+		if !ok {
+			return clientusage.CredentialInfo{}, false
+		}
+		return clientusage.CredentialInfoFromAuth(auth), true
+	})
+	t.Cleanup(func() { tracker.SetCredentialResolver(nil) })
+}
+
+// claudeAccountAuth returns an active Claude credential of its own account.
+func claudeAccountAuth(id string) *coreauth.Auth {
+	return &coreauth.Auth{ID: id, Provider: "claude", Status: coreauth.StatusActive, Metadata: map[string]any{
+		"organization_uuid": "org-" + id,
+		"email":             id + "@example.com",
+	}}
+}
+
 // Credentials without a quota snapshot, as after a restart, are ranked from the weekly
 // readings the client usage tracker kept for them.
 func TestQuotaAwareRoutingSelectorReadsClientUsageWeeklyQuota(t *testing.T) {
 	now := time.Now()
+	// "a" sorts first, so round-robin over credentials without data would pick it.
+	auths := []*coreauth.Auth{claudeAccountAuth("qa-tracker-a"), claudeAccountAuth("qa-tracker-b")}
+	resolveClientUsageCredentials(t, auths...)
 	for id, reading := range map[string]struct {
 		used    string
 		resetIn time.Duration
@@ -93,11 +123,6 @@ func TestQuotaAwareRoutingSelectorReadsClientUsageWeeklyQuota(t *testing.T) {
 	selector := newRoutingSelector(normalizedRoutingRuntimeState(&internalconfig.Config{
 		Routing: internalconfig.RoutingConfig{Strategy: "quota-aware"},
 	}), usageCache)
-	// "a" sorts first, so round-robin over credentials without data would pick it.
-	auths := []*coreauth.Auth{
-		{ID: "qa-tracker-a", Provider: "claude", Status: coreauth.StatusActive},
-		{ID: "qa-tracker-b", Provider: "claude", Status: coreauth.StatusActive},
-	}
 	picked, errPick := selector.Pick(context.Background(), "claude", "claude-sonnet-4-5", cliproxyexecutor.Options{}, auths)
 	if errPick != nil || picked == nil || picked.ID != "qa-tracker-b" {
 		pickedID := ""
@@ -112,6 +137,8 @@ func TestQuotaAwareRoutingSelectorReadsClientUsageWeeklyQuota(t *testing.T) {
 // endpoint readings second, so the saved reading wins a tie.
 func TestQuotaAwareRoutingSourcesTrackerThenUsageCache(t *testing.T) {
 	now := time.Now()
+	auth := claudeAccountAuth("qa-sources-a")
+	resolveClientUsageCredentials(t, auth)
 	clientusage.Default().HandleUsage(context.Background(), usage.Record{
 		Provider:    "claude",
 		AuthID:      "qa-sources-a",
@@ -129,7 +156,6 @@ func TestQuotaAwareRoutingSourcesTrackerThenUsageCache(t *testing.T) {
 	if len(sources) != 2 {
 		t.Fatalf("sources = %d, want the tracker and the usage cache", len(sources))
 	}
-	auth := &coreauth.Auth{ID: "qa-sources-a", Provider: "claude"}
 	if reading, ok := sources[0](auth); !ok || reading.Source != "last-known" || reading.Weekly == nil || reading.Weekly.Used != 0.3 {
 		t.Fatalf("first source reading = %+v (%v), want the tracker's", reading, ok)
 	}

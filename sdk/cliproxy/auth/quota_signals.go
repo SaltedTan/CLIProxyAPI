@@ -306,10 +306,18 @@ func sameQuotaProvider(existing, incoming *Auth) bool {
 //   - a key only incoming has is ignored: an older file gains identity when the proxy fills
 //     it from the profile.
 func quotaAccountMetadata(existing, incoming *Auth) (proven, conflict bool) {
-	dropped := false
+	proven, conflict, _ = compareQuotaIdentity(authIdentityLookup(existing), authIdentityLookup(incoming))
+	return proven, conflict
+}
+
+// compareQuotaIdentity applies the rules of quotaAccountMetadata to two lookups of identity
+// metadata values ("" when absent). dropped reports a proof key that existing has and
+// incoming lacks; it is only complete when there is no conflict.
+func compareQuotaIdentity(existing, incoming func(key string) string) (proven, conflict, dropped bool) {
+	matched := false
 	for _, key := range quotaAccountMetadataKeys {
-		existingValue := authMetadataString(existing, key)
-		incomingValue := authMetadataString(incoming, key)
+		existingValue := existing(key)
+		incomingValue := incoming(key)
 		if existingValue == "" || incomingValue == "" {
 			if existingValue != "" && key != "account_uuid" {
 				dropped = true
@@ -317,13 +325,43 @@ func quotaAccountMetadata(existing, incoming *Auth) (proven, conflict bool) {
 			continue
 		}
 		if !strings.EqualFold(existingValue, incomingValue) {
-			return false, true
+			return false, true, dropped
 		}
 		if key != "account_uuid" {
-			proven = true
+			matched = true
 		}
 	}
-	return proven && !dropped, false
+	return matched && !dropped, false, dropped
+}
+
+// authIdentityLookup returns the identity metadata lookup of auth.
+func authIdentityLookup(auth *Auth) func(key string) string {
+	return func(key string) string { return authMetadataString(auth, key) }
+}
+
+// QuotaAccountIdentity returns the identity metadata of auth that quota data is matched
+// by (see QuotaIdentityMatch): the non-empty values of the quota identity keys, never nil.
+// Saved with quota data, it identifies the account the data was taken for.
+func QuotaAccountIdentity(auth *Auth) map[string]string {
+	identity := make(map[string]string)
+	for _, key := range quotaAccountMetadataKeys {
+		if value := authMetadataString(auth, key); value != "" {
+			identity[key] = value
+		}
+	}
+	return identity
+}
+
+// QuotaIdentityMatch compares a saved identity (see QuotaAccountIdentity), the existing
+// side, with the identity metadata of auth by the rules of quotaAccountMetadata. proven
+// reports that a proof key (any key but account_uuid) matches and none that saved has is
+// missing from auth. differs reports that auth is, or may be, another account: a value
+// conflicts, or auth lacks a proof key that saved has. Unlike two auths, a saved identity
+// has no lineage or credentials, so without proof it never proves the account.
+func QuotaIdentityMatch(saved map[string]string, auth *Auth) (proven, differs bool) {
+	lookup := func(key string) string { return strings.TrimSpace(saved[key]) }
+	proven, conflict, dropped := compareQuotaIdentity(lookup, authIdentityLookup(auth))
+	return proven, conflict || dropped
 }
 
 // quotaLineageCounter issues quota lineages (see Auth.quotaLineage).

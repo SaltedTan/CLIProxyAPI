@@ -513,6 +513,8 @@ func TestTrackerPersistsAcrossRestart(t *testing.T) {
 	if errOpen := tracker.Open(path); errOpen != nil {
 		t.Fatalf("open: %v", errOpen)
 	}
+	accounts := claudeAccounts{"claude-1": accountAuth("claude-1", accountA)}
+	tracker.SetCredentialResolver(accounts.resolve)
 	resetAt := testNow.Add(72 * time.Hour)
 	tracker.HandleUsage(context.Background(), claudeRecord("secret-key", "claude-1", testNow, claudeObs{0.10, resetAt}, breakdown(100, 0, 0, 10, 0)))
 	if errFlush := tracker.Flush(); errFlush != nil {
@@ -522,7 +524,7 @@ func TestTrackerPersistsAcrossRestart(t *testing.T) {
 	if errRead != nil {
 		t.Fatalf("read state: %v", errRead)
 	}
-	if !json.Valid(data) || bytes.Contains(data, []byte("secret-key")) {
+	if !json.Valid(data) || bytes.Contains(data, []byte("secret-key")) || bytes.Contains(data, []byte("token-secret")) {
 		t.Fatalf("state must be JSON without raw keys: %s", data)
 	}
 	if info, errStat := os.Stat(path); errStat != nil || info.Mode().Perm() != 0o600 {
@@ -533,8 +535,9 @@ func TestTrackerPersistsAcrossRestart(t *testing.T) {
 	if errOpen := restarted.Open(path); errOpen != nil {
 		t.Fatalf("reopen: %v", errOpen)
 	}
+	restarted.SetCredentialResolver(accounts.resolve)
 	// The credential's weekly reading survives for quota-aware routing.
-	if reading, ok := restarted.ClaudeQuota(&coreauth.Auth{ID: "claude-1"}); !ok || reading.Weekly == nil || reading.Weekly.Used != 0.10 || !reading.Weekly.ResetAt.Equal(resetAt) ||
+	if reading, ok := restarted.ClaudeQuota(accountAuth("claude-1", accountA)); !ok || reading.Weekly == nil || reading.Weekly.Used != 0.10 || !reading.Weekly.ResetAt.Equal(resetAt) ||
 		reading.Short != nil || reading.Fable != nil || !reading.ObservedAt.Equal(testNow) || reading.Source != "last-known" {
 		t.Fatalf("weekly reading after restart = %+v (%v)", reading, ok)
 	}

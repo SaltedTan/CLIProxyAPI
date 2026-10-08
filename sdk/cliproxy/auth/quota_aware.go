@@ -126,7 +126,7 @@ type QuotaReading struct {
 // QuotaSource returns a credential's quota reading. It is called on the selection path
 // without manager locks and must not block on the network. A source keyed by auth ID
 // should check that its reading describes the credential's current upstream account
-// (see SameQuotaAccount).
+// (see SameQuotaAccount, or QuotaIdentityMatch for an identity saved with the reading).
 type QuotaSource func(auth *Auth) (QuotaReading, bool)
 
 // SameQuotaAccount reports whether incoming draws quota from the same upstream account as
