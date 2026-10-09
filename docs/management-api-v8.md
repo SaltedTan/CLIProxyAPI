@@ -127,6 +127,42 @@ retain the corresponding business operation's fields.
 | `/plugins/store/<id>/install` | POST | Install or update a plugin. |
 | `/plugins/<id>/quota` | GET, POST, DELETE | Read, fetch, or reset plugin quota. |
 
+### Credential refresh failures
+
+Each `GET /credentials` entry reports the last failed OAuth token refresh until
+a refresh succeeds. Request results do not change it. The record is in memory
+only: a restart, or re-registering the credential from its file (for example
+after a new login), clears it until the next refresh attempt.
+
+```json
+{
+  "status": "active",
+  "status_message": "refresh token rejected; sign in again before the access token expires at 2026-10-09T18:00:00Z",
+  "refresh_error": {
+    "message": "token refresh failed with status 400: {\"error\":\"invalid_grant\"}",
+    "code": "invalid_grant",
+    "http_status": 400,
+    "at": "2026-10-09T10:00:00Z"
+  },
+  "next_refresh_after": "2026-10-09T10:01:00Z"
+}
+```
+
+- `refresh_error` is present only after a failed refresh. `message` is the
+  same sanitized diagnostic the warning log shows, at most about 300 characters,
+  with tokens, secrets, and cookies redacted. `code` (`invalid_grant` or
+  `unauthorized`) and `http_status` appear when known; `at` is when the refresh
+  failed.
+- `next_refresh_after` is when the next refresh attempt is due. It appears only
+  with `refresh_error`.
+- A credential whose access token is still valid stays active after a failed
+  refresh. When the provider rejected the refresh token itself (`invalid_grant`
+  or HTTP 401) and the credential is otherwise healthy (status `active`, no
+  status message), `status_message` asks the operator to sign in again and names
+  the access token expiry when it is known. Transient failures (network errors,
+  5xx, 429) never set `status_message`, and disabled or failing credentials keep
+  their own message.
+
 ## Routing observability
 
 `GET /observability/routing` reports what the running selector is doing on this

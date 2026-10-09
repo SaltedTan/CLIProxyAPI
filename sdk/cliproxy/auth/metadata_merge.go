@@ -54,8 +54,16 @@ func MergeExistingAuthMetadata(target *Auth, existingMap map[string]any) {
 
 // MergePreparedAuth merges prepared request auth updates into current without modifying
 // refresh lifecycle fields (such as LastRefreshedAt, LastError, or cooldown status).
+// The one exception: a preparation that exchanged tokens (it stamps LastRefreshedAt,
+// as Meta's key mint does) proves refresh works again, so it clears RefreshError.
 func MergePreparedAuth(base, current, updated *Auth) *Auth {
-	return mergeAuthContent(base, current, updated)
+	merged := mergeAuthContent(base, current, updated)
+	if merged != nil && base != nil && current != nil && updated != nil &&
+		current.RegistrationEpoch == base.RegistrationEpoch && updated.LastRefreshedAt.After(base.LastRefreshedAt) {
+		merged.RefreshError = nil
+		merged.RefreshErrorAt = time.Time{}
+	}
+	return merged
 }
 
 // MergeRefreshedAuth merges the refresh results from updated (derived from base)
@@ -77,6 +85,8 @@ func MergeRefreshedAuth(base, current, updated *Auth) *Auth {
 	if !updated.NextRefreshAfter.IsZero() || (base != nil && !base.NextRefreshAfter.IsZero()) {
 		merged.NextRefreshAfter = updated.NextRefreshAfter
 	}
+	merged.RefreshError = cloneError(updated.RefreshError)
+	merged.RefreshErrorAt = updated.RefreshErrorAt
 
 	// 2. Error and Status recovery
 	baseErrMsg := ""

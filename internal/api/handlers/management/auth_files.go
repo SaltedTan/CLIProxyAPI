@@ -654,7 +654,13 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quotaSupported .
 	if name == "" {
 		name = auth.ID
 	}
-	unavailable, status, statusMessage, nextRetryAfter := reconcileAuthFileCooldownState(auth, time.Now().UTC())
+	now := time.Now().UTC()
+	unavailable, status, statusMessage, nextRetryAfter := reconcileAuthFileCooldownState(auth, now)
+	if status == coreauth.StatusActive && statusMessage == "" && auth.RefreshTokenRejected() {
+		// The panel flags any status message, so only a dead refresh token earns
+		// one; transient refresh failures appear in refresh_error alone.
+		statusMessage = refreshTokenRejectedStatusMessage(auth, now)
+	}
 	entry := gin.H{
 		"id":             auth.ID,
 		"auth_index":     auth.Index,
@@ -731,6 +737,12 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quotaSupported .
 	if !nextRetryAfter.IsZero() {
 		entry["next_retry_after"] = nextRetryAfter
 	}
+	if auth.RefreshError != nil {
+		entry["refresh_error"] = authFileRefreshErrorPayload(auth)
+		if !auth.NextRefreshAfter.IsZero() {
+			entry["next_refresh_after"] = auth.NextRefreshAfter
+		}
+	}
 	if path != "" {
 		entry["path"] = path
 		entry["source"] = "file"
@@ -791,6 +803,31 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quotaSupported .
 		entry["request_retry"] = requestRetry
 	}
 	return entry
+}
+
+// authFileRefreshErrorPayload describes the last failed token refresh. The
+// manager records the message already sanitized and bounded for operators.
+func authFileRefreshErrorPayload(auth *coreauth.Auth) gin.H {
+	refreshErr := auth.RefreshError
+	payload := gin.H{"message": refreshErr.Message}
+	if code := strings.TrimSpace(refreshErr.Code); code != "" {
+		payload["code"] = code
+	}
+	if refreshErr.HTTPStatus > 0 {
+		payload["http_status"] = refreshErr.HTTPStatus
+	}
+	if !auth.RefreshErrorAt.IsZero() {
+		payload["at"] = auth.RefreshErrorAt
+	}
+	return payload
+}
+
+func refreshTokenRejectedStatusMessage(auth *coreauth.Auth, now time.Time) string {
+	const message = "refresh token rejected; sign in again"
+	if expiresAt, ok := auth.AccessTokenExpirationTime(); ok && expiresAt.After(now) {
+		return message + " before the access token expires at " + expiresAt.UTC().Format(time.RFC3339)
+	}
+	return message
 }
 
 func authFileRequestRetryFromJSON(data []byte) (int, bool) {

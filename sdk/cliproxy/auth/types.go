@@ -92,6 +92,12 @@ type Auth struct {
 	NextRefreshAfter time.Time `json:"next_refresh_after"`
 	// RefreshFailures tracks consecutive refresh failures for exponential backoff (in-memory only).
 	RefreshFailures int `json:"-"`
+	// RefreshError records the last failed token refresh with an operator-safe
+	// message (in-memory only). Unlike LastError, request results never set or
+	// clear it; a successful refresh clears it.
+	RefreshError *Error `json:"-"`
+	// RefreshErrorAt is when RefreshError was recorded (in-memory only).
+	RefreshErrorAt time.Time `json:"-"`
 	// NextRetryAfter is the earliest time a retry should retrigger.
 	NextRetryAfter time.Time `json:"next_retry_after"`
 	// ModelStates tracks per-model runtime availability data.
@@ -318,8 +324,19 @@ func (a *Auth) Clone() *Auth {
 			copyAuth.ModelStates[key] = state.Clone()
 		}
 	}
+	copyAuth.RefreshError = cloneError(a.RefreshError)
 	copyAuth.Runtime = a.Runtime
 	return &copyAuth
+}
+
+// RefreshTokenRejected reports whether the last failed token refresh shows that
+// the provider rejected the refresh token itself (invalid_grant or 401), so only
+// a new login can recover the credential.
+func (a *Auth) RefreshTokenRejected() bool {
+	if a == nil || a.RefreshError == nil {
+		return false
+	}
+	return a.RefreshError.StatusCode() == http.StatusUnauthorized || isInvalidGrantResultError(a.RefreshError)
 }
 
 func stableAuthIndex(seed string) string {

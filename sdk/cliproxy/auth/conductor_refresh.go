@@ -556,6 +556,21 @@ func invalidGrantBackoffDuration(failures int) time.Duration {
 	return backoff
 }
 
+// refreshFailureError describes a failed token refresh for operators. It names
+// invalid_grant when the status alone does not classify it, and keeps only the
+// bounded log-safe diagnostic, without credentials, cookies, or full bodies.
+func refreshFailureError(err error) *Error {
+	refreshErr := refreshErrorFromError(err)
+	if refreshErr == nil {
+		return nil
+	}
+	if refreshErr.Code == "" && isInvalidGrantError(err) {
+		refreshErr.Code = "invalid_grant"
+	}
+	refreshErr.Message = sanitizerCookiePattern.ReplaceAllString(safeErrorDiagnosticForLog(err), "Cookie: [REDACTED]")
+	return refreshErr
+}
+
 func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	_, _ = m.refreshAuthForRequest(ctx, id, "")
 }
@@ -675,6 +690,10 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 				return nil, err
 			}
 			wasTerminalUnauthorized := hasUnauthorizedAuthFailure(current)
+			// Request results overwrite LastError, so keep the refresh failure
+			// separately for operators until a refresh succeeds.
+			current.RefreshError = refreshFailureError(err)
+			current.RefreshErrorAt = now
 			if wasTerminalUnauthorized {
 				current.Generation++
 				current.UpdatedAt = now
@@ -795,6 +814,8 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	updated.StatusMessage = ""
 	updated.Unavailable = false
 	updated.RefreshFailures = 0
+	updated.RefreshError = nil
+	updated.RefreshErrorAt = time.Time{}
 	if updated.Status == StatusError || updated.Status == "" {
 		updated.Status = StatusActive
 	}
