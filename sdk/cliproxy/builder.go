@@ -260,6 +260,7 @@ func (b *Builder) Build() (*Service, error) {
 		return service.currentConfig()
 	})
 
+	logRoutingConfigWarnings(b.cfg)
 	coreManager := b.coreManager
 	cooldownStateStore := b.cooldownStateStore
 	var appliedRoutingState *routingRuntimeState

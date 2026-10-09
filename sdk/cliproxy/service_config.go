@@ -43,27 +43,65 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 		return state
 	}
 
-	switch strings.ToLower(strings.TrimSpace(cfg.Routing.Strategy)) {
-	case "weighted-round-robin", "weightedroundrobin", "wrr":
-		state.strategy = "weighted-round-robin"
-	case "fill-first", "fillfirst", "ff":
-		state.strategy = "fill-first"
-	case "quota-aware", "quotaaware", "qa", "reset-priority":
-		state.strategy = "quota-aware"
-	}
+	state.strategy, _ = routingStrategyName(cfg.Routing.Strategy)
 	state.sessionAffinity = cfg.Routing.SessionAffinity
-	if ttl := strings.TrimSpace(cfg.Routing.SessionAffinityTTL); ttl != "" {
-		if parsed, errParse := time.ParseDuration(ttl); errParse == nil && parsed > 0 {
-			if parsed < time.Second {
-				parsed = time.Second
-			}
-			state.sessionAffinityTTL = parsed
+	if parsed, ok := sessionAffinityTTL(cfg.Routing.SessionAffinityTTL); ok {
+		if parsed < time.Second {
+			parsed = time.Second
 		}
+		state.sessionAffinityTTL = parsed
 	}
 	if state.sessionAffinity && cfg.Routing.SessionAffinitySubagents != nil {
 		state.sessionAffinitySubagents = *cfg.Routing.SessionAffinitySubagents
 	}
 	return state
+}
+
+// routingStrategyName returns the canonical name of a configured routing strategy.
+// An unknown name reports false and routes round-robin.
+func routingStrategyName(value string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "round-robin", "roundrobin", "rr":
+		return "round-robin", true
+	case "weighted-round-robin", "weightedroundrobin", "wrr":
+		return "weighted-round-robin", true
+	case "fill-first", "fillfirst", "ff":
+		return "fill-first", true
+	case "quota-aware", "quotaaware", "qa", "reset-priority":
+		return "quota-aware", true
+	}
+	return "round-robin", false
+}
+
+// sessionAffinityTTL parses a configured session affinity TTL. An empty or invalid
+// value reports false and keeps the default.
+func sessionAffinityTTL(value string) (time.Duration, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+	parsed, errParse := time.ParseDuration(value)
+	if errParse != nil || parsed <= 0 {
+		return 0, false
+	}
+	return parsed, true
+}
+
+// logRoutingConfigWarnings warns about routing settings the proxy does not understand
+// and replaces with a default, so a typo does not silently change how credentials are
+// picked.
+func logRoutingConfigWarnings(cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	if _, ok := routingStrategyName(cfg.Routing.Strategy); !ok {
+		log.Warnf("routing.strategy %q is not a known strategy (round-robin, weighted-round-robin, fill-first, quota-aware); routing round-robin instead", strings.TrimSpace(cfg.Routing.Strategy))
+	}
+	if ttl := strings.TrimSpace(cfg.Routing.SessionAffinityTTL); ttl != "" {
+		if _, ok := sessionAffinityTTL(ttl); !ok {
+			log.Warnf("routing.session-affinity-ttl %q is not a positive duration such as 30m or 2h; using 1h instead", ttl)
+		}
+	}
 }
 
 // quotaAwareActive reports whether the current configuration routes with quota-aware.
@@ -251,6 +289,7 @@ func (s *Service) applyManagerConfig(ctx context.Context, commit configCommit) b
 	if errContext := ctx.Err(); errContext != nil {
 		return false
 	}
+	logRoutingConfigWarnings(commit.cfg)
 	routingState := normalizedRoutingRuntimeState(commit.cfg)
 	if s.appliedRoutingState == nil || *s.appliedRoutingState != routingState {
 		s.replaceRoutingSelector(newRoutingSelector(routingState, s.claudeUsage), time.Now())
