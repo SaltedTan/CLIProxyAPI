@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type endpointKey struct{}
@@ -32,6 +33,10 @@ type responseStatusHolder struct {
 type responseHeadersHolder struct {
 	mu      sync.RWMutex
 	headers http.Header
+	// observedAt is when headers were last received from upstream. A long stream
+	// completes well after its headers arrived, and quota readings must be ordered
+	// by when they were taken, not by when their request finished.
+	observedAt time.Time
 }
 
 func WithEndpoint(ctx context.Context, endpoint string) context.Context {
@@ -113,6 +118,11 @@ func SetResponseStatus(ctx context.Context, status int) {
 }
 
 func SetResponseHeaders(ctx context.Context, headers http.Header) {
+	SetResponseHeadersAt(ctx, headers, time.Now())
+}
+
+// SetResponseHeadersAt records upstream response headers received at observedAt.
+func SetResponseHeadersAt(ctx context.Context, headers http.Header, observedAt time.Time) {
 	if ctx == nil {
 		return
 	}
@@ -123,6 +133,7 @@ func SetResponseHeaders(ctx context.Context, headers http.Header) {
 	holder.mu.Lock()
 	defer holder.mu.Unlock()
 	holder.headers = cloneHTTPHeader(headers)
+	holder.observedAt = observedAt
 }
 
 // MergeResponseHeaders adds headers observed after the initial HTTP response,
@@ -147,6 +158,7 @@ func MergeResponseHeaders(ctx context.Context, headers http.Header) {
 		}
 		holder.headers[canonicalKey] = append([]string(nil), values...)
 	}
+	holder.observedAt = time.Now()
 }
 
 func GetResponseStatus(ctx context.Context) int {
@@ -161,16 +173,23 @@ func GetResponseStatus(ctx context.Context) int {
 }
 
 func GetResponseHeaders(ctx context.Context) http.Header {
+	headers, _ := GetObservedResponseHeaders(ctx)
+	return headers
+}
+
+// GetObservedResponseHeaders returns the upstream response headers and when they were
+// last received. The time is zero when no headers were recorded.
+func GetObservedResponseHeaders(ctx context.Context) (http.Header, time.Time) {
 	if ctx == nil {
-		return nil
+		return nil, time.Time{}
 	}
 	holder, ok := ctx.Value(responseHeadersKey{}).(*responseHeadersHolder)
 	if !ok || holder == nil {
-		return nil
+		return nil, time.Time{}
 	}
 	holder.mu.RLock()
 	defer holder.mu.RUnlock()
-	return cloneHTTPHeader(holder.headers)
+	return cloneHTTPHeader(holder.headers), holder.observedAt
 }
 
 func cloneHTTPHeader(src http.Header) http.Header {

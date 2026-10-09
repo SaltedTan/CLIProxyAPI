@@ -762,13 +762,24 @@ func isStaleExecutionResult(result Result, current *Auth) bool {
 // isStaleExecutionResult rejected. Such a result must not change the status of the newer
 // credential, but while its quota lineage matches, its response headers still describe the
 // account's quota: a token refresh or a replace proven to keep the account changed the
-// credential version. It reports whether the snapshot changed.
-func observeStaleResultQuota(result Result, auth *Auth, headers http.Header, now time.Time) bool {
+// credential version. observedAt is when the headers arrived; an older reading than the
+// installed one is ignored. It reports whether the snapshot changed.
+func observeStaleResultQuota(result Result, auth *Auth, headers http.Header, observedAt time.Time) bool {
 	if auth == nil || result.SkipQuotaObservation || result.quotaLineage == 0 ||
 		result.quotaLineage != auth.quotaLineage || !ProviderSupportsQuotaObservation(result.Provider) {
 		return false
 	}
-	return auth.Quota.ObserveResponseHeadersForProvider(result.Provider, headers, now)
+	return auth.Quota.ObserveResponseHeadersForProvider(result.Provider, headers, observedAt)
+}
+
+// observedResponseHeaders returns the response headers of ctx and when they arrived,
+// or now when the time is unknown.
+func observedResponseHeaders(ctx context.Context, now time.Time) (http.Header, time.Time) {
+	headers, observedAt := internallogging.GetObservedResponseHeaders(ctx)
+	if observedAt.IsZero() {
+		observedAt = now
+	}
+	return headers, observedAt
 }
 
 // MarkResult records an execution result and notifies hooks.
@@ -799,7 +810,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
 		if isStaleExecutionResult(result, auth) {
 			var quotaSnapshot *Auth
-			if observeStaleResultQuota(result, auth, internallogging.GetResponseHeaders(ctx), now) {
+			staleHeaders, staleObservedAt := observedResponseHeaders(ctx, now)
+			if observeStaleResultQuota(result, auth, staleHeaders, staleObservedAt) {
 				auth.Generation++
 				auth.UpdatedAt = now
 				_ = m.persistLocked(ctx, auth)
@@ -823,7 +835,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 		now = time.Now()
-		responseHeaders := internallogging.GetResponseHeaders(ctx)
+		responseHeaders, headersObservedAt := observedResponseHeaders(ctx, now)
 		modelState := existingModelState(auth, modelKey)
 		var cooldownRecordsBefore []CooldownStateRecord
 		trackCooldownState := m.cooldownStore != nil
@@ -1056,9 +1068,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		auth.UpdatedAt = now
 
 		if !result.SkipQuotaObservation {
-			auth.Quota.ObserveResponseHeadersForProvider(result.Provider, responseHeaders, now)
+			auth.Quota.ObserveResponseHeadersForProvider(result.Provider, responseHeaders, headersObservedAt)
 			if modelState != nil {
-				modelState.Quota.ObserveResponseHeadersForProvider(result.Provider, responseHeaders, now)
+				modelState.Quota.ObserveResponseHeadersForProvider(result.Provider, responseHeaders, headersObservedAt)
 			}
 		}
 
