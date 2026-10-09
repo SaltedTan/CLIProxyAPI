@@ -199,6 +199,10 @@ func TestInterruptExecutionSessionRejectsInterruptAcrossTurnTransition(t *testin
 	if !errors.Is(errTransition, errCodexInterruptTurnEnded) {
 		t.Fatalf("interrupt across a turn transition error = %v, want errCodexInterruptTurnEnded", errTransition)
 	}
+	// The handler treats it like an interrupt that found no active turn.
+	if !errors.Is(errTransition, cliproxyexecutor.ErrNoActiveUpstreamWebsocket) {
+		t.Fatalf("interrupt across a turn transition error = %v, want it to wrap ErrNoActiveUpstreamWebsocket", errTransition)
+	}
 	sess.clearActive(client, turnB)
 
 	unfiltered := sess.activate(client)

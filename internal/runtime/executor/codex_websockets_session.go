@@ -3,7 +3,6 @@ package executor
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -175,8 +174,10 @@ func (s *codexWebsocketSession) markTerminalError(conn *websocket.Conn, err erro
 }
 
 // errCodexInterruptTurnEnded rejects a response.interrupt whose turn is no longer active
-// on its socket, or bound no payload rules: forwarding it would bypass the rules.
-var errCodexInterruptTurnEnded = errors.New("codex websockets: the turn of response.interrupt is no longer active")
+// on its socket, or bound no payload rules: forwarding it would bypass the rules. It wraps
+// ErrNoActiveUpstreamWebsocket so the handler treats it like an interrupt that found no
+// active turn.
+var errCodexInterruptTurnEnded = fmt.Errorf("codex websockets: the turn of response.interrupt is no longer active: %w", cliproxyexecutor.ErrNoActiveUpstreamWebsocket)
 
 // activeInterruptRulesFor returns the interrupt payload rules of the turn reading ch on
 // conn, or nil when another turn, or none, is active.
