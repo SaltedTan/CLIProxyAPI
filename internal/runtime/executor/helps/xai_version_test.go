@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -309,5 +310,45 @@ func setXAIVersionProxyURLForTest(proxyURL string) func() {
 		xaiClientVersionMu.Lock()
 		xaiVersionProxyURL = old
 		xaiClientVersionMu.Unlock()
+	}
+}
+
+type xaiDeadlineRecorder struct {
+	hasDeadline atomic.Bool
+}
+
+func (r *xaiDeadlineRecorder) RoundTrip(req *http.Request) (*http.Response, error) {
+	_, ok := req.Context().Deadline()
+	r.hasDeadline.Store(ok)
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"version":"1.0.52"}`)),
+		Request:    req,
+	}, nil
+}
+
+// The npm lookup runs after the connection is established, where AGENTS.md
+// allows no timeouts: neither the request context nor the client may set one.
+func TestFetchXAINPMLatestVersionSetsNoTimeout(t *testing.T) {
+	recorder := &xaiDeadlineRecorder{}
+	if _, err := FetchXAINPMLatestVersion(context.Background(), &http.Client{Transport: recorder}); err != nil {
+		t.Fatalf("FetchXAINPMLatestVersion() error = %v", err)
+	}
+	if recorder.hasDeadline.Load() {
+		t.Fatal("npm registry request carries a deadline")
+	}
+	for _, proxyURL := range []string{"", "http://127.0.0.1:1"} {
+		xaiClientVersionMu.Lock()
+		old := xaiVersionProxyURL
+		xaiVersionProxyURL = proxyURL
+		xaiClientVersionMu.Unlock()
+		client := xaiVersionHTTPClient()
+		xaiClientVersionMu.Lock()
+		xaiVersionProxyURL = old
+		xaiClientVersionMu.Unlock()
+		if client.Timeout != 0 {
+			t.Fatalf("proxy %q: client timeout = %s, want none", proxyURL, client.Timeout)
+		}
 	}
 }
