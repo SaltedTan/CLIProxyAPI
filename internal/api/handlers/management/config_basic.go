@@ -3,6 +3,7 @@ package management
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/secretfile"
 	"io"
 	"net/http"
 	"os"
@@ -111,7 +112,7 @@ func WriteConfig(path string, data []byte) error {
 		}
 	}
 	data = config.NormalizeCommentIndentation(data)
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	f, err := secretfile.Create(path)
 	if err != nil {
 		return err
 	}
