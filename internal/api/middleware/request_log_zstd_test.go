@@ -98,7 +98,13 @@ func TestRequestLoggingMiddlewareBoundsAnonymousZstdExpansion(t *testing.T) {
 				t.Fatal("handler ran for an unauthenticated request")
 			}
 			content := readSingleLogFile(t, logsDir)
-			if limit := maxDecodedRequestBodyLogBytes + 64<<10; int64(len(content)) > limit {
+			// Without request logging only an error log is written, and its decoded
+			// body must stay within the raw-size cap for error-only capture.
+			limit := maxDecodedRequestBodyLogBytes + 64<<10
+			if !enabled {
+				limit = maxErrorOnlyCapturedRequestBodyBytes + 64<<10
+			}
+			if int64(len(content)) > limit {
 				t.Fatalf("log entry is %d bytes, want at most %d", len(content), limit)
 			}
 			if !bytes.Contains(content, []byte("[DECOMPRESSED REQUEST BODY TRUNCATED]")) {

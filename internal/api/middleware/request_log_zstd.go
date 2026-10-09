@@ -27,3 +27,16 @@ func newRequestLogZstdDecoder(r io.Reader) (*zstd.Decoder, error) {
 		zstd.WithDecoderMaxMemory(uint64(maxDecodedRequestBodyLogBytes)),
 	)
 }
+
+// requestLogDecodeLimit returns the decompression cap for a request body captured
+// before authentication. Without request logging, a body is captured only for a
+// possible error log and only when its raw size is at most
+// maxErrorOnlyCapturedRequestBodyBytes, so its decoded copy gets the same cap: an
+// anonymous client cannot make the log entry larger than a body it could send
+// uncompressed.
+func requestLogDecodeLimit(loggerEnabled bool) int64 {
+	if loggerEnabled {
+		return maxDecodedRequestBodyLogBytes
+	}
+	return maxErrorOnlyCapturedRequestBodyBytes
+}

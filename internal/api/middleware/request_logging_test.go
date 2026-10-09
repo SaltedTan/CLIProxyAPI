@@ -428,7 +428,7 @@ func TestCaptureRequestInfoDecodesZstdRequestBodyForLog(t *testing.T) {
 	req.Header.Set("Content-Encoding", "zstd")
 	c.Request = req
 
-	info, errCapture := captureRequestInfo(c, true)
+	info, errCapture := captureRequestInfo(c, true, maxDecodedRequestBodyLogBytes)
 	if errCapture != nil {
 		t.Fatalf("captureRequestInfo: %v", errCapture)
 	}
@@ -577,7 +577,7 @@ func TestCaptureRequestInfo_HeadersDeepCopy(t *testing.T) {
 	req.Header.Set("X-Audit", "original-value")
 	c.Request = req
 
-	info, err := captureRequestInfo(c, false)
+	info, err := captureRequestInfo(c, false, maxDecodedRequestBodyLogBytes)
 	if err != nil {
 		t.Fatalf("captureRequestInfo failed: %v", err)
 	}
