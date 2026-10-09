@@ -188,6 +188,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	var readCh chan codexWebsocketRead
 	if sess != nil {
 		readCh = sess.activate(conn)
+		sess.setActiveInterruptRules(readCh, e.interruptPayloadRules(req, opts))
 		defer func() {
 			sess.clearActive(conn, readCh)
 		}()
@@ -227,6 +228,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 					return resp, errBind
 				}
 				readCh = sess.activate(conn)
+				sess.setActiveInterruptRules(readCh, e.interruptPayloadRules(req, opts))
 				restoreMultiAgentV2 = !multiAgentV2Conflict && (optimizeMultiAgentV2 || sess.isMultiAgentV2Optimized(conn))
 				wsReqBodyRetry := frameCodexWebsocketRequestBody(body)
 				helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{

@@ -10,7 +10,11 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
+	"github.com/tidwall/gjson"
 )
 
 func TestInterruptExecutionSessionRequiresActiveRead(t *testing.T) {
@@ -70,5 +74,69 @@ func TestInterruptExecutionSessionRequiresActiveRead(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("active socket did not receive the interrupt")
+	}
+}
+
+// A response.interrupt sent during an active turn passes the turn's payload rules as its
+// final barrier: a wildcard Codex filter removes the extension field, while the frame keeps
+// its type and response_id.
+func TestInterruptExecutionSessionAppliesPayloadRules(t *testing.T) {
+	captured := make(chan []byte, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Error(errUpgrade)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			t.Error(errRead)
+			return
+		}
+		_, body, errRead := conn.ReadMessage()
+		if errRead != nil {
+			t.Error(errRead)
+			return
+		}
+		captured <- body
+		_, _, _ = conn.ReadMessage()
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{Payload: config.PayloadConfig{Filter: []config.PayloadFilterRule{{
+		Models: []config.PayloadModelRule{{Name: "*", Protocol: "codex"}},
+		Params: []string{"private_extension"},
+	}}}}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ctx = cliproxyexecutor.WithDownstreamWebsocket(ctx)
+	sessionID := t.Name()
+	executor := NewCodexWebsocketsExecutor(cfg)
+	executor.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+	defer executor.CloseExecutionSession(sessionID)
+	auth := &cliproxyauth.Auth{ID: t.Name(), Provider: "codex", Attributes: map[string]string{"api_key": "test", "base_url": server.URL, "websockets": "true"}}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatCodex, Metadata: map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: sessionID}}
+	result, errStream := executor.ExecuteStream(ctx, auth, cliproxyexecutor.Request{Model: "gpt-6-astra", Payload: []byte(`{"input":[]}`)}, opts)
+	if errStream != nil {
+		t.Fatal(errStream)
+	}
+
+	interrupt := []byte(`{"type":"response.interrupt","response_id":"r1","mode":"discard_partial_items","private_extension":{"secret":true}}`)
+	if errInterrupt := executor.InterruptExecutionSession(ctx, sessionID, interrupt); errInterrupt != nil {
+		t.Fatal(errInterrupt)
+	}
+	select {
+	case body := <-captured:
+		if gjson.GetBytes(body, "private_extension").Exists() {
+			t.Fatalf("interrupt bypassed payload rules: %s", body)
+		}
+		if gjson.GetBytes(body, "type").String() != "response.interrupt" || gjson.GetBytes(body, "response_id").String() != "r1" || gjson.GetBytes(body, "mode").String() != "discard_partial_items" {
+			t.Fatalf("interrupt framing changed: %s", body)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	cancel()
+	for range result.Chunks {
 	}
 }

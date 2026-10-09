@@ -71,8 +71,11 @@ type codexWebsocketSession struct {
 	activeCh     chan codexWebsocketRead
 	activeDone   <-chan struct{}
 	activeCancel context.CancelFunc
-	terminalConn *websocket.Conn
-	terminalErr  error
+	// activeInterruptRules applies payload rules to a response.interrupt frame of the
+	// active turn, with that turn's matching context. Nil when no turn set it.
+	activeInterruptRules func([]byte) []byte
+	terminalConn         *websocket.Conn
+	terminalErr          error
 
 	readerConn *websocket.Conn
 
@@ -111,6 +114,7 @@ func (s *codexWebsocketSession) setActiveLocked(conn *websocket.Conn, ch chan co
 	}
 	s.activeConn = conn
 	s.activeCh = ch
+	s.activeInterruptRules = nil
 	if conn != nil && ch != nil {
 		activeCtx, activeCancel := context.WithCancel(context.Background())
 		s.activeDone = activeCtx.Done()
@@ -161,6 +165,31 @@ func (s *codexWebsocketSession) markTerminalError(conn *websocket.Conn, err erro
 	return true
 }
 
+// setActiveInterruptRules binds rules to the turn activated with ch, if it is still active.
+func (s *codexWebsocketSession) setActiveInterruptRules(ch chan codexWebsocketRead, rules func([]byte) []byte) {
+	if s == nil || ch == nil {
+		return
+	}
+	s.activeMu.Lock()
+	defer s.activeMu.Unlock()
+	if s.activeCh == ch {
+		s.activeInterruptRules = rules
+	}
+}
+
+// activeInterruptRulesFor returns the interrupt payload rules of the turn reading ch.
+func (s *codexWebsocketSession) activeInterruptRulesFor(ch chan codexWebsocketRead) func([]byte) []byte {
+	if s == nil || ch == nil {
+		return nil
+	}
+	s.activeMu.Lock()
+	defer s.activeMu.Unlock()
+	if s.activeCh != ch {
+		return nil
+	}
+	return s.activeInterruptRules
+}
+
 func (s *codexWebsocketSession) activeForConn(conn *websocket.Conn) (chan codexWebsocketRead, <-chan struct{}) {
 	if s == nil || conn == nil {
 		return nil, nil
@@ -191,6 +220,7 @@ func (s *codexWebsocketSession) clearActive(conn *websocket.Conn, ch chan codexW
 	}
 	s.activeConn = nil
 	s.activeCh = nil
+	s.activeInterruptRules = nil
 	if s.activeCancel != nil {
 		s.activeCancel()
 	}

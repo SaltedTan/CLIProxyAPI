@@ -10,9 +10,12 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/sjson"
 )
 
 // CodexWebsocketsExecutor executes Codex Responses requests using a WebSocket transport.
@@ -169,8 +172,27 @@ func (e *CodexAutoExecutor) InterruptExecutionSession(ctx context.Context, sessi
 	return e.wsExec.InterruptExecutionSession(ctx, sessionID, payload)
 }
 
-// InterruptExecutionSession writes the original interrupt payload to the session
-// socket captured for this execution. Payload rules and response.create defaults
+// interruptPayloadRules returns the final payload barrier for response.interrupt frames
+// sent during the turn of req: user payload rules, matched with the turn's model, protocol
+// and request context, applied once to the interrupt itself. Like response.steer, the frame
+// does not inherit response.create defaults and keeps its type as transport framing.
+func (e *CodexWebsocketsExecutor) interruptPayloadRules(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) func([]byte) []byte {
+	var cfg *config.Config
+	if e != nil && e.CodexExecutor != nil {
+		cfg = e.cfg
+	}
+	model := req.Model
+	baseModel := thinking.ParseSuffix(model).ModelName
+	return func(payload []byte) []byte {
+		interruptReq := cliproxyexecutor.Request{Model: model, Payload: payload}
+		payload = helps.NewPayloadFinalizer(cfg, "codex-websockets", baseModel, "codex", "", payload, interruptReq, opts)(payload)
+		payload, _ = sjson.SetBytes(payload, "type", "response.interrupt")
+		return payload
+	}
+}
+
+// InterruptExecutionSession writes the interrupt payload to the session socket captured
+// for this execution, after the active turn's payload rules. response.create defaults
 // must not rewrite response_id, mode, or extension fields.
 func (e *CodexWebsocketsExecutor) InterruptExecutionSession(ctx context.Context, sessionID string, payload []byte) error {
 	if e == nil {
@@ -205,11 +227,15 @@ func (e *CodexWebsocketsExecutor) InterruptExecutionSession(ctx context.Context,
 	}
 	// A retained socket from an earlier turn is not the current upstream.
 	// HTTP turns must fall through to local cancellation instead.
-	if readCh, _ := sess.activeForConn(conn); readCh == nil {
+	readCh, _ := sess.activeForConn(conn)
+	if readCh == nil {
 		return cliproxyexecutor.ErrNoActiveUpstreamWebsocket
 	}
 	if !cliproxyexecutor.WebsocketAuthEnabled(ctx, authID) {
 		return fmt.Errorf("websocket credential is no longer enabled")
+	}
+	if rules := sess.activeInterruptRulesFor(readCh); rules != nil {
+		payload = rules(payload)
 	}
 	if errWrite := writeCodexWebsocketMessage(sess, conn, payload); errWrite != nil {
 		return errWrite
