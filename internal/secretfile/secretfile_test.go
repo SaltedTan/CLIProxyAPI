@@ -71,3 +71,42 @@ func TestCreateRestrictsExistingFileBeforeWriting(t *testing.T) {
 		t.Fatalf("close: %v", errClose)
 	}
 }
+
+func TestOpenExistingRestrictsAndNeverCreates(t *testing.T) {
+	permissiveUmask(t)
+	dir := t.TempDir()
+
+	missing := filepath.Join(dir, "deleted.json")
+	if file, errOpen := OpenExisting(missing); errOpen == nil {
+		_ = file.Close()
+		t.Fatal("OpenExisting opened a missing file")
+	} else if !os.IsNotExist(errOpen) {
+		t.Fatalf("OpenExisting missing: %v, want a not-exist error", errOpen)
+	}
+	if _, errStat := os.Stat(missing); !os.IsNotExist(errStat) {
+		t.Fatalf("OpenExisting created the missing file: %v", errStat)
+	}
+
+	existing := filepath.Join(dir, "token.json")
+	if errWrite := os.WriteFile(existing, []byte("old-and-longer"), 0o664); errWrite != nil {
+		t.Fatalf("seed file: %v", errWrite)
+	}
+	file, errOpen := OpenExisting(existing)
+	if errOpen != nil {
+		t.Fatalf("OpenExisting: %v", errOpen)
+	}
+	assertMode(t, existing)
+	if _, errWrite := file.Write([]byte("new")); errWrite != nil {
+		t.Fatalf("write: %v", errWrite)
+	}
+	if errClose := file.Close(); errClose != nil {
+		t.Fatalf("close: %v", errClose)
+	}
+	content, errRead := os.ReadFile(existing)
+	if errRead != nil {
+		t.Fatalf("read: %v", errRead)
+	}
+	if string(content) != "new" {
+		t.Fatalf("content = %q, want %q", content, "new")
+	}
+}

@@ -22,6 +22,18 @@ func Create(path string) (*os.File, error) {
 	return file, nil
 }
 
+// OpenExisting opens an existing file for writing and truncates it, tightening it
+// to Mode first. Unlike Create it never creates the file, so an update cannot bring
+// back a file that was deleted after it was read.
+func OpenExisting(path string) (*os.File, error) {
+	file, errOpen := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, Mode)
+	if errOpen != nil {
+		return nil, errOpen
+	}
+	restrict(file)
+	return file, nil
+}
+
 // WriteFile writes data to path like os.WriteFile, with the permissions of Create.
 func WriteFile(path string, data []byte) error {
 	file, errCreate := Create(path)
