@@ -96,6 +96,7 @@ func loadConfigData(configFile string, data []byte, optional bool) (*Config, err
 		}
 		return nil, fmt.Errorf("failed to parse config file: %w", maskDecoderError(err))
 	}
+	warnUnknownConfigKeys(data)
 	if errValidate := validateTrustedProxies(cfg.TrustedProxies); errValidate != nil {
 		return nil, errValidate
 	}
