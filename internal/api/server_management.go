@@ -338,5 +338,9 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 	// this, browsers may reuse a cached copy for hours after it changed; with it they
 	// revalidate on every load, which is a 304 while the file is unchanged.
 	c.Header("Cache-Control", "no-cache")
+	// Only the proxy's own pages may frame the panel, so another site cannot
+	// overlay it to trick a signed-in operator into clicking its controls.
+	c.Header("Content-Security-Policy", "frame-ancestors 'self'")
+	c.Header("X-Frame-Options", "SAMEORIGIN")
 	c.File(filePath)
 }
