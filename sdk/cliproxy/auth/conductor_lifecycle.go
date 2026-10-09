@@ -217,7 +217,10 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 		return nil, fmt.Errorf("update auth %s: stale registration epoch %d != %d", auth.ID, base.RegistrationEpoch, existing.RegistrationEpoch)
 	}
 	// Do not let an in-flight refresh overwrite credentials committed after its snapshot.
-	if mode == updateModeRefresh && base != nil && (existing.CredentialVersion != base.CredentialVersion || CredentialsChanged(base, existing)) {
+	// The check is the one that discards an obsolete refresh failure: a replace that moved
+	// the auth to another account through credentials outside the version (Meta's device
+	// token) must not receive the old account's refreshed key.
+	if mode == updateModeRefresh && base != nil && refreshResultObsolete(base, existing) {
 		current := existing.Clone()
 		m.mu.Unlock()
 		return current, nil
