@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestGetXAIClientVersionDefault(t *testing.T) {
@@ -350,5 +351,59 @@ func TestFetchXAINPMLatestVersionSetsNoTimeout(t *testing.T) {
 		if client.Timeout != 0 {
 			t.Fatalf("proxy %q: client timeout = %s, want none", proxyURL, client.Timeout)
 		}
+	}
+}
+
+// A reload that changes the global proxy cancels a lookup stalled on the old proxy, which
+// has no deadline of its own, and the updater looks the version up through the new one.
+func TestUpdateXAIVersionProxyURLCancelsPendingLookup(t *testing.T) {
+	restoreVersion := SetXAIClientVersionForTest(DefaultXAIFallbackClientVersion)
+	defer restoreVersion()
+	restoreProxy := setXAIVersionProxyURLForTest("")
+	defer restoreProxy()
+
+	stalledReached := make(chan struct{}, 1)
+	stalledCanceled := make(chan struct{}, 1)
+	stalled := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		stalledReached <- struct{}{}
+		<-r.Context().Done()
+		stalledCanceled <- struct{}{}
+	}))
+	defer stalled.Close()
+	var reloadedHits atomic.Int32
+	reloaded := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reloadedHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"version":"1.0.62"}`))
+	}))
+	defer reloaded.Close()
+
+	restoreURL := OverrideXAINPMRegistryURLForTest("http://registry.npm.invalid/@xai-official/grok/latest")
+	defer restoreURL()
+	notified := make(chan struct{}, 4)
+	restoreHook := SetXAIVersionRefreshedHookForTest(notified)
+	defer restoreHook()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	StartXAIVersionUpdater(ctx, stalled.URL)
+	waitXAIVersionSignal(t, stalledReached, "lookup through the startup proxy")
+
+	UpdateXAIVersionProxyURL(reloaded.URL)
+	waitXAIVersionSignal(t, stalledCanceled, "cancellation of the stalled lookup")
+	for GetXAIClientVersion() != "1.0.62" {
+		waitXAIVersionSignal(t, notified, "lookup through the reloaded proxy")
+	}
+	if got := reloadedHits.Load(); got != 1 {
+		t.Fatalf("reloaded proxy hits = %d, want 1", got)
+	}
+}
+
+func waitXAIVersionSignal(t *testing.T, signal <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
 	}
 }

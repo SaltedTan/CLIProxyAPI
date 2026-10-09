@@ -36,6 +36,7 @@ var (
 	xaiVersionProxyURL     string
 	xaiClientVersionMu     sync.RWMutex
 	xaiUpdaterCancel       context.CancelFunc
+	xaiUpdaterCtx          context.Context
 	xaiVersionRefreshed    chan struct{}
 )
 
@@ -55,16 +56,34 @@ func StartXAIVersionUpdater(ctx context.Context, proxyURL string) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	runCtx, cancel := context.WithCancel(ctx)
-
 	xaiClientVersionMu.Lock()
+	defer xaiClientVersionMu.Unlock()
+	startXAIVersionUpdaterLocked(ctx, strings.TrimSpace(proxyURL))
+}
+
+// UpdateXAIVersionProxyURL applies a reloaded global proxy URL to a started updater. A
+// changed proxy cancels the pending npm lookup, which has no deadline of its own, and
+// restarts the updater under its service context with the new proxy. Updates before
+// startup or after shutdown start nothing.
+func UpdateXAIVersionProxyURL(proxyURL string) {
+	proxyURL = strings.TrimSpace(proxyURL)
+	xaiClientVersionMu.Lock()
+	defer xaiClientVersionMu.Unlock()
+	if xaiUpdaterCtx == nil || xaiUpdaterCtx.Err() != nil || proxyURL == xaiVersionProxyURL {
+		return
+	}
+	startXAIVersionUpdaterLocked(xaiUpdaterCtx, proxyURL)
+}
+
+// startXAIVersionUpdaterLocked replaces the running updater. The caller holds xaiClientVersionMu.
+func startXAIVersionUpdaterLocked(ctx context.Context, proxyURL string) {
 	if xaiUpdaterCancel != nil {
 		xaiUpdaterCancel()
 	}
+	runCtx, cancel := context.WithCancel(ctx)
+	xaiUpdaterCtx = ctx
 	xaiUpdaterCancel = cancel
-	xaiVersionProxyURL = strings.TrimSpace(proxyURL)
-	xaiClientVersionMu.Unlock()
-
+	xaiVersionProxyURL = proxyURL
 	go runXAIVersionUpdater(runCtx)
 }
 

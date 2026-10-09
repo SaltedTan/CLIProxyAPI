@@ -90,6 +90,12 @@ func StartXAIVersionUpdater(ctx context.Context, proxyURL string) {
 	helps.StartXAIVersionUpdater(ctx, proxyURL)
 }
 
+// UpdateXAIVersionProxyURL applies a reloaded global proxy URL to the started updater,
+// cancelling a pending lookup through the old proxy.
+func UpdateXAIVersionProxyURL(proxyURL string) {
+	helps.UpdateXAIVersionProxyURL(proxyURL)
+}
+
 // Identifier returns the provider identifier.
 func (e *XAIExecutor) Identifier() string {
 	return "xai"
