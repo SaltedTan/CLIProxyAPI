@@ -84,19 +84,161 @@ plugins:
 `,
 		},
 		{
-			name: "list items are not inspected",
-			doc: `api-keys:
+			name: "legacy provider list items",
+			doc: `claude-api-key:
+  - api-key: upstream-key-1
+    base-url: https://api.anthropic.com
+  - api-key: upstream-key-2
+    base-urll: https://api.anthropic.com
+    cloak:
+      mod: always
+    models:
+      - name: claude-sonnet-4
+        alias: sonnet
+      - name: claude-opus-4
+        aliass: opus
+    request-scoped-errors:
+      - status: 400
+        actoin: stop
+openai-compatibility:
+  - name: compat
+    base-url: https://example.com/v1
+    api-key-entries:
+      - api-key: upstream-key-3
+        proxy-ur: socks5://127.0.0.1:1080
+    models:
+      - name: m1
+        alias: a1
+        thinking:
+          levles: [low]
+`,
+			want: []string{
+				unknownKeyWarning("claude-api-key[1].base-urll", 5),
+				unknownKeyWarning("claude-api-key[1].cloak.mod", 7),
+				unknownKeyWarning("claude-api-key[1].models[1].aliass", 12),
+				unknownKeyWarning("claude-api-key[1].request-scoped-errors[0].actoin", 15),
+				unknownKeyWarning("openai-compatibility[0].api-key-entries[0].proxy-ur", 21),
+				unknownKeyWarning("openai-compatibility[0].models[0].thinking.levles", 26),
+			},
+		},
+		{
+			name: "v8 provider list items",
+			doc: `config-version: 8
+api-keys:
   gemini:
     - name: g1
       base-url: https://generativelanguage.googleapis.com
       headers:
         X-Custom: value
+      models:
+        - name: gemini-2.5-pro
+          alais: pro
       keys:
         - api-key: upstream-key
+          auth-index: abc
           not-a-field: 1
-claude-api-key:
-  - api-key: upstream-key-2
-    bogus-field: 1
+  claude:
+    - name: c1
+      keys:
+        - api-key: upstream-key-2
+          prefx: team
+          rebuild-mid-system-message: true
+  openai-compatibility:
+    - name: compat
+      base-urll: https://example.com/v1
+      auth_index: def
+      api-key-entries:
+        - api-key: ignored-key
+      keys:
+        - api-key: upstream-key-3
+          auth-index: ghi
+          proxy-ur: socks5://127.0.0.1:1080
+`,
+			want: []string{
+				unknownKeyWarning("api-keys.gemini[0].models[0].alais", 10),
+				unknownKeyWarning("api-keys.gemini[0].keys[0].not-a-field", 14),
+				unknownKeyWarning("api-keys.claude[0].keys[0].prefx", 19),
+				unknownKeyWarning("api-keys.openai-compatibility[0].base-urll", 23),
+				unknownKeyWarning("api-keys.openai-compatibility[0].api-key-entries", 25),
+				unknownKeyWarning("api-keys.openai-compatibility[0].keys[0].proxy-ur", 30),
+			},
+		},
+		{
+			name: "nested typed lists outside providers",
+			doc: `config-version: 8
+requests:
+  payload:
+    override:
+      - models:
+          - name: gpt-*
+            protocl: responses
+        params:
+          reasoning.effort: high
+    filter:
+      - models:
+          - name: gpt-*
+        paramz: [metadata]
+payload:
+  default:
+    - modles:
+        - name: gemini-*
+codex:
+  live-media-relay:
+    ice-servers:
+      - urls: [stun:stun.example.com]
+        usernme: u
+oauth:
+  providers:
+    codex:
+      live-media-relay:
+        ice-servers:
+          - urlz: [stun:stun.example.com]
+plugins:
+  store-auth:
+    - match: example.com
+      tokn-env: TOKEN
+`,
+			want: []string{
+				unknownKeyWarning("requests.payload.override[0].models[0].protocl", 7),
+				unknownKeyWarning("requests.payload.filter[0].paramz", 13),
+				unknownKeyWarning("payload.default[0].modles", 16),
+				unknownKeyWarning("codex.live-media-relay.ice-servers[0].usernme", 22),
+				unknownKeyWarning("oauth.providers.codex.live-media-relay.ice-servers[0].urlz", 28),
+				unknownKeyWarning("plugins.store-auth[0].tokn-env", 32),
+			},
+		},
+		{
+			name: "free-form values in list items stay open",
+			doc: `claude-api-key:
+  - api-key: upstream-key
+    headers:
+      X-Anything: value
+payload:
+  override:
+    - models:
+        - name: gpt-*
+          headers:
+            X-Client: codex*
+          match:
+            - any.json.path: 1
+      params:
+        any.json.path: value
+oauth-model-alias:
+  codex:
+    - name: gpt-5
+      alias: g5
+      any-field: 1
+oauth-settings:
+  claude:
+    - anything: 1
+oauth-request-scoped-errors:
+  codex:
+    - anything: 1
+plugins:
+  configs:
+    my-plugin:
+      list:
+        - anything: 1
 `,
 		},
 		{
@@ -176,6 +318,12 @@ func TestUnknownConfigKeysMasksClientKeys(t *testing.T) {
 			want: []string{unknownKeyWarning("access.sk-l...6789", 6), unknownKeyWarning("sk.d....key", 7)},
 		},
 		{
+			name: "client key as an unknown key in a list item",
+			doc:  "api-keys:\n  - sk-live-0123456789\nclaude-api-key:\n  - api-key: upstream-key\n    sk-live-0123456789: true\n",
+			raw:  []string{"sk-live-0123456789"},
+			want: []string{unknownKeyWarning("claude-api-key[0].sk-l...6789", 5)},
+		},
+		{
 			name: "client keys written as an api-keys mapping",
 			doc:  "api-keys:\n  sk-unlisted-secret-42: laptop\n",
 			raw:  []string{"sk-unlisted-secret-42"},
@@ -223,8 +371,20 @@ func TestUnknownConfigKeysExampleConfig(t *testing.T) {
 			uncommented.WriteString(strings.TrimPrefix(strings.TrimPrefix(line, "#"), " ") + "\n")
 		}
 	}
-	if got := unknownConfigKeys([]byte(text + "\n" + uncommented.String())); len(got) != 0 {
+	full := []byte(text + "\n" + uncommented.String())
+	if got := unknownConfigKeys(full); len(got) != 0 {
 		t.Fatalf("config.example.yaml API-key examples have unknown keys: %q", got)
+	}
+	// The same document written in the v8 layout, with its provider groups.
+	migrated, _, err := NormalizeConfigLayout(full, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(migrated), "keys:") {
+		t.Fatal("migrated example has no v8 provider groups")
+	}
+	if got := unknownConfigKeys(migrated); len(got) != 0 {
+		t.Fatalf("config.example.yaml migrated to v8 has unknown keys: %q", got)
 	}
 }
 

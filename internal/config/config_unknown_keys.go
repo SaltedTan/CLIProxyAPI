@@ -23,9 +23,18 @@ var checkedCustomDecoders = map[reflect.Type]bool{
 
 var knownConfigKeys = sync.OnceValue(buildKnownConfigKeys)
 
+// listItem marks the items of a list in a known-key path, as in
+// "claude-api-key[].models[]".
+const listItem = "[]"
+
+// v8KeyIndexFields are the management-written key indexes the v8 loader drops
+// from api-keys groups and keys.
+var v8KeyIndexFields = []string{"auth-index", "auth_index"}
+
 // buildKnownConfigKeys maps every mapping path the runtime decodes as a struct,
-// in either layout, to the keys it consumes there. Paths it does not name, such
-// as user-owned maps and list items, are never checked.
+// in either layout, to the keys it consumes there. List items of a struct type
+// are named by their list path plus listItem. Paths it does not name, such as
+// user-owned maps, are never checked.
 func buildKnownConfigKeys() map[string]map[string]bool {
 	known := make(map[string]map[string]bool)
 	open := make(map[string]bool)
@@ -67,10 +76,31 @@ func buildKnownConfigKeys() map[string]map[string]bool {
 			if name == "" {
 				name = strings.ToLower(field.Name)
 			}
+			known[path][name] = true
 			child := strings.TrimPrefix(path+"."+name, ".")
-			add(child)
+			for fieldType.Kind() == reflect.Slice || fieldType.Kind() == reflect.Array || fieldType.Kind() == reflect.Pointer {
+				if fieldType.Kind() != reflect.Pointer {
+					child += listItem
+				}
+				fieldType = fieldType.Elem()
+			}
 			if fieldType.Kind() == reflect.Struct && (!reflect.PointerTo(fieldType).Implements(unmarshaler) || checkedCustomDecoders[fieldType]) {
 				native(fieldType, child)
+			}
+		}
+	}
+	// copyLists gives the list item paths at or below from the same keys at to.
+	copyLists := func(from, to string) {
+		copied := make(map[string]map[string]bool)
+		for path, keys := range known {
+			if strings.Contains(path, listItem) && (path == from || strings.HasPrefix(path, from+".") || strings.HasPrefix(path, from+listItem)) {
+				copied[to+strings.TrimPrefix(path, from)] = keys
+			}
+		}
+		for path, keys := range copied {
+			known[path] = make(map[string]bool, len(keys))
+			for key := range keys {
+				known[path][key] = true
 			}
 		}
 	}
@@ -79,14 +109,42 @@ func buildKnownConfigKeys() map[string]map[string]bool {
 	// by the native walk above.
 	for _, path := range append(append([]configPath(nil), v8Paths...), v8StructPaths...) {
 		add(path.current)
+		copyLists(path.old, path.current)
 	}
 	for _, path := range append(append([]configPath(nil), v8Aliases...), v8SharedStructPaths...) {
 		add(path.old)
 		add(path.current)
+		copyLists(path.current, path.old)
 	}
-	// The v8 api-keys map holds one upstream key list per provider family.
+	// The v8 api-keys map holds one upstream key list per provider family. Each
+	// group holds a keys list; the loader turns every key into one legacy entry.
 	for _, family := range v8KeyFamilies {
 		add("api-keys." + family.current)
+		legacy, group := family.old+listItem, "api-keys."+family.current+listItem
+		keys := group + ".keys" + listItem
+		copyLists(legacy, group)
+		if family.current == "openai-compatibility" {
+			// The group is the legacy entry with keys in place of api-key-entries.
+			copyLists(legacy+".api-key-entries"+listItem, keys)
+			delete(known[group], "api-key-entries")
+			known[group]["keys"] = true
+			for _, field := range v8KeyIndexFields {
+				known[group][field] = true
+			}
+		} else {
+			// The group holds the shared fields; a key may set any legacy field.
+			copyLists(legacy, keys)
+			fields := map[string]bool{"name": true, "keys": true}
+			for field := range known[legacy] {
+				if field == "base-url" || sharedKeyFields[field] {
+					fields[field] = true
+				}
+			}
+			known[group] = fields
+		}
+		for _, field := range v8KeyIndexFields {
+			known[keys][field] = true
+		}
 	}
 	for _, path := range extraConfigKeyPaths {
 		add(path)
@@ -98,8 +156,8 @@ func buildKnownConfigKeys() map[string]map[string]bool {
 }
 
 // unknownConfigKeys returns a warning for every mapping key in the config
-// document data that the runtime decoder ignores. Client keys used as mapping
-// keys are masked and values are never printed.
+// document data that the runtime decoder ignores, including keys in list items.
+// Client keys used as mapping keys are masked and values are never printed.
 func unknownConfigKeys(data []byte) []string {
 	var doc yaml.Node
 	if yaml.Unmarshal(data, &doc) != nil || len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
@@ -110,6 +168,12 @@ func unknownConfigKeys(data []byte) []string {
 	var findings []string
 	var walk func(node *yaml.Node, path, display string)
 	walk = func(node *yaml.Node, path, display string) {
+		if node.Kind == yaml.SequenceNode {
+			for index, item := range node.Content {
+				walk(item, path+listItem, fmt.Sprintf("%s[%d]", display, index))
+			}
+			return
+		}
 		allowed := known[path]
 		if node.Kind != yaml.MappingNode || allowed == nil {
 			return
