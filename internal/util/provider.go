@@ -289,5 +289,9 @@ func shouldMaskQueryParam(key string) bool {
 	if strings.Contains(key, "token") || strings.Contains(key, "secret") {
 		return true
 	}
+	// OAuth callbacks carry the authorization code and its state in the query.
+	if key == "code" || key == "state" || key == "code_verifier" {
+		return true
+	}
 	return false
 }
