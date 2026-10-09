@@ -78,6 +78,10 @@ type Result struct {
 	CredentialVersion uint64
 	// RegistrationEpoch captures the registration epoch under which the request was executed.
 	RegistrationEpoch uint64
+	// quotaLineage captures the quota lineage (see Auth.quotaLineage) of the auth the request
+	// was executed with. A result from an older credential version still reports the quota of
+	// the same account while the lineage matches.
+	quotaLineage uint64
 }
 
 // Selector chooses an auth candidate for execution.

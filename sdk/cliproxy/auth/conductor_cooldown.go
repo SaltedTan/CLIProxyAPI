@@ -758,6 +758,19 @@ func isStaleExecutionResult(result Result, current *Auth) bool {
 	return staleVersion || staleEpoch
 }
 
+// observeStaleResultQuota records the passive quota snapshot of a result that
+// isStaleExecutionResult rejected. Such a result must not change the status of the newer
+// credential, but while its quota lineage matches, its response headers still describe the
+// account's quota: a token refresh or a replace proven to keep the account changed the
+// credential version. It reports whether the snapshot changed.
+func observeStaleResultQuota(result Result, auth *Auth, headers http.Header, now time.Time) bool {
+	if auth == nil || result.SkipQuotaObservation || result.quotaLineage == 0 ||
+		result.quotaLineage != auth.quotaLineage || !ProviderSupportsQuotaObservation(result.Provider) {
+		return false
+	}
+	return auth.Quota.ObserveResponseHeadersForProvider(result.Provider, headers, now)
+}
+
 // MarkResult records an execution result and notifies hooks.
 func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if result.AuthID == "" {
@@ -785,8 +798,18 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
 		if isStaleExecutionResult(result, auth) {
+			var quotaSnapshot *Auth
+			if observeStaleResultQuota(result, auth, internallogging.GetResponseHeaders(ctx), now) {
+				auth.Generation++
+				auth.UpdatedAt = now
+				_ = m.persistLocked(ctx, auth)
+				quotaSnapshot = auth.Clone()
+			}
 			m.mu.Unlock()
 			releaseMutation()
+			if m.scheduler != nil && quotaSnapshot != nil {
+				m.scheduler.upsertAuth(quotaSnapshot)
+			}
 			m.hook.OnResult(ctx, result)
 			m.publishErrorEvent(result, nil)
 			return
@@ -1099,6 +1122,9 @@ func (m *Manager) recordExecutionResult(ctx context.Context, result Result, auth
 		}
 		if result.RegistrationEpoch == 0 {
 			result.RegistrationEpoch = auth.RegistrationEpoch
+		}
+		if result.quotaLineage == 0 {
+			result.quotaLineage = auth.quotaLineage
 		}
 	}
 	if !ephemeral {
