@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	configaccess "github.com/router-for-me/CLIProxyAPI/v8/internal/access/config_access"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"gopkg.in/yaml.v3"
 )
@@ -179,6 +180,12 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 	data, _, err = config.NormalizeConfigLayout(data, true)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_config", "message": err.Error()})
+		return
+	}
+	// The config watcher refuses to apply a config without client keys while keys
+	// are in force; refuse the save too, so a later restart cannot open the proxy.
+	if configaccess.HasKeys(&h.cfg.SDKConfig) && !configaccess.HasKeys(&next.SDKConfig) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "last_client_key", "message": "removing every client API key (access.api-keys) would let anyone who can reach the proxy use it without a key; keep at least one key, or edit the config file and restart to run without client keys"})
 		return
 	}
 	// Save the validated canonical tree directly: projecting runtime defaults

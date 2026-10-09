@@ -66,6 +66,13 @@ The Home-owned revision fields
 `credentials.concurrency.observation-barrier-revision`, and `plugins.auth-revision`
 cannot be changed through these endpoints.
 
+A write that would remove every key from `access.api-keys` while at least one is
+configured returns `400 last_client_key` and leaves the file unchanged: without
+client keys, anyone who can reach the proxy can use it. The config watcher
+likewise refuses to apply such an edit made to the file directly and keeps the
+previous keys in force. To run without client keys, remove them from the file
+and restart the service.
+
 ### Codex multi-agent configuration migration
 
 `client.codex.optimize-multi-agent-v2` is the sole runtime setting. Loading older

@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"time"
 
+	configaccess "github.com/router-for-me/CLIProxyAPI/v8/internal/access/config_access"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/diff"
@@ -92,6 +93,20 @@ func (w *Watcher) reloadConfig() bool {
 	newConfig, errLoadConfig := config.LoadConfig(w.configPath)
 	if errLoadConfig != nil {
 		log.Errorf("failed to reload config: %v", errLoadConfig)
+		return false
+	}
+
+	// Removing every client key turns client authentication off. A reload that does so
+	// is far more likely a mistake (a typo in access.api-keys, a bad edit) than intent,
+	// so it is refused and the previous configuration stays in force. The check reads
+	// the snapshot of the last applied config: management handlers edit the shared
+	// w.config in place before they save, so it may already lack the keys in force.
+	w.clientsMutex.RLock()
+	var previousConfig *config.Config
+	_ = yaml.Unmarshal(w.oldConfigYaml, &previousConfig)
+	w.clientsMutex.RUnlock()
+	if previousConfig != nil && configaccess.HasKeys(&previousConfig.SDKConfig) && !configaccess.HasKeys(&newConfig.SDKConfig) {
+		log.Errorf("config reload rejected: %s no longer lists any client API key (access.api-keys), which would let anyone who can reach the proxy use it without a key; keeping the previous configuration. Add a key back, or restart the service to run without client keys", w.configPath)
 		return false
 	}
 

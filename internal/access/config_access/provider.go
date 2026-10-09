@@ -117,6 +117,11 @@ func extractBearerToken(header string) string {
 	return strings.TrimSpace(parts[1])
 }
 
+// HasKeys reports whether cfg configures at least one non-empty client API key.
+func HasKeys(cfg *sdkconfig.SDKConfig) bool {
+	return cfg != nil && len(normalizeKeys(cfg.APIKeys)) > 0
+}
+
 func normalizeKeys(keys []string) []string {
 	if len(keys) == 0 {
 		return nil
