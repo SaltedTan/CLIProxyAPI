@@ -2,6 +2,8 @@ package executor
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -222,5 +224,210 @@ func TestClaudeExecutor_ExecuteStream_Passthrough_ClientDisconnectAfterTerminalE
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for usage record")
+	}
+}
+
+// terminalStreamBody serves a canned stream, then fails the read with err or ends cleanly when err is nil.
+type terminalStreamBody struct {
+	reader io.Reader
+	err    error
+}
+
+func (b *terminalStreamBody) Read(p []byte) (int, error) {
+	n, err := b.reader.Read(p)
+	if errors.Is(err, io.EOF) && b.err != nil {
+		return n, b.err
+	}
+	return n, err
+}
+
+func (b *terminalStreamBody) Close() error { return nil }
+
+// terminalStreamContext answers every upstream request with the canned SSE stream.
+func terminalStreamContext(stream string, readErr error) context.Context {
+	return context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       &terminalStreamBody{reader: strings.NewReader(stream), err: readErr},
+			Request:    req,
+		}, nil
+	})))
+}
+
+// terminalUsagePlugin captures the usage records of one test credential, keyed by its base URL.
+type terminalUsagePlugin struct {
+	baseURL string
+	records chan usage.Record
+}
+
+func (p *terminalUsagePlugin) HandleUsage(_ context.Context, record usage.Record) {
+	if record.BaseURL != p.baseURL {
+		return
+	}
+	select {
+	case p.records <- record:
+	default:
+	}
+}
+
+func captureTerminalUsage(t *testing.T, baseURL string) <-chan usage.Record {
+	t.Helper()
+	plugin := &terminalUsagePlugin{baseURL: baseURL, records: make(chan usage.Record, 4)}
+	name := "test-terminal-" + baseURL
+	usage.RegisterNamedPlugin(name, plugin)
+	t.Cleanup(func() { usage.RegisterNamedPlugin(name, noopClaudeUsagePlugin{}) })
+	return plugin.records
+}
+
+func waitTerminalUsage(t *testing.T, records <-chan usage.Record) usage.Record {
+	t.Helper()
+	select {
+	case record := <-records:
+		return record
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for usage record")
+	}
+	return usage.Record{}
+}
+
+func drainTerminalStream(t *testing.T, result *cliproxyexecutor.StreamResult) (string, []error) {
+	t.Helper()
+	var output strings.Builder
+	var errs []error
+	for chunk := range result.Chunks {
+		output.Write(chunk.Payload)
+		if chunk.Err != nil {
+			errs = append(errs, chunk.Err)
+		}
+	}
+	return output.String(), errs
+}
+
+func assertTerminalStreamError(t *testing.T, errs []error, wantMessage string) {
+	t.Helper()
+	if len(errs) != 1 {
+		t.Fatalf("stream errors = %v, want exactly one", errs)
+	}
+	status, ok := errs[0].(interface{ StatusCode() int })
+	if !ok || status.StatusCode() != http.StatusBadGateway {
+		t.Fatalf("stream error = %#v, want status %d", errs[0], http.StatusBadGateway)
+	}
+	if errs[0].Error() != wantMessage {
+		t.Fatalf("stream error = %q, want %q", errs[0].Error(), wantMessage)
+	}
+}
+
+const (
+	claudeTerminalIncompleteMessage = "claude executor: upstream stream response ended before message completion"
+	claudeTerminalStart             = "event: message_start\n" +
+		`data: {"type":"message_start","message":{"id":"msg_terminal","type":"message","role":"assistant","content":[],"model":"claude-opus-5","stop_reason":null,"usage":{"input_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}}` + "\n\n"
+	claudeTerminalText = "event: content_block_start\n" +
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}` + "\n\n" +
+		"event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}` + "\n\n"
+	claudeTerminalDelta = "event: content_block_stop\n" +
+		`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+		"event: message_delta\n" +
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":15}}` + "\n\n"
+	claudeTerminalStop  = "event: message_stop\n" + `data: {"type":"message_stop"}` + "\n\n"
+	claudeTerminalError = "event: error\n" + `data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}` + "\n\n"
+)
+
+var claudeTerminalFormats = []sdktranslator.Format{sdktranslator.FormatClaude, sdktranslator.FormatOpenAI, sdktranslator.FormatOpenAIResponse}
+
+func runClaudeTerminalStream(t *testing.T, format sdktranslator.Format, stream string, readErr error) (string, []error, <-chan usage.Record) {
+	t.Helper()
+	baseURL := "https://claude-terminal.test/" + strings.ReplaceAll(t.Name(), "/", "_")
+	records := captureTerminalUsage(t, baseURL)
+	exec := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-123", "base_url": baseURL}}
+	payload := []byte(`{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	if format == sdktranslator.FormatOpenAIResponse {
+		payload = []byte(`{"model":"claude-opus-5","input":"hi","stream":true}`)
+	}
+	result, err := exec.ExecuteStream(terminalStreamContext(stream, readErr), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-5",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: format, ResponseFormat: format, Stream: true})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	output, errs := drainTerminalStream(t, result)
+	return output, errs, records
+}
+
+func TestClaudeExecutorStreamCleanEOFBeforeMessageStopFails(t *testing.T) {
+	for _, format := range claudeTerminalFormats {
+		t.Run(format.String(), func(t *testing.T) {
+			_, errs, records := runClaudeTerminalStream(t, format, claudeTerminalStart+claudeTerminalText+claudeTerminalDelta, nil)
+			assertTerminalStreamError(t, errs, claudeTerminalIncompleteMessage)
+			// Usage observed before the truncation is still counted, on a failed record.
+			record := waitTerminalUsage(t, records)
+			if !record.Failed || record.Fail.StatusCode != http.StatusBadGateway {
+				t.Fatalf("usage record failed=%v status=%d, want failed with %d", record.Failed, record.Fail.StatusCode, http.StatusBadGateway)
+			}
+			if record.Detail.InputTokens != 100 || record.Detail.OutputTokens != 15 {
+				t.Fatalf("usage tokens input=%d output=%d, want 100/15", record.Detail.InputTokens, record.Detail.OutputTokens)
+			}
+		})
+	}
+	t.Run("empty body", func(t *testing.T) {
+		_, errs, _ := runClaudeTerminalStream(t, sdktranslator.FormatClaude, "", nil)
+		assertTerminalStreamError(t, errs, claudeTerminalIncompleteMessage)
+	})
+}
+
+func TestClaudeExecutorStreamCompleteHasNoError(t *testing.T) {
+	for _, format := range claudeTerminalFormats {
+		t.Run(format.String(), func(t *testing.T) {
+			_, errs, records := runClaudeTerminalStream(t, format, claudeTerminalStart+claudeTerminalText+claudeTerminalDelta+claudeTerminalStop, nil)
+			if len(errs) != 0 {
+				t.Fatalf("stream errors = %v, want none", errs)
+			}
+			if record := waitTerminalUsage(t, records); record.Failed {
+				t.Fatalf("usage record failed with %d %s, want success", record.Fail.StatusCode, record.Fail.Body)
+			}
+		})
+	}
+}
+
+func TestClaudeExecutorStreamUpstreamErrorEventAddsNoSyntheticError(t *testing.T) {
+	stream := claudeTerminalStart + claudeTerminalText + claudeTerminalError
+	for _, format := range []sdktranslator.Format{sdktranslator.FormatClaude, sdktranslator.FormatOpenAI} {
+		t.Run(format.String(), func(t *testing.T) {
+			output, errs, _ := runClaudeTerminalStream(t, format, stream, nil)
+			if len(errs) != 0 {
+				t.Fatalf("stream errors = %v, want only the forwarded upstream error", errs)
+			}
+			if strings.Count(output, "overloaded_error") != 1 {
+				t.Fatalf("forwarded upstream error count != 1: %s", output)
+			}
+		})
+	}
+	// The Responses translation drops upstream error events, so the client would
+	// otherwise see no failure at all: it gets exactly one synthetic error.
+	t.Run(sdktranslator.FormatOpenAIResponse.String(), func(t *testing.T) {
+		output, errs, _ := runClaudeTerminalStream(t, sdktranslator.FormatOpenAIResponse, stream, nil)
+		if strings.Contains(output, "overloaded_error") {
+			t.Fatalf("Responses translation now forwards upstream error events; drop this case: %s", output)
+		}
+		assertTerminalStreamError(t, errs, claudeTerminalIncompleteMessage)
+	})
+}
+
+func TestClaudeExecutorStreamScannerErrorUnchanged(t *testing.T) {
+	readErr := errors.New("upstream connection reset")
+	for _, format := range claudeTerminalFormats {
+		t.Run(format.String(), func(t *testing.T) {
+			_, errs, records := runClaudeTerminalStream(t, format, claudeTerminalStart+claudeTerminalText, readErr)
+			if len(errs) != 1 || !errors.Is(errs[0], readErr) {
+				t.Fatalf("stream errors = %v, want only %v", errs, readErr)
+			}
+			record := waitTerminalUsage(t, records)
+			if !record.Failed || record.Detail.InputTokens != 100 {
+				t.Fatalf("usage record failed=%v input=%d, want failed with 100 input tokens", record.Failed, record.Detail.InputTokens)
+			}
+		})
 	}
 }

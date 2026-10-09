@@ -357,6 +357,8 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			var event bytes.Buffer
 			var upstreamMessageID string
 			upstreamCompleted := false
+			// Passthrough forwards every line, so an upstream error event always reaches the client.
+			upstreamErrorForwarded := false
 			flushEvent := func() bool {
 				if event.Len() == 0 {
 					return true
@@ -372,7 +374,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 			for scanner.Scan() {
 				line := scanner.Bytes()
-				observeClaudeStreamLine(line, &upstreamMessageID, &upstreamCompleted)
+				if observeClaudeStreamLine(line, &upstreamMessageID, &upstreamCompleted) == "error" {
+					upstreamErrorForwarded = true
+				}
 				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 				reporter.ObserveResponseModel(line)
 				streamUsage.ObserveClaudeStream(line)
@@ -412,6 +416,10 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					}
 					return
 				}
+				if ctx.Err() == nil && !upstreamErrorForwarded {
+					emitResponseError(newClaudeIncompleteStreamError())
+					return
+				}
 			}
 			if upstreamCompleted {
 				commitClaudeContinuity(diagnosticsState, upstreamMessageID, helps.HeaderValueCaseInsensitive(httpResp.Header, "request-id"))
@@ -426,9 +434,12 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		helps.InitializeApplyPatchStream(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), bodyForTranslation, &param)
 		var upstreamMessageID string
 		upstreamCompleted := false
+		// Some client formats drop upstream error events in translation, so only an
+		// error event that produced client output counts as forwarded.
+		upstreamErrorForwarded := false
 		for scanner.Scan() {
 			line := scanner.Bytes()
-			observeClaudeStreamLine(line, &upstreamMessageID, &upstreamCompleted)
+			isErrorEvent := observeClaudeStreamLine(line, &upstreamMessageID, &upstreamCompleted) == "error"
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			reporter.ObserveResponseModel(line)
 			streamUsage.ObserveClaudeStream(line)
@@ -461,6 +472,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					emitCancellation(ctx.Err())
 					return
 				}
+				if isErrorEvent && len(chunks[i]) > 0 {
+					upstreamErrorForwarded = true
+				}
 			}
 			if helps.StopApplyPatchStream(ctx, param, reporter, out, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}) {
 				return
@@ -486,6 +500,10 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				}
 				return
 			}
+			if ctx.Err() == nil && !upstreamErrorForwarded {
+				emitResponseError(newClaudeIncompleteStreamError())
+				return
+			}
 		}
 		if upstreamCompleted {
 			commitClaudeContinuity(diagnosticsState, upstreamMessageID, helps.HeaderValueCaseInsensitive(httpResp.Header, "request-id"))
@@ -496,6 +514,11 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		result = wrapClaudeThinkingReplayStream(ctx, result, replayScope)
 	}
 	return result, nil
+}
+
+// newClaudeIncompleteStreamError reports an upstream stream that ended before its terminal event.
+func newClaudeIncompleteStreamError() error {
+	return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream stream response ended before message completion"}
 }
 
 func validateClaudeStreamingResponse(data []byte) error {
@@ -551,7 +574,7 @@ func validateClaudeStreamingResponse(data []byte) error {
 		return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream stream response is missing message_start"}
 	}
 	if !hasMessageDelta {
-		return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream stream response ended before message completion"}
+		return newClaudeIncompleteStreamError()
 	}
 	return nil
 }

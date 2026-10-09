@@ -281,3 +281,52 @@ func TestClaudeExecutorNonFastErrorKeepsCredentialScopedBehavior(t *testing.T) {
 		t.Fatalf("upstream attempts = %d, want 1", got)
 	}
 }
+
+func TestClaudeExecutorFastTruncatedStreamKeepsBadGatewayStatus(t *testing.T) {
+	truncated := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fast_truncated\",\"model\":\"claude-opus-5\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"O\"}}\n\n"
+	transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(truncated)),
+			Request:    req,
+		}, nil
+	})
+	ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", http.RoundTripper(transport))
+	auth := &cliproxyauth.Auth{
+		ID:         "fast-truncated-stream",
+		Attributes: map[string]string{"api_key": "sk-ant-oat-fast-truncated-stream"},
+		Metadata:   claudeOAuthTestMetadata(),
+	}
+	request := cliproxyexecutor.Request{
+		Model:   "claude-opus-5",
+		Payload: []byte(`{"model":"claude-opus-5","max_tokens":16,"stream":true,"speed":"fast","messages":[{"role":"user","content":"reply OK"}]}`),
+	}
+	result, errStream := NewClaudeExecutor(&config.Config{}).ExecuteStream(ctx, auth, request, cliproxyexecutor.Options{
+		Stream:         true,
+		SourceFormat:   sdktranslator.FormatClaude,
+		ResponseFormat: sdktranslator.FormatClaude,
+	})
+	if errStream != nil {
+		t.Fatalf("ExecuteStream error = %v", errStream)
+	}
+	var streamErr error
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			streamErr = chunk.Err
+		}
+	}
+	if streamErr == nil {
+		t.Fatal("truncated Fast stream ended without an error")
+	}
+	var requestErr cliproxyexecutor.RequestScopedError
+	if !errors.As(streamErr, &requestErr) || requestErr == nil || !requestErr.IsRequestScoped() {
+		t.Fatalf("truncated Fast stream error = %T %v, want request-scoped", streamErr, streamErr)
+	}
+	var statusErr interface{ StatusCode() int }
+	if !errors.As(streamErr, &statusErr) || statusErr == nil || statusErr.StatusCode() != http.StatusBadGateway {
+		t.Fatalf("truncated Fast stream error = %T %v, want status 502", streamErr, streamErr)
+	}
+}

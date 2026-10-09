@@ -130,6 +130,13 @@ func wrapClaudeFastRequestError(fastRequest bool, status int, err error) error {
 	if rap, ok := err.(interface{ RetryAfter() *time.Duration }); ok && rap != nil {
 		retryAfter = rap.RetryAfter()
 	}
+	// A stream that failed after a 200 response carries its own failure status
+	// (for example 502 for a truncated stream); keep it rather than the 200.
+	if status < http.StatusBadRequest {
+		if sc, ok := err.(interface{ StatusCode() int }); ok && sc.StatusCode() >= http.StatusBadRequest {
+			status = sc.StatusCode()
+		}
+	}
 	return &claudeFastRequestError{cause: err, status: status, retryAfter: retryAfter}
 }
 

@@ -14,6 +14,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // midSystemLegacyPayload is a caller body pairing a legacy model with a
@@ -149,8 +150,13 @@ func sendMidSystemExecute(t *testing.T, ex *ClaudeExecutor, ctx context.Context,
 
 func sendMidSystemStream(t *testing.T, ex *ClaudeExecutor, ctx context.Context, model string) error {
 	t.Helper()
+	// A streaming caller asks for SSE, so the stub answers with a complete event stream.
+	payload, errSet := sjson.SetBytes(midSystemLegacyPayload(model), "stream", true)
+	if errSet != nil {
+		t.Fatal(errSet)
+	}
 	result, err := ex.ExecuteStream(ctx, midSystemAuth(), cliproxyexecutor.Request{
-		Model: model, Payload: midSystemLegacyPayload(model),
+		Model: model, Payload: payload,
 	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude})
 	if err != nil {
 		return err

@@ -361,13 +361,37 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		defer streamUsage.Publish(ctx, reporter)
 		var param any
 		helps.InitializeApplyPatchStream(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), body, &param)
+		// seenFinish records a choice's finish_reason, so a stream that omits [DONE]
+		// after finishing still completes. errorForwarded records an upstream error
+		// object that translation passed to the client, so EOF after it adds no second
+		// error; some client formats drop such objects and still need the 502.
+		seenDone, seenFinish, errorForwarded := false, false, false
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			reporter.ObserveResponseModel(line)
 			streamUsage.ObserveOpenAIStream(line)
+			isErrorChunk := false
+			if trimmed := bytes.TrimSpace(line); bytes.HasPrefix(trimmed, dataTag) {
+				data := bytes.TrimSpace(trimmed[len(dataTag):])
+				switch {
+				case bytes.Equal(data, []byte("[DONE]")):
+					seenDone = true
+				case gjson.GetBytes(data, "error").IsObject():
+					isErrorChunk = true
+				default:
+					for _, reason := range gjson.GetBytes(data, "choices.#.finish_reason").Array() {
+						if reason.String() != "" {
+							seenFinish = true
+						}
+					}
+				}
+			}
 			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), body, bytes.Clone(line), &param, claudeInputTokens)
 			helps.RecordApplyPatchStreamFailure(ctx, param, reporter, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage})
+			if isErrorChunk && len(chunks) > 0 {
+				errorForwarded = true
+			}
 			for i := range chunks {
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
@@ -379,9 +403,42 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 				return
 			}
 		}
+		errScan := scanner.Err()
 		if helps.EndApplyPatchStream(ctx, param, reporter, out, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}) {
 			return
 		}
+		// Check the transport before synthesizing any terminal marker.
+		if errScan != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
+			streamUsage.PublishFailure(ctx, reporter, errScan)
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
+			case <-ctx.Done():
+			}
+			return
+		}
+		if seenDone {
+			return
+		}
+		// Responses clients require an explicit terminal event, so a clean upstream EOF
+		// without [DONE] fails the stream. Other protocols accept a missing [DONE] after
+		// a finish_reason, but a stream that ended mid-generation is truncated.
+		var streamErr error
+		if responseFormat == sdktranslator.FormatOpenAIResponse {
+			streamErr = statusErr{code: http.StatusBadGateway, msg: "upstream stream closed before [DONE]"}
+		} else if !seenFinish && !errorForwarded && ctx.Err() == nil {
+			streamErr = statusErr{code: http.StatusBadGateway, msg: "upstream stream closed before finish_reason"}
+		}
+		if streamErr != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+			streamUsage.PublishFailure(ctx, reporter, streamErr)
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+			case <-ctx.Done():
+			}
+			return
+		}
+		// Retain compatibility with providers that omit [DONE] after finishing.
 		doneChunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), body, []byte("[DONE]"), &param, claudeInputTokens)
 		helps.RecordApplyPatchStreamFailure(ctx, param, reporter, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage})
 		for i := range doneChunks {
@@ -389,14 +446,6 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 			case out <- cliproxyexecutor.StreamChunk{Payload: doneChunks[i]}:
 			case <-ctx.Done():
 				return
-			}
-		}
-		if errScan := scanner.Err(); errScan != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx, errScan)
-			select {
-			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
-			case <-ctx.Done():
 			}
 		}
 	}()
@@ -687,6 +736,10 @@ func (e *KimiExecutor) executeResponsesStream(ctx context.Context, auth *cliprox
 			return true
 		}
 
+		// terminalSeen covers the Codex success terminals; upstreamFailed covers failure
+		// terminals that were already forwarded, so EOF after them adds no second error.
+		terminalSeen := false
+		upstreamFailed := false
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
@@ -695,12 +748,16 @@ func (e *KimiExecutor) executeResponsesStream(ctx context.Context, auth *cliprox
 			if bytes.HasPrefix(line, dataTag) {
 				dataBytes := bytes.TrimSpace(line[len(dataTag):])
 				eventType := gjson.GetBytes(dataBytes, "type").String()
-				if eventType == "response.completed" || eventType == "response.incomplete" || eventType == "response.done" {
+				switch eventType {
+				case "response.completed", "response.incomplete", "response.done":
+					terminalSeen = true
 					if usage, ok := helps.ParseCodexUsage(dataBytes); ok && (usage.TotalTokens > 0 || usage.InputTokens > 0) {
 						streamUsage.Observe(usage, true)
 					} else if usage := helps.ParseOpenAIUsage(dataBytes); usage.TotalTokens > 0 || usage.InputTokens > 0 {
 						streamUsage.Observe(usage, true)
 					}
+				case "response.failed", "error":
+					upstreamFailed = true
 				}
 			}
 
@@ -734,9 +791,19 @@ func (e *KimiExecutor) executeResponsesStream(ctx context.Context, auth *cliprox
 
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx, errScan)
+			streamUsage.PublishFailure(ctx, reporter, errScan)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
+			case <-ctx.Done():
+			}
+			return
+		}
+		if !terminalSeen && !upstreamFailed && ctx.Err() == nil {
+			streamErr := statusErr{code: http.StatusBadGateway, msg: "upstream stream closed before response.completed"}
+			helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+			streamUsage.PublishFailure(ctx, reporter, streamErr)
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
 			case <-ctx.Done():
 			}
 		}
