@@ -76,3 +76,35 @@ func TestSourceCredentialStatusPatchIsOwnerOnly(t *testing.T) {
 	}
 	requireOwnerOnlyFile(t, path)
 }
+
+// A FIFO lets the test delete the source credential after the status update
+// has opened it for reading but before the update writes it back.
+func TestSourceCredentialStatusPatchDoesNotRecreateDeletedFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "plugin-source.json")
+	if errFifo := syscall.Mkfifo(path, 0o600); errFifo != nil {
+		t.Fatalf("mkfifo: %v", errFifo)
+	}
+	done := make(chan error, 1)
+	go func() { done <- setSourceAuthFileDisabled(path, false) }()
+
+	writer, errOpen := os.OpenFile(path, os.O_WRONLY, 0o600)
+	if errOpen != nil {
+		t.Fatalf("open fifo: %v", errOpen)
+	}
+	if _, errWrite := writer.Write([]byte(`{"type":"codex","access_token":"test-secret","disabled":true}`)); errWrite != nil {
+		t.Fatalf("write fifo: %v", errWrite)
+	}
+	if errRemove := os.Remove(path); errRemove != nil {
+		t.Fatalf("remove source: %v", errRemove)
+	}
+	if errClose := writer.Close(); errClose != nil {
+		t.Fatalf("close fifo: %v", errClose)
+	}
+
+	if errSet := <-done; !os.IsNotExist(errSet) {
+		t.Fatalf("status update error = %v, want a not-exist error", errSet)
+	}
+	if data, errRead := os.ReadFile(path); !os.IsNotExist(errRead) {
+		t.Fatalf("deleted source credential was recreated: data=%s err=%v", data, errRead)
+	}
+}

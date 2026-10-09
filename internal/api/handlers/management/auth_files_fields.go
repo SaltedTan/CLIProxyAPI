@@ -230,10 +230,16 @@ func setSourceAuthFileDisabled(path string, disabled bool) error {
 	if errMarshal != nil {
 		return fmt.Errorf("marshal auth file: %w", errMarshal)
 	}
-	if errWrite := secretfile.WriteFile(path, raw); errWrite != nil {
+	// The file was just read; never recreate it if it was deleted since.
+	file, errOpen := secretfile.OpenExisting(path)
+	if errOpen != nil {
+		return errOpen
+	}
+	if _, errWrite := file.Write(raw); errWrite != nil {
+		_ = file.Close()
 		return errWrite
 	}
-	return nil
+	return file.Close()
 }
 
 func applyAuthDisabledState(auth *coreauth.Auth, disabled bool) {
