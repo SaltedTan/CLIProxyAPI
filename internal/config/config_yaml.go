@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/secretfile"
 	"gopkg.in/yaml.v3"
 )
 
@@ -116,7 +117,7 @@ func SaveConfigPreserveComments(configFile string, cfg *Config, migrateV8 ...boo
 			return fmt.Errorf("decode migrated config: %w", err)
 		}
 	}
-	if err = os.WriteFile(configFile, data, 0600); err != nil {
+	if err = secretfile.WriteFile(configFile, data); err != nil {
 		return err
 	}
 	if migrated != nil {
@@ -170,7 +171,7 @@ func SaveConfigPreserveCommentsUpdateNestedScalar(configFile string, path []stri
 			node = next
 		}
 	}
-	f, err := os.Create(configFile)
+	f, err := secretfile.Create(configFile)
 	if err != nil {
 		return err
 	}

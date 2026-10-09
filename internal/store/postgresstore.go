@@ -15,6 +15,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/secretfile"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
@@ -266,7 +267,7 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 			return "", fmt.Errorf("postgres store: read existing metadata: %w", errRead)
 		}
 		tmp := path + ".tmp"
-		if errWrite := os.WriteFile(tmp, raw, 0o600); errWrite != nil {
+		if errWrite := secretfile.WriteFile(tmp, raw); errWrite != nil {
 			return "", fmt.Errorf("postgres store: write temp auth file: %w", errWrite)
 		}
 		if errRename := os.Rename(tmp, path); errRename != nil {
@@ -476,7 +477,7 @@ func (s *PostgresStore) syncConfigFromDatabase(ctx context.Context, exampleConfi
 			return fmt.Errorf("postgres store: prepare config directory: %w", err)
 		}
 		normalized := normalizeLineEndings(content)
-		if err = os.WriteFile(s.configPath, []byte(normalized), 0o600); err != nil {
+		if err = secretfile.WriteFile(s.configPath, []byte(normalized)); err != nil {
 			return fmt.Errorf("postgres store: write config to spool: %w", err)
 		}
 	}
@@ -515,7 +516,7 @@ func (s *PostgresStore) syncAuthFromDatabase(ctx context.Context) error {
 		if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return fmt.Errorf("postgres store: create auth subdir: %w", err)
 		}
-		if err = os.WriteFile(path, []byte(payload), 0o600); err != nil {
+		if err = secretfile.WriteFile(path, []byte(payload)); err != nil {
 			return fmt.Errorf("postgres store: write auth file: %w", err)
 		}
 	}

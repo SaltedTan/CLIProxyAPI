@@ -22,6 +22,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/plumbing/transport/http"
 	"github.com/go-git/go-git/v6/storage/filesystem/dotgit"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/secretfile"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
@@ -470,7 +471,7 @@ func (s *GitTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		}
 		if !contentsMatch {
 			tmp := path + ".tmp"
-			if errWrite := os.WriteFile(tmp, raw, 0o600); errWrite != nil {
+			if errWrite := secretfile.WriteFile(tmp, raw); errWrite != nil {
 				return "", fmt.Errorf("auth filestore: write temp failed: %w", errWrite)
 			}
 			if errRename := os.Rename(tmp, path); errRename != nil {
@@ -1157,7 +1158,7 @@ func applyTreePaths(tree *object.Tree, repoDir string, paths []string) error {
 		if errMkdir := os.MkdirAll(filepath.Dir(destination), 0o700); errMkdir != nil {
 			return fmt.Errorf("create parent for %s: %w", path, errMkdir)
 		}
-		if errWrite := os.WriteFile(destination, []byte(contents), 0o600); errWrite != nil {
+		if errWrite := secretfile.WriteFile(destination, []byte(contents)); errWrite != nil {
 			return fmt.Errorf("write %s: %w", path, errWrite)
 		}
 	}
@@ -1587,7 +1588,7 @@ func restoreMissingTrackedFiles(repo *git.Repository, repoDir string) error {
 		if errMkdir := os.MkdirAll(filepath.Dir(destination), 0o700); errMkdir != nil {
 			return errMkdir
 		}
-		return os.WriteFile(destination, []byte(contents), 0o600)
+		return secretfile.WriteFile(destination, []byte(contents))
 	})
 }
 

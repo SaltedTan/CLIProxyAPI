@@ -8,6 +8,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/secretfile"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
@@ -230,7 +231,7 @@ func loadConfigData(configFile string, data []byte, optional bool) (*Config, err
 		return nil, errLayout
 	}
 	if changed {
-		if errWrite := os.WriteFile(configFile, cleaned, 0600); errWrite != nil {
+		if errWrite := secretfile.WriteFile(configFile, cleaned); errWrite != nil {
 			return nil, fmt.Errorf("clean conflicting config fields: %w", errWrite)
 		}
 	}

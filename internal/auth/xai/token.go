@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/secretfile"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -51,7 +52,7 @@ func (ts *TokenStorage) SaveTokenToFile(authFilePath string) error {
 		return fmt.Errorf("xai token storage: merge metadata: %w", errMerge)
 	}
 
-	file, err := os.Create(authFilePath)
+	file, err := secretfile.Create(authFilePath)
 	if err != nil {
 		return fmt.Errorf("xai token storage: create token file: %w", err)
 	}

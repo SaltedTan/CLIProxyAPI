@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/secretfile"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -66,7 +67,7 @@ func (s *VertexCredentialStorage) SaveTokenToFile(authFilePath string) error {
 		return fmt.Errorf("vertex credential: merge metadata failed: %w", errMerge)
 	}
 
-	f, err := os.Create(authFilePath)
+	f, err := secretfile.Create(authFilePath)
 	if err != nil {
 		return fmt.Errorf("vertex credential: create file failed: %w", err)
 	}

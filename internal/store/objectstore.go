@@ -18,6 +18,7 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/secretfile"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
@@ -215,7 +216,7 @@ func (s *ObjectTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (s
 			return "", fmt.Errorf("object store: read existing metadata: %w", errRead)
 		}
 		tmp := path + ".tmp"
-		if errWrite := os.WriteFile(tmp, raw, 0o600); errWrite != nil {
+		if errWrite := secretfile.WriteFile(tmp, raw); errWrite != nil {
 			return "", fmt.Errorf("object store: write temp auth file: %w", errWrite)
 		}
 		if errRename := os.Rename(tmp, path); errRename != nil {
@@ -368,7 +369,7 @@ func (s *ObjectTokenStore) syncConfigFromBucket(ctx context.Context, example str
 		if errRead != nil {
 			return fmt.Errorf("object store: read config: %w", errRead)
 		}
-		if errWrite := os.WriteFile(s.configPath, normalizeLineEndingsBytes(data), 0o600); errWrite != nil {
+		if errWrite := secretfile.WriteFile(s.configPath, normalizeLineEndingsBytes(data)); errWrite != nil {
 			return fmt.Errorf("object store: write config: %w", errWrite)
 		}
 	case isObjectNotFound(err):
@@ -446,7 +447,7 @@ func (s *ObjectTokenStore) syncAuthFromBucket(ctx context.Context) error {
 		if errRead != nil {
 			return fmt.Errorf("object store: read auth %s: %w", object.Key, errRead)
 		}
-		if errWrite := os.WriteFile(local, data, 0o600); errWrite != nil {
+		if errWrite := secretfile.WriteFile(local, data); errWrite != nil {
 			return fmt.Errorf("object store: write auth %s: %w", local, errWrite)
 		}
 	}
