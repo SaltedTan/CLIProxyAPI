@@ -232,12 +232,15 @@ func ConfigureLogOutput(cfg *config.Config) error {
 			MaxAge:     0,
 			Compress:   false,
 		}
+		writeStartupWarnings(logWriter)
 		log.SetOutput(logWriter)
 	} else {
 		if logWriter != nil {
 			_ = logWriter.Close()
 			logWriter = nil
 		}
+		// The console already shows the startup warnings.
+		takeStartupWarnings()
 		log.SetOutput(os.Stdout)
 	}
 

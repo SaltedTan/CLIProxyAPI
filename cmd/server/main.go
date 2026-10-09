@@ -635,7 +635,6 @@ func main() {
 		log.Errorf("failed to configure log output: %v", err)
 		return
 	}
-	logging.ReplayStartupWarnings()
 
 	log.Infof("CLIProxyAPI Version: %s, Commit: %s, BuiltAt: %s", buildinfo.Version, buildinfo.Commit, buildinfo.BuildDate)
 

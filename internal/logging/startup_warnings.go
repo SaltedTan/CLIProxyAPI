@@ -1,6 +1,7 @@
 package logging
 
 import (
+	"io"
 	"sync"
 
 	log "github.com/sirupsen/logrus"
@@ -42,7 +43,7 @@ func (h *startupWarningHook) Fire(entry *log.Entry) error {
 }
 
 // HoldStartupWarnings starts keeping the warnings and errors logged until
-// ReplayStartupWarnings. They are still logged as usual.
+// ConfigureLogOutput first sets the log output. They are still logged as usual.
 func HoldStartupWarnings() {
 	startupWarningsMu.Lock()
 	defer startupWarningsMu.Unlock()
@@ -53,17 +54,16 @@ func HoldStartupWarnings() {
 	log.AddHook(startupWarnings)
 }
 
-// ReplayStartupWarnings stops keeping warnings and writes the kept ones to the
-// log file when ConfigureLogOutput enabled one. They were logged before the
-// file existed, so they only reached the console. Without a log file the
-// console already shows them and nothing is written again.
-func ReplayStartupWarnings() {
+// takeStartupWarnings stops keeping warnings and returns the kept ones. It
+// returns nil when nothing is held, so only the first ConfigureLogOutput sees
+// them.
+func takeStartupWarnings() [][]byte {
 	startupWarningsMu.Lock()
 	hook := startupWarnings
 	startupWarnings = nil
 	startupWarningsMu.Unlock()
 	if hook == nil {
-		return
+		return nil
 	}
 
 	logger := log.StandardLogger()
@@ -78,17 +78,19 @@ func ReplayStartupWarnings() {
 	logger.ReplaceHooks(hooks)
 
 	hook.mu.Lock()
+	defer hook.mu.Unlock()
 	lines := hook.lines
 	hook.lines = nil
-	hook.mu.Unlock()
+	return lines
+}
 
-	writerMu.RLock()
-	defer writerMu.RUnlock()
-	if logWriter == nil {
-		return
-	}
-	for _, line := range lines {
-		if _, errWrite := logWriter.Write(line); errWrite != nil {
+// writeStartupWarnings copies the kept warnings into a new log file. They were
+// logged before the file existed, so they only reached the console. It runs
+// before the logger switches to the file, so no warning reaches the file both
+// directly and as a copy.
+func writeStartupWarnings(w io.Writer) {
+	for _, line := range takeStartupWarnings() {
+		if _, errWrite := w.Write(line); errWrite != nil {
 			return
 		}
 	}
