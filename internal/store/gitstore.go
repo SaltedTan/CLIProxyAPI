@@ -142,6 +142,8 @@ func (s *GitTokenStore) ensureRepositoryLocked() (errResult error) {
 	gitDir := filepath.Join(repoDir, ".git")
 	authMethod := s.gitClientOptions()
 	var initPaths []string
+	// Keep the checkout private before git writes to it, and again after.
+	restrictGitRepository(repoDir, s.baseDir, s.configDir)
 	if _, err := os.Stat(gitDir); errors.Is(err, fs.ErrNotExist) {
 		if errMk := os.MkdirAll(repoDir, 0o700); errMk != nil {
 			s.dirLock.Unlock()
@@ -383,6 +385,7 @@ func (s *GitTokenStore) ensureRepositoryLocked() (errResult error) {
 			}
 		}
 	}
+	restrictGitRepository(repoDir, s.baseDir, s.configDir)
 	if err := disableGitCommitSigning(repoDir); err != nil {
 		s.dirLock.Unlock()
 		return err
