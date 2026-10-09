@@ -222,6 +222,16 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 		m.mu.Unlock()
 		return current, nil
 	}
+	// A preparation that produced credentials (Meta's key mint) belongs to the account of
+	// its snapshot. A replace that moved the auth to another account meanwhile started a
+	// new quota lineage; merging the result would graft the old account's credentials onto
+	// the new one. The lineage, not the credential version, decides: Meta's device token is
+	// not among the credentials that bump the version. The same account keeps the result.
+	if mode == updateModePrepare && base != nil && CredentialsChanged(base, auth) && existing.quotaLineage != base.quotaLineage {
+		current := existing.Clone()
+		m.mu.Unlock()
+		return current, nil
+	}
 	if mode == updateModeRefresh {
 		merged := MergeRefreshedAuth(base, existing, auth)
 		if merged != nil {
