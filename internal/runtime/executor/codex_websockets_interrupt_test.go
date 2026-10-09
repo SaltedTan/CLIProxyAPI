@@ -62,7 +62,7 @@ func TestInterruptExecutionSessionRequiresActiveRead(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 
-	readCh := sess.activate(client)
+	readCh := sess.activateWithInterruptRules(client, executor.interruptPayloadRules(cliproxyexecutor.Request{Model: "gpt-6-astra"}, cliproxyexecutor.Options{}))
 	defer sess.clearActive(client, readCh)
 	if errActive := executor.InterruptExecutionSession(context.Background(), sessionID, interrupt); errActive != nil {
 		t.Fatal(errActive)
@@ -138,5 +138,87 @@ func TestInterruptExecutionSessionAppliesPayloadRules(t *testing.T) {
 	}
 	cancel()
 	for range result.Chunks {
+	}
+}
+
+// An interrupt captures the active turn before it checks the credential. When that turn ends
+// and the next one activates meanwhile, the interrupt must not reach the socket: the old
+// turn's rules are gone, and forwarding it would bypass payload rules. A turn that bound no
+// rules rejects its interrupts as well.
+func TestInterruptExecutionSessionRejectsInterruptAcrossTurnTransition(t *testing.T) {
+	received := make(chan []byte, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Errorf("upgrade: %v", errUpgrade)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		for {
+			_, payload, errRead := conn.ReadMessage()
+			if errRead != nil {
+				return
+			}
+			received <- payload
+		}
+	}))
+	defer upstream.Close()
+
+	client, _, errDial := websocket.DefaultDialer.Dial("ws"+upstream.URL[len("http"):], nil)
+	if errDial != nil {
+		t.Fatal(errDial)
+	}
+	defer func() { _ = client.Close() }()
+
+	const sessionID = "interrupt-turn-transition"
+	cfg := &config.Config{Payload: config.PayloadConfig{Filter: []config.PayloadFilterRule{{
+		Models: []config.PayloadModelRule{{Name: "*", Protocol: "codex"}},
+		Params: []string{"private_extension"},
+	}}}}
+	executor := NewCodexWebsocketsExecutor(cfg)
+	executor.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+	defer executor.CloseExecutionSession(sessionID)
+	sess := executor.getOrCreateSession(sessionID)
+	sess.connMu.Lock()
+	sess.conn = client
+	sess.authID = "auth"
+	sess.wsURL = upstream.URL
+	sess.connMu.Unlock()
+	rules := executor.interruptPayloadRules(cliproxyexecutor.Request{Model: "gpt-6-astra"}, cliproxyexecutor.Options{})
+	interrupt := []byte(`{"type":"response.interrupt","response_id":"r1","mode":"discard_partial_items","private_extension":{"secret":true}}`)
+
+	turnA := sess.activateWithInterruptRules(client, rules)
+	var turnB chan codexWebsocketRead
+	transition := cliproxyexecutor.WithWebsocketAuthCheck(context.Background(), func(string) bool {
+		// Turn A finishes and turn B starts after the interrupt captured turn A.
+		sess.clearActive(client, turnA)
+		turnB = sess.activateWithInterruptRules(client, rules)
+		return true
+	})
+	errTransition := executor.InterruptExecutionSession(transition, sessionID, interrupt)
+	if !errors.Is(errTransition, errCodexInterruptTurnEnded) {
+		t.Fatalf("interrupt across a turn transition error = %v, want errCodexInterruptTurnEnded", errTransition)
+	}
+	sess.clearActive(client, turnB)
+
+	unfiltered := sess.activate(client)
+	errUnfiltered := executor.InterruptExecutionSession(context.Background(), sessionID, interrupt)
+	if !errors.Is(errUnfiltered, errCodexInterruptTurnEnded) {
+		t.Fatalf("interrupt of a turn without rules error = %v, want errCodexInterruptTurnEnded", errUnfiltered)
+	}
+	sess.clearActive(client, unfiltered)
+
+	// A sentinel written after both attempts must be the first frame upstream received.
+	sentinel := []byte(`{"type":"sentinel"}`)
+	if errWrite := sess.writeMessage(client, websocket.TextMessage, sentinel); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	select {
+	case payload := <-received:
+		if !bytes.Equal(payload, sentinel) {
+			t.Fatalf("upstream received %s before the sentinel: a rejected interrupt was forwarded", payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream did not receive the sentinel")
 	}
 }

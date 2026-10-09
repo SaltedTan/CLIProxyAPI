@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -72,7 +73,8 @@ type codexWebsocketSession struct {
 	activeDone   <-chan struct{}
 	activeCancel context.CancelFunc
 	// activeInterruptRules applies payload rules to a response.interrupt frame of the
-	// active turn, with that turn's matching context. Nil when no turn set it.
+	// active turn, with that turn's matching context. It is installed with the turn, under
+	// the same lock; nil when the turn did not bind any.
 	activeInterruptRules func([]byte) []byte
 	terminalConn         *websocket.Conn
 	terminalErr          error
@@ -102,11 +104,11 @@ func (s *codexWebsocketSession) setActive(conn *websocket.Conn, ch chan codexWeb
 		return
 	}
 	s.activeMu.Lock()
-	s.setActiveLocked(conn, ch)
+	s.setActiveLocked(conn, ch, nil)
 	s.activeMu.Unlock()
 }
 
-func (s *codexWebsocketSession) setActiveLocked(conn *websocket.Conn, ch chan codexWebsocketRead) {
+func (s *codexWebsocketSession) setActiveLocked(conn *websocket.Conn, ch chan codexWebsocketRead, interruptRules func([]byte) []byte) {
 	if s.activeCancel != nil {
 		s.activeCancel()
 		s.activeCancel = nil
@@ -114,7 +116,7 @@ func (s *codexWebsocketSession) setActiveLocked(conn *websocket.Conn, ch chan co
 	}
 	s.activeConn = conn
 	s.activeCh = ch
-	s.activeInterruptRules = nil
+	s.activeInterruptRules = interruptRules
 	if conn != nil && ch != nil {
 		activeCtx, activeCancel := context.WithCancel(context.Background())
 		s.activeDone = activeCtx.Done()
@@ -123,6 +125,13 @@ func (s *codexWebsocketSession) setActiveLocked(conn *websocket.Conn, ch chan co
 }
 
 func (s *codexWebsocketSession) activate(conn *websocket.Conn) chan codexWebsocketRead {
+	return s.activateWithInterruptRules(conn, nil)
+}
+
+// activateWithInterruptRules starts a turn on conn whose response.interrupt frames pass
+// interruptRules. The rules become visible together with the turn, so an interrupt never
+// sees the turn active without them.
+func (s *codexWebsocketSession) activateWithInterruptRules(conn *websocket.Conn, interruptRules func([]byte) []byte) chan codexWebsocketRead {
 	if s == nil || conn == nil {
 		return nil
 	}
@@ -134,7 +143,7 @@ func (s *codexWebsocketSession) activate(conn *websocket.Conn) chan codexWebsock
 		close(ch)
 		return ch
 	}
-	s.setActiveLocked(conn, ch)
+	s.setActiveLocked(conn, ch, interruptRules)
 	return ch
 }
 
@@ -165,29 +174,43 @@ func (s *codexWebsocketSession) markTerminalError(conn *websocket.Conn, err erro
 	return true
 }
 
-// setActiveInterruptRules binds rules to the turn activated with ch, if it is still active.
-func (s *codexWebsocketSession) setActiveInterruptRules(ch chan codexWebsocketRead, rules func([]byte) []byte) {
-	if s == nil || ch == nil {
-		return
-	}
-	s.activeMu.Lock()
-	defer s.activeMu.Unlock()
-	if s.activeCh == ch {
-		s.activeInterruptRules = rules
-	}
-}
+// errCodexInterruptTurnEnded rejects a response.interrupt whose turn is no longer active
+// on its socket, or bound no payload rules: forwarding it would bypass the rules.
+var errCodexInterruptTurnEnded = errors.New("codex websockets: the turn of response.interrupt is no longer active")
 
-// activeInterruptRulesFor returns the interrupt payload rules of the turn reading ch.
-func (s *codexWebsocketSession) activeInterruptRulesFor(ch chan codexWebsocketRead) func([]byte) []byte {
-	if s == nil || ch == nil {
+// activeInterruptRulesFor returns the interrupt payload rules of the turn reading ch on
+// conn, or nil when another turn, or none, is active.
+func (s *codexWebsocketSession) activeInterruptRulesFor(conn *websocket.Conn, ch chan codexWebsocketRead) func([]byte) []byte {
+	if s == nil || conn == nil || ch == nil {
 		return nil
 	}
 	s.activeMu.Lock()
 	defer s.activeMu.Unlock()
-	if s.activeCh != ch {
+	if s.activeConn != conn || s.activeCh != ch {
 		return nil
 	}
 	return s.activeInterruptRules
+}
+
+// writeTurnInterrupt writes a response.interrupt for the turn reading ch on conn, after that
+// turn's payload rules. The turn is checked under the write lock, so no frame of a later
+// turn, such as its response.create, reaches the socket between the check and the
+// interrupt. It returns errCodexInterruptTurnEnded, writing nothing, when the turn ended or
+// has no rules.
+func (s *codexWebsocketSession) writeTurnInterrupt(conn *websocket.Conn, ch chan codexWebsocketRead, payload []byte) error {
+	if s == nil {
+		return fmt.Errorf("codex websockets executor: session is nil")
+	}
+	if conn == nil {
+		return fmt.Errorf("codex websockets executor: websocket conn is nil")
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	rules := s.activeInterruptRulesFor(conn, ch)
+	if rules == nil {
+		return errCodexInterruptTurnEnded
+	}
+	return s.writeMessageLocked(conn, websocket.TextMessage, rules(payload))
 }
 
 func (s *codexWebsocketSession) activeForConn(conn *websocket.Conn) (chan codexWebsocketRead, <-chan struct{}) {
@@ -245,6 +268,11 @@ func (s *codexWebsocketSession) writeMessage(conn *websocket.Conn, msgType int, 
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	return s.writeMessageLocked(conn, msgType, payload)
+}
+
+// writeMessageLocked writes payload to conn; the caller holds writeMu.
+func (s *codexWebsocketSession) writeMessageLocked(conn *websocket.Conn, msgType int, payload []byte) error {
 	if testWebsocketWritePayloadHook != nil {
 		testWebsocketWritePayloadHook(conn)
 	}

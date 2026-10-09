@@ -148,8 +148,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 	var readCh chan codexWebsocketRead
 	if sess != nil {
-		readCh = sess.activate(conn)
-		sess.setActiveInterruptRules(readCh, e.interruptPayloadRules(req, opts))
+		readCh = sess.activateWithInterruptRules(conn, e.interruptPayloadRules(req, opts))
 	}
 	restoreMultiAgentV2 := !multiAgentV2Conflict && (optimizeMultiAgentV2 || sess.isMultiAgentV2Optimized(conn))
 
@@ -192,8 +191,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				closeWebsocketAfterBindFailure(sess, conn, closer)
 				return nil, errBind
 			}
-			readCh = sess.activate(conn)
-			sess.setActiveInterruptRules(readCh, e.interruptPayloadRules(req, opts))
+			readCh = sess.activateWithInterruptRules(conn, e.interruptPayloadRules(req, opts))
 			restoreMultiAgentV2 = !multiAgentV2Conflict && (optimizeMultiAgentV2 || sess.isMultiAgentV2Optimized(conn))
 			wsReqBodyRetry := frameCodexWebsocketRequestBody(clientBody)
 			helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{

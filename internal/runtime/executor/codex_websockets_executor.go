@@ -234,10 +234,10 @@ func (e *CodexWebsocketsExecutor) InterruptExecutionSession(ctx context.Context,
 	if !cliproxyexecutor.WebsocketAuthEnabled(ctx, authID) {
 		return fmt.Errorf("websocket credential is no longer enabled")
 	}
-	if rules := sess.activeInterruptRulesFor(readCh); rules != nil {
-		payload = rules(payload)
-	}
-	if errWrite := writeCodexWebsocketMessage(sess, conn, payload); errWrite != nil {
+	// The turn may have ended, and another started, since readCh was captured: its rules
+	// are looked up and applied under the write lock, and the interrupt is rejected rather
+	// than forwarded unfiltered when the turn changed.
+	if errWrite := sess.writeTurnInterrupt(conn, readCh, payload); errWrite != nil {
 		return errWrite
 	}
 	log.Infof("codex websockets: request forwarded session=%s auth=%s url=%s event=response.interrupt", sessionID, authID, wsURL)
