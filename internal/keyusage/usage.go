@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -430,10 +432,43 @@ func (w *usageWindow) reading() windowReading {
 	return windowReading{ok: true, used: *w.Utilization, resetAt: parseResetTime(w.ResetsAt)}
 }
 
+// legacyWindow is the iguana_necktie window. It is the Fable window on accounts
+// without a scoped Fable limit, but can also be dollar-denominated cloud session
+// credits, which carry limit_dollars, used_dollars or remaining_dollars.
+type legacyWindow struct {
+	usageWindow
+	LimitDollars     any `json:"limit_dollars"`
+	UsedDollars      any `json:"used_dollars"`
+	RemainingDollars any `json:"remaining_dollars"`
+}
+
+// fableReading returns the window's reading as the Fable window; it is not ok for
+// a dollar-denominated credit pool, which says nothing about the Fable allowance.
+func (w *legacyWindow) fableReading() windowReading {
+	if w == nil || isNumber(w.LimitDollars) || isNumber(w.UsedDollars) || isNumber(w.RemainingDollars) {
+		return windowReading{}
+	}
+	return w.usageWindow.reading()
+}
+
+// isNumber reports whether a decoded JSON value is a finite number or a numeric
+// string, the way the management panel tells a dollar field is present.
+func isNumber(value any) bool {
+	switch v := value.(type) {
+	case float64:
+		return true
+	case string:
+		parsed, errParse := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		return errParse == nil && !math.IsInf(parsed, 0) && !math.IsNaN(parsed)
+	default:
+		return false
+	}
+}
+
 type usagePayload struct {
-	FiveHour *usageWindow `json:"five_hour"`
-	Weekly   *usageWindow `json:"seven_day"`
-	Legacy   *usageWindow `json:"iguana_necktie"`
+	FiveHour *usageWindow  `json:"five_hour"`
+	Weekly   *usageWindow  `json:"seven_day"`
+	Legacy   *legacyWindow `json:"iguana_necktie"`
 	Limits   []struct {
 		Kind     string   `json:"kind"`
 		Percent  *float64 `json:"percent"`
@@ -450,7 +485,8 @@ type usagePayload struct {
 // parseUsageReading reads an OAuth usage payload: the account's five_hour and overall
 // seven_day windows, and its Fable window the way the management panel reads it: the
 // active weekly_scoped limit of the Fable model family (any version), else the first
-// valid one, else the legacy iguana_necktie window.
+// valid one, else the legacy iguana_necktie window unless it is dollar-denominated
+// cloud session credits.
 func parseUsageReading(body []byte) (usageReading, error) {
 	var payload usagePayload
 	if errUnmarshal := json.Unmarshal(body, &payload); errUnmarshal != nil {
@@ -476,7 +512,7 @@ func parseUsageReading(body []byte) (usageReading, error) {
 		}
 	}
 	if !found {
-		reading.fable = payload.Legacy.reading()
+		reading.fable = payload.Legacy.fableReading()
 	}
 	return reading, nil
 }

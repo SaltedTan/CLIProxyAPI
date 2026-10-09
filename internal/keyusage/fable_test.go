@@ -41,6 +41,28 @@ func TestParseFableReading(t *testing.T) {
 			reset: "2026-10-11T10:00:00Z",
 		},
 		{
+			name:  "percentage legacy field without a scoped limit",
+			body:  `{"iguana_necktie":{"utilization":41,"resets_at":"2026-10-11T10:00:00Z","limit_dollars":null}}`,
+			want:  41,
+			reset: "2026-10-11T10:00:00Z",
+		},
+		{
+			name:    "dollar-denominated legacy field is cloud session credits",
+			body:    `{"iguana_necktie":{"utilization":5.04,"resets_at":"2026-11-05T07:59:00+00:00","limit_dollars":100,"used_dollars":5.04,"remaining_dollars":94.96}}`,
+			noFable: true,
+		},
+		{
+			name:    "legacy field with only remaining_dollars is cloud session credits",
+			body:    `{"iguana_necktie":{"utilization":5,"resets_at":"2026-11-05T07:59:00+00:00","remaining_dollars":"95"},"limits":[{"kind":"weekly_scoped","percent":null,"scope":{"model":{"display_name":"Fable"}}}]}`,
+			noFable: true,
+		},
+		{
+			name:  "credit pool beside a scoped Fable limit",
+			body:  `{"iguana_necktie":{"utilization":5,"resets_at":"2026-11-05T07:59:00+00:00","used_dollars":5},"limits":[{"kind":"weekly_scoped","percent":64,"resets_at":"2026-10-10T10:00:00Z","is_active":true,"scope":{"model":{"display_name":"Fable"}}}]}`,
+			want:  64,
+			reset: "2026-10-10T10:00:00Z",
+		},
+		{
 			name:    "other models and windows are not Fable",
 			body:    `{"seven_day":{"utilization":20,"resets_at":"2026-10-11T10:00:00Z"},"limits":[{"kind":"weekly_scoped","percent":35,"scope":{"model":{"display_name":"Sonnet 5"}}},{"kind":"session","percent":50,"scope":{"model":{"display_name":"Fable"}}}]}`,
 			noFable: true,
