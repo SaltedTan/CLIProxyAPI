@@ -710,3 +710,48 @@ func TestRefreshAuth_MergesAttributesAndPreservesPath_Issue6119(t *testing.T) {
 		})
 	}
 }
+
+// A plugin grant lives in opaque storage the core cannot compare, so a refresh started from
+// grant A must not overwrite a grant B installed while it ran.
+func TestRefreshSuccessKeepsPluginStorageReplacedDuringRefresh(t *testing.T) {
+	ctx := context.Background()
+	manager := coreauth.NewManager(nil, nil, nil)
+	authWithToken := func(token string) *coreauth.Auth {
+		return pluginAuthDataToCoreAuth(pluginapi.AuthData{
+			ID:          "plugin-grant-swap",
+			Provider:    "example-auth-go",
+			Metadata:    map[string]any{"type": "example-auth-go"},
+			StorageJSON: []byte(`{"token":"` + token + `"}`),
+		}, "", "", "")
+	}
+	base, errRegister := manager.Register(ctx, authWithToken("A"))
+	if errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	replacement, errUpdate := manager.Update(ctx, authWithToken("B"))
+	if errUpdate != nil {
+		t.Fatalf("Update() error = %v", errUpdate)
+	}
+	if replacement.CredentialVersion != base.CredentialVersion {
+		t.Fatalf("credential version = %d, want %d: the test needs a swap the version misses", replacement.CredentialVersion, base.CredentialVersion)
+	}
+
+	if _, errRefresh := manager.UpdateRefreshedAuth(ctx, base, authWithToken("A-rotated")); errRefresh != nil {
+		t.Fatalf("UpdateRefreshedAuth() error = %v", errRefresh)
+	}
+	current, ok := manager.GetByID(base.ID)
+	if !ok {
+		t.Fatal("auth missing after refresh")
+	}
+	storage, ok := current.Storage.(*pluginTokenStorage)
+	if !ok {
+		t.Fatalf("storage = %T, want *pluginTokenStorage", current.Storage)
+	}
+	var payload map[string]any
+	if errUnmarshal := json.Unmarshal(storage.RawJSON(), &payload); errUnmarshal != nil {
+		t.Fatalf("unmarshal storage: %v", errUnmarshal)
+	}
+	if payload["token"] != "B" {
+		t.Fatalf("storage token = %v, want B", payload["token"])
+	}
+}

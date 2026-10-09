@@ -645,17 +645,24 @@ func (m *Manager) markRejectedAccessToken(id, failedAccessToken string) {
 // credentials or another account (a new quota lineage, which also covers credentials such
 // as Meta's device token that do not bump the credential version) while the refresh ran.
 // refreshGrantReplaced reports whether a successful refresh started from base must not be
-// applied to current: a replace committed other credentials while it ran, including Meta's
-// device token, which does not bump the credential version. Unlike refreshResultObsolete it
-// ignores the quota lineage. A replace that keeps the credentials but renews the lineage
-// (a corrected account ID) must still receive the rotated tokens, because the provider has
-// already invalidated the refresh token the replace carries.
+// applied to current because a replace committed another grant while it ran.
+//
+// For an auth with a refresh token, that token is the grant and CredentialsChanged compares
+// it, so the quota lineage is ignored: a replace that keeps the credentials but renews the
+// lineage (a corrected account ID) must still receive the rotated tokens, because the
+// provider has already invalidated the refresh token the replace carries.
+//
+// Other grants are opaque here (Meta's device token, Devin's session, plugin storage), so
+// such an auth also counts a renewed lineage as a replace, like refreshResultObsolete.
+// Dropping one of their results only costs another exchange.
 func refreshGrantReplaced(base, current *Auth) bool {
 	if base == nil || current == nil {
 		return false
 	}
-	return current.CredentialVersion != base.CredentialVersion || CredentialsChanged(base, current) ||
-		authDCAToken(base) != authDCAToken(current)
+	if authRefreshToken(base) == "" {
+		return refreshResultObsolete(base, current)
+	}
+	return current.CredentialVersion != base.CredentialVersion || CredentialsChanged(base, current)
 }
 
 func refreshResultObsolete(base, current *Auth) bool {
