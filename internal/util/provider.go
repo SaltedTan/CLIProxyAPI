@@ -215,7 +215,9 @@ func MaskAuthorizationHeader(value string) string {
 //
 // Behavior by header key (case-insensitive):
 //   - "Authorization": Preserve the auth type prefix (e.g., "Bearer ") and mask only the credential part.
-//   - Headers containing "api-key": Mask the entire value using HideAPIKey.
+//   - Headers containing "api-key", "token", "secret", "cookie" or "management-key":
+//     Mask the entire value using HideAPIKey.
+//   - "Sec-WebSocket-Protocol": Mask only the subprotocol entries that carry a credential.
 //   - Others: Return the original value unchanged.
 //
 // Parameters:
@@ -232,8 +234,12 @@ func MaskSensitiveHeaderValue(key, value string) string {
 	case strings.Contains(lowerKey, "api-key"),
 		strings.Contains(lowerKey, "apikey"),
 		strings.Contains(lowerKey, "token"),
-		strings.Contains(lowerKey, "secret"):
+		strings.Contains(lowerKey, "secret"),
+		strings.Contains(lowerKey, "cookie"),
+		strings.Contains(lowerKey, "management-key"):
 		return HideAPIKey(value)
+	case lowerKey == "sec-websocket-protocol":
+		return maskWebsocketSubprotocols(value)
 	default:
 		return value
 	}
