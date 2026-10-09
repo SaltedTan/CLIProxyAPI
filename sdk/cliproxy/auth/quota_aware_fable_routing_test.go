@@ -33,14 +33,22 @@ type fableRoutingCase struct {
 	fable bool
 }
 
+// forwardingSelector is a custom selector that wraps another and forwards every pick.
+type forwardingSelector struct{ next Selector }
+
+func (s forwardingSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	return s.next.Pick(ctx, provider, model, opts, auths)
+}
+
 // assertManagerFableRouting picks for the route model through the manager's local pick
 // paths: SelectAuth (single provider) and Execute (mixed providers), with the quota-aware
-// selector on its own and nested under session affinity.
+// selector on its own, nested under session affinity, and wrapped by a custom selector.
 func assertManagerFableRouting(t *testing.T, tc fableRoutingCase) {
 	t.Helper()
 	selectors := map[string]func(*QuotaAwareSelector) Selector{
 		"quota-aware":                  func(quota *QuotaAwareSelector) Selector { return quota },
 		"session-affinity/quota-aware": func(quota *QuotaAwareSelector) Selector { return NewSessionAffinitySelector(quota) },
+		"forwarding/quota-aware":       func(quota *QuotaAwareSelector) Selector { return forwardingSelector{next: quota} },
 	}
 	for selectorName, newSelector := range selectors {
 		for _, path := range []string{"select", "execute"} {
@@ -204,4 +212,26 @@ func TestManagerQuotaAware_APIKeyAliasRanksByConfiguredUpstream(t *testing.T) {
 		upstream: testFableModel,
 		fable:    true,
 	})
+}
+
+// A custom selector receives the upstream model resolver but is not told the candidates are
+// prevalidated; that stays limited to the built-in selectors.
+func TestSelectorContextForAvailableAuths_CustomSelectorGetsResolverOnly(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	for name, tc := range map[string]struct {
+		selector     Selector
+		prevalidated bool
+	}{
+		"custom":      {selector: forwardingSelector{next: &RoundRobinSelector{}}},
+		"quota-aware": {selector: newTestQuotaAwareSelector(quotaAwareTestBase(), nil), prevalidated: true},
+		"round-robin": {selector: &RoundRobinSelector{}, prevalidated: true},
+	} {
+		ctx := manager.selectorContextForAvailableAuths(context.Background(), tc.selector, testFableModel)
+		if upstreamModelResolverFromContext(ctx) == nil {
+			t.Errorf("%s: no upstream model resolver attached", name)
+		}
+		if got, _ := ctx.Value(prevalidatedAuthCandidatesKey{}).(bool); got != tc.prevalidated {
+			t.Errorf("%s: prevalidated = %v, want %v", name, got, tc.prevalidated)
+		}
+	}
 }

@@ -660,18 +660,19 @@ func selectionArgForSelector(selector Selector, routeModel string) string {
 }
 
 // selectorContextForAvailableAuths prepares the context for the configured selector's Pick
-// over candidates the manager has already checked. Session affinity and quota-aware
-// selectors also receive the manager's per-credential upstream model for the route model,
-// which quota-aware routing uses to tell Fable requests apart (see quotaAwareFableRequest);
-// session affinity passes the context on to its fallback.
+// over candidates the manager has already checked. Every selector receives the manager's
+// per-credential upstream model for the route model, resolved lazily, which quota-aware
+// routing uses to tell Fable requests apart (see quotaAwareFableRequest) even when another
+// selector wraps it; session affinity passes the context on to its fallback.
 func (m *Manager) selectorContextForAvailableAuths(ctx context.Context, selector Selector, routeModel string) context.Context {
 	ctx = withWeightedSelectorStateModel(ctx, selector, routeModel)
+	ctx = withUpstreamModelResolver(ctx, func(auth *Auth) string {
+		return m.upstreamModelForAuth(auth, routeModel)
+	})
 	if !isBuiltInSelector(selector) {
 		switch selector.(type) {
 		case *SessionAffinitySelector, *QuotaAwareSelector:
-			ctx = withUpstreamModelResolver(ctx, func(auth *Auth) string {
-				return m.upstreamModelForAuth(auth, routeModel)
-			})
+			// Built-in strategies that trust the manager's candidate checks.
 		default:
 			return ctx
 		}
