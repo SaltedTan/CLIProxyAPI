@@ -22,7 +22,7 @@ func (e *blockingMetaKeyRefresher) Refresh(_ context.Context, auth *Auth) (*Auth
 
 // A successful refresh that finished after a replace moved the auth to another account must
 // not install the old account's key. Meta's device token does not bump the credential
-// version, so only the quota lineage shows the replace.
+// version, so the refresh compares it explicitly.
 func TestManagerRefreshAuthObsoleteSuccessKeepsReplacementCredentials(t *testing.T) {
 	ctx := context.Background()
 	store := newMemoryAuthTestStore()
@@ -68,5 +68,40 @@ func TestManagerRefreshAuthObsoleteSuccessKeepsReplacementCredentials(t *testing
 	store.mu.Unlock()
 	if got := authMetadataString(persisted, "api_key"); got != "" {
 		t.Fatalf("persisted api_key = %q, want none", got)
+	}
+}
+
+// A successful refresh is kept when a replace committed the same credentials meanwhile,
+// though the replace renewed the quota lineage: the provider has already invalidated the
+// old refresh token, so dropping the rotated one would force a new login.
+func TestManagerRefreshSuccessSurvivesReplaceWithSameCredentials(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(nil, nil, nil)
+	synthetic := lineageClaudeAuth("refresh-same-credentials", "1")
+	synthetic.Metadata["account_uuid"] = "synthetic-uuid"
+	base := registerForLineage(t, manager, synthetic)
+
+	corrected := base.Clone()
+	corrected.Metadata["account_uuid"] = "real-uuid"
+	if _, errUpdate := manager.Update(ctx, corrected); errUpdate != nil {
+		t.Fatalf("Update() error = %v", errUpdate)
+	}
+	replaced := currentForLineage(t, manager, base.ID)
+	if replaced.quotaLineage == base.quotaLineage {
+		t.Fatal("replace kept the quota lineage; the test needs a renewed one")
+	}
+	if replaced.CredentialVersion != base.CredentialVersion {
+		t.Fatalf("credential version = %d, want %d: the replace changed no credential", replaced.CredentialVersion, base.CredentialVersion)
+	}
+
+	if _, errUpdate := manager.UpdateRefreshedAuth(ctx, base, withTokens(base, "2")); errUpdate != nil {
+		t.Fatalf("UpdateRefreshedAuth() error = %v", errUpdate)
+	}
+	current := currentForLineage(t, manager, base.ID)
+	if got := authRefreshToken(current); got != "refresh-2" {
+		t.Fatalf("refresh token = %q, want refresh-2: the rotated tokens were dropped", got)
+	}
+	if got := authAccessToken(current); got != "access-2" {
+		t.Fatalf("access token = %q, want access-2", got)
 	}
 }

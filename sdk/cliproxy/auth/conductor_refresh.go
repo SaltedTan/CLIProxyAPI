@@ -411,8 +411,18 @@ func authHasRefreshCredential(auth *Auth) bool {
 		return true
 	}
 	// Meta exchanges its device token for a replacement API key after a 401.
-	return auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "meta") &&
-		(authMetadataString(auth, "dca_token") != "" || strings.TrimSpace(auth.Attributes["dca_token"]) != "")
+	return auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "meta") && authDCAToken(auth) != ""
+}
+
+// authDCAToken returns Meta's device token, which a refresh exchanges for an API key.
+func authDCAToken(auth *Auth) string {
+	if token := authMetadataString(auth, "dca_token"); token != "" {
+		return token
+	}
+	if auth == nil || auth.Attributes == nil {
+		return ""
+	}
+	return strings.TrimSpace(auth.Attributes["dca_token"])
 }
 
 // CredentialsChanged reports whether authentication credentials (tokens or API keys)
@@ -634,6 +644,20 @@ func (m *Manager) markRejectedAccessToken(id, failedAccessToken string) {
 // started from (base): the auth was registered again, or a replace committed other
 // credentials or another account (a new quota lineage, which also covers credentials such
 // as Meta's device token that do not bump the credential version) while the refresh ran.
+// refreshGrantReplaced reports whether a successful refresh started from base must not be
+// applied to current: a replace committed other credentials while it ran, including Meta's
+// device token, which does not bump the credential version. Unlike refreshResultObsolete it
+// ignores the quota lineage. A replace that keeps the credentials but renews the lineage
+// (a corrected account ID) must still receive the rotated tokens, because the provider has
+// already invalidated the refresh token the replace carries.
+func refreshGrantReplaced(base, current *Auth) bool {
+	if base == nil || current == nil {
+		return false
+	}
+	return current.CredentialVersion != base.CredentialVersion || CredentialsChanged(base, current) ||
+		authDCAToken(base) != authDCAToken(current)
+}
+
 func refreshResultObsolete(base, current *Auth) bool {
 	if base == nil || current == nil {
 		return false
