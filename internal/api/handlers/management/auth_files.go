@@ -529,9 +529,21 @@ func isModelStateBlocked(state *coreauth.ModelState, now time.Time) bool {
 	return true
 }
 
-func reconcileAuthFileCooldownState(auth *coreauth.Auth, now time.Time) (unavailable bool, status coreauth.Status, statusMessage string, nextRetry time.Time) {
+// Values of a listing entry's unavailable_reason, which says why unavailable is set.
+const (
+	// authFileUnavailableAuth: a persistent auth failure; no model can use the credential.
+	authFileUnavailableAuth = "auth"
+	// authFileUnavailableCooldown: a credential-wide cooldown; no model can use the credential.
+	authFileUnavailableCooldown = "cooldown"
+	// authFileUnavailableModels: only recorded models are cooling; others can still use it.
+	authFileUnavailableModels = "models"
+)
+
+// reconcileAuthFileCooldownState reports the credential's listed availability.
+// reason is set whenever unavailable is, except for a disabled credential.
+func reconcileAuthFileCooldownState(auth *coreauth.Auth, now time.Time) (unavailable bool, status coreauth.Status, statusMessage string, nextRetry time.Time, reason string) {
 	if auth == nil {
-		return false, coreauth.StatusActive, "", time.Time{}
+		return false, coreauth.StatusActive, "", time.Time{}, ""
 	}
 	unavailable = auth.Unavailable
 	status = auth.Status
@@ -541,7 +553,7 @@ func reconcileAuthFileCooldownState(auth *coreauth.Auth, now time.Time) (unavail
 	}
 
 	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
-		return unavailable, coreauth.StatusDisabled, statusMessage, nextRetry
+		return unavailable, coreauth.StatusDisabled, statusMessage, nextRetry, ""
 	}
 
 	// Never reconcile an active authentication or token failure to active.
@@ -549,18 +561,20 @@ func reconcileAuthFileCooldownState(auth *coreauth.Auth, now time.Time) (unavail
 		if !nextRetry.IsZero() && !nextRetry.After(now) {
 			nextRetry = time.Time{}
 		}
-		return true, coreauth.StatusError, statusMessage, nextRetry
+		return true, coreauth.StatusError, statusMessage, nextRetry, authFileUnavailableAuth
 	}
 
 	// Check if there is an active credential-level cooldown.
 	// Matching selector.availabilityBlock: if neither Unavailable nor Quota.Exceeded is true,
 	// an inactive timestamp does not block the credential.
 	hasActiveCredCooldown := false
+	hasCredentialQuota := false
 	if auth.Unavailable || auth.Quota.Exceeded {
 		if !auth.NextRetryAfter.IsZero() && auth.NextRetryAfter.After(now) {
 			hasActiveCredCooldown = true
 		}
 		if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now) {
+			hasCredentialQuota = true
 			hasActiveCredCooldown = true
 			if nextRetry.IsZero() || auth.Quota.NextRecoverAt.After(nextRetry) {
 				nextRetry = auth.Quota.NextRecoverAt
@@ -593,6 +607,14 @@ func reconcileAuthFileCooldownState(auth *coreauth.Auth, now time.Time) (unavail
 		}
 	}
 
+	// Matching isAuthBlockedForModel: once any model state is recorded, only a
+	// credential-wide quota blocks other models; the credential-level cooldown
+	// is otherwise the aggregate of the recorded models' states.
+	blockedReason := authFileUnavailableCooldown
+	if len(auth.ModelStates) > 0 && !hasCredentialQuota {
+		blockedReason = authFileUnavailableModels
+	}
+
 	hadCooldown := !auth.NextRetryAfter.IsZero() ||
 		(auth.Quota.Exceeded && !auth.Quota.NextRecoverAt.IsZero()) ||
 		hadAnyModelCooldown
@@ -603,7 +625,7 @@ func reconcileAuthFileCooldownState(auth *coreauth.Auth, now time.Time) (unavail
 		if !nextRetry.IsZero() && !nextRetry.After(now) {
 			nextRetry = time.Time{}
 		}
-		return true, coreauth.StatusError, statusMessage, nextRetry
+		return true, coreauth.StatusError, statusMessage, nextRetry, blockedReason
 	}
 
 	// If the credential was not marked unavailable and has no active credential cooldown, keep unavailable=false.
@@ -612,12 +634,12 @@ func reconcileAuthFileCooldownState(auth *coreauth.Auth, now time.Time) (unavail
 			status = coreauth.StatusActive
 			statusMessage = ""
 		}
-		return false, status, statusMessage, time.Time{}
+		return false, status, statusMessage, time.Time{}, ""
 	}
 
 	// If a cooldown was recorded but has expired (and no active model cooldown blocks all models):
 	if hadCooldown && !hasActiveCredCooldown && !hasActiveModelCooldown {
-		return false, coreauth.StatusActive, "", time.Time{}
+		return false, coreauth.StatusActive, "", time.Time{}, ""
 	}
 
 	// If partial models are still cooling, the credential as a whole remains available for other models.
@@ -626,7 +648,7 @@ func reconcileAuthFileCooldownState(auth *coreauth.Auth, now time.Time) (unavail
 			status = coreauth.StatusActive
 			statusMessage = ""
 		}
-		return false, status, statusMessage, time.Time{}
+		return false, status, statusMessage, time.Time{}, ""
 	}
 
 	// If nextRetry is in the past, do not expose a past retry deadline.
@@ -634,7 +656,10 @@ func reconcileAuthFileCooldownState(auth *coreauth.Auth, now time.Time) (unavail
 		nextRetry = time.Time{}
 	}
 
-	return unavailable, status, statusMessage, nextRetry
+	if !unavailable {
+		blockedReason = ""
+	}
+	return unavailable, status, statusMessage, nextRetry, blockedReason
 }
 
 func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quotaSupported ...map[string]struct{}) gin.H {
@@ -655,7 +680,7 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quotaSupported .
 		name = auth.ID
 	}
 	now := time.Now().UTC()
-	unavailable, status, statusMessage, nextRetryAfter := reconcileAuthFileCooldownState(auth, now)
+	unavailable, status, statusMessage, nextRetryAfter, unavailableReason := reconcileAuthFileCooldownState(auth, now)
 	if status == coreauth.StatusActive && statusMessage == "" && auth.RefreshTokenRejected() {
 		// The panel flags any status message, so only a dead refresh token earns
 		// one; transient refresh failures appear in refresh_error alone.
@@ -736,6 +761,9 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quotaSupported .
 	}
 	if !nextRetryAfter.IsZero() {
 		entry["next_retry_after"] = nextRetryAfter
+	}
+	if unavailableReason != "" {
+		entry["unavailable_reason"] = unavailableReason
 	}
 	if auth.RefreshError != nil {
 		entry["refresh_error"] = authFileRefreshErrorPayload(auth)
