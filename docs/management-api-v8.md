@@ -108,7 +108,7 @@ retain the corresponding business operation's fields.
 | `/observability/usage/api-keys` | GET | Get upstream provider API-key usage. |
 | `/observability/usage/clients` | GET, DELETE | Get or reset usage per client API key (`access.api-keys`). |
 | `/observability/usage/clients/window/reset` | POST | End a client key's current Claude allowance window, keeping its history. |
-| `/observability/usage/queue` | GET | Get queued usage events. |
+| `/observability/usage/queue` | GET | Remove and return the oldest queued usage events (destructive, see [Usage queue](#usage-queue)). |
 | `/observability/routing` | GET | Get live routing state and recent credential selections. |
 | `/credentials` | GET, POST, DELETE | List, upload, or delete credential files. |
 | `/credentials/models` | GET | Get credential models. |
@@ -126,6 +126,28 @@ retain the corresponding business operation's fields.
 | `/plugins/store` | GET | List the plugin store. |
 | `/plugins/store/<id>/install` | POST | Install or update a plugin. |
 | `/plugins/<id>/quota` | GET, POST, DELETE | Read, fetch, or reset plugin quota. |
+
+### Usage queue
+
+`GET /observability/usage/queue?count=<n>` pops events: it removes up to
+`count` of the oldest queued usage events and returns them as a JSON array,
+oldest first. It is not a peek.
+
+- `count` defaults to `1`. A value that is not a positive integer returns `400`.
+- Returned events leave the queue before the response is written. If the
+  response is lost (client timeout, dropped connection), those events are gone;
+  there is no acknowledgement or redelivery.
+- All consumers compete for the same events: concurrent callers of this
+  endpoint, `LPOP`/`RPOP` on the Redis-protocol usage queue, and the
+  CLIProxyAPIHome usage forwarder when Home is enabled. Each event goes to only
+  one of them, so use a single consumer when every event matters.
+- Events are queued only while `observability.usage.usage-statistics-enabled`
+  is on. While a Redis-protocol `SUBSCRIBE` client is connected, new events are
+  pushed to it and are not queued.
+- Events nobody pops expire after
+  `observability.usage.redis-usage-queue-retention-seconds` (default 60,
+  maximum 3600).
+- An empty queue returns `[]`.
 
 ### Credential refresh failures
 
