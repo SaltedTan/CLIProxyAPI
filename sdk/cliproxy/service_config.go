@@ -7,6 +7,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clientusage"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/keyusage"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/synthesizer"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
@@ -157,7 +158,8 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(ctx context.Context, newCfg
 }
 
 // commitConfigUpdate applies only in-memory configuration state. Runtime work that
-// may block on plugins, models, storage, or networking is deliberately deferred.
+// may block on plugins, storage, or networking is deliberately deferred. Catalog
+// source generations change here so an older commit cannot restart stale readers.
 func (s *Service) commitConfigUpdate(newCfg *config.Config) configCommit {
 	if s == nil {
 		return configCommit{}
@@ -179,11 +181,16 @@ func (s *Service) commitConfigUpdate(newCfg *config.Config) configCommit {
 		return configCommit{}
 	}
 
+	if errValidate := newCfg.Models.Validate(); errValidate != nil {
+		log.WithError(errValidate).Warn("rejected invalid model catalog sources")
+		return configCommit{}
+	}
 	s.cfgMu.Lock()
 	s.cfg = newCfg
 	s.cfgMu.Unlock()
 	s.cancelStaleAntigravityProbes("")
 	s.configSequence++
+	registry.UpdateModelCatalogSources(newCfg.Models, newCfg.Home.Enabled)
 	return configCommit{cfg: newCfg, sequence: s.configSequence}
 }
 

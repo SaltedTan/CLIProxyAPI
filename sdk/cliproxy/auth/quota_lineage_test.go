@@ -59,7 +59,8 @@ func TestManagerQuotaLineage(t *testing.T) {
 	}
 	current = expect("replace with other tokens", false)
 
-	// A refresh whose base predates such a replace mixes two accounts' data.
+	// A refresh whose base predates such a replace would mix two accounts' data. The
+	// manager discards it: the replacement credentials and their lineage stay current.
 	base := current.Clone()
 	if _, errUpdate := manager.Update(ctx, withTokens(current, "4")); errUpdate != nil {
 		t.Fatalf("Update() error = %v", errUpdate)
@@ -68,13 +69,19 @@ func TestManagerQuotaLineage(t *testing.T) {
 	if _, errUpdate := manager.UpdateRefreshedAuth(ctx, base, withTokens(base, "5")); errUpdate != nil {
 		t.Fatalf("UpdateRefreshedAuth() error = %v", errUpdate)
 	}
-	current = expect("refresh from a replaced base", false)
+	current = expect("refresh from a replaced base", true)
 	if current.quotaLineage == base.quotaLineage {
 		t.Fatalf("lineage %d of the replaced base was restored", base.quotaLineage)
 	}
+	if got := current.Metadata["access_token"]; got != "access-4" {
+		t.Fatalf("access_token = %v after an obsolete refresh, want the replacement access-4", got)
+	}
+	if got := current.Metadata["refresh_token"]; got != "refresh-4" {
+		t.Fatalf("refresh_token = %v after an obsolete refresh, want the replacement refresh-4", got)
+	}
 
 	// Register over an existing ID follows the replace rule.
-	if _, errRegister := manager.Register(ctx, withTokens(current, "5")); errRegister != nil {
+	if _, errRegister := manager.Register(ctx, withTokens(current, "4")); errRegister != nil {
 		t.Fatalf("Register() error = %v", errRegister)
 	}
 	current = expect("register with the same tokens", true)

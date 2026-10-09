@@ -78,6 +78,7 @@ var v8KeyFamilies = []configPath{
 func buildV8Paths() []configPath {
 	prefixes := []configPath{
 		{"host", "server.host"}, {"port", "server.port"}, {"trusted-proxies", "server.trusted-proxies"},
+		{"github-token", "server.github-token"},
 		{"tls", "server.tls"}, {"commercial-mode", "server.commercial-mode"}, {"discovery", "server.discovery"},
 		{"remote-management", "management"}, {"api-keys", "access.api-keys"}, {"api-key-names", "access.api-key-names"},
 		{"api-key-limits", "access.api-key-limits"},
@@ -681,6 +682,9 @@ func (cfg *Config) UnmarshalYAML(node *yaml.Node) error {
 		// Callers decoding straight into Config see the typed decoder's message.
 		return maskDecoderError(err)
 	}
+	if errValidate := decoded.Models.Validate(); errValidate != nil {
+		return errValidate
+	}
 	*cfg = Config(decoded)
 	cfg.OAuthOnlyFields = nil
 	source := expandConfigAliases(node)
@@ -1021,7 +1025,7 @@ func IsV8ConfigLayout(root *yaml.Node) bool {
 }
 
 func v8AllowedRoots() map[string]bool {
-	allowed := map[string]bool{"config-version": true, "api-keys": true, "plugins": true, "quota-exceeded": true, "client": true}
+	allowed := map[string]bool{"models": true, "config-version": true, "api-keys": true, "plugins": true, "quota-exceeded": true, "client": true}
 	for _, path := range v8Paths {
 		section, _, _ := strings.Cut(path.current, ".")
 		allowed[section] = true
@@ -1372,5 +1376,8 @@ func validateV8Config(data []byte) error {
 	// Client key allowances are the only v8 values with a semantic range check
 	// here; ParseConfigBytes runs first in management writes and must not turn
 	// them into a 422 before this layout validation reports 400.
-	return validateAPIKeyLimits(normalizeAPIKeyLimitKeys(cfg.APIKeyLimits))
+	if errLimits := validateAPIKeyLimits(normalizeAPIKeyLimitKeys(cfg.APIKeyLimits)); errLimits != nil {
+		return errLimits
+	}
+	return cfg.Models.Validate()
 }
