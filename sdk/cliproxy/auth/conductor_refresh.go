@@ -630,6 +630,18 @@ func (m *Manager) markRejectedAccessToken(id, failedAccessToken string) {
 	m.mu.Unlock()
 }
 
+// refreshResultObsolete reports whether current no longer holds the credentials a refresh
+// started from (base): the auth was registered again, or a replace committed other
+// credentials or another account (a new quota lineage, which also covers credentials such
+// as Meta's device token that do not bump the credential version) while the refresh ran.
+func refreshResultObsolete(base, current *Auth) bool {
+	if base == nil || current == nil {
+		return false
+	}
+	return current.RegistrationEpoch != base.RegistrationEpoch || current.CredentialVersion != base.CredentialVersion ||
+		current.quotaLineage != base.quotaLineage || CredentialsChanged(base, current)
+}
+
 func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAccessToken string, registrationEpoch uint64) (*Auth, error) {
 	if m == nil {
 		return nil, errors.New("auth manager is nil")
@@ -705,7 +717,7 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	if err != nil && errors.Is(err, context.Canceled) {
 		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
 		m.mu.Lock()
-		if current := m.auths[id]; current != nil {
+		if current := m.auths[id]; current != nil && !refreshResultObsolete(base, current) {
 			if current.NextRefreshAfter.IsZero() || current.NextRefreshAfter.Before(now) {
 				current.NextRefreshAfter = now.Add(time.Second)
 			}
@@ -727,7 +739,9 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 		shouldUnschedule := false
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
-			if base != nil && current.RegistrationEpoch != base.RegistrationEpoch {
+			// The failure describes credentials that are gone: leave the replacement's
+			// refresh error, status and backoff alone.
+			if refreshResultObsolete(base, current) {
 				m.mu.Unlock()
 				return nil, err
 			}
