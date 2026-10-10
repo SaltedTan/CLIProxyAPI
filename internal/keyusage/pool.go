@@ -95,8 +95,10 @@ func (p *Pool) Summary(ctx context.Context, wait time.Duration) PoolSummary {
 	c.mu.Unlock()
 
 	if len(pending) > 0 {
-		waitAll(ctx, pending, waitUntil.Sub(now))
+		waitForLookups(ctx, pending, waitUntil.Sub(now))
 	}
+	// Readings age while Summary waits.
+	now = c.nowFunc()
 
 	c.mu.Lock()
 	fiveHour := make([]poolAccount, 0, len(accounts))
@@ -111,9 +113,12 @@ func (p *Pool) Summary(ctx context.Context, wait time.Duration) PoolSummary {
 		}
 	}
 	c.mu.Unlock()
-	now = c.nowFunc()
 	return PoolSummary{FiveHour: combineFiveHour(now, fiveHour), Fable: combineFable(now, fable)}
 }
+
+// waitForLookups is how Summary waits for lookups. It is a variable only so that tests
+// can observe the wait.
+var waitForLookups = waitAll
 
 func waitAll(ctx context.Context, pending []chan struct{}, wait time.Duration) {
 	if ctx == nil {

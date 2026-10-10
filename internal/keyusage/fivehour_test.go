@@ -2,6 +2,7 @@ package keyusage
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -137,8 +138,19 @@ func TestSessionProUnitsFallsBackToTheWeeklyWeight(t *testing.T) {
 	}
 }
 
-// One summary lists the accounts once and waits once, with one bound, for every
-// account never read, whichever figures it counts in.
+// stubLookupWait makes Summary call wait instead of waiting for its lookups, until the
+// test ends.
+func stubLookupWait(t *testing.T, wait func(pending []chan struct{}, budget time.Duration)) {
+	t.Helper()
+	previous := waitForLookups
+	t.Cleanup(func() { waitForLookups = previous })
+	waitForLookups = func(_ context.Context, pending []chan struct{}, budget time.Duration) {
+		wait(pending, budget)
+	}
+}
+
+// One summary lists the accounts once and waits once, under one budget, for the lookups
+// of every account never read, whichever figures it counts in.
 func TestPoolListsAndWaitsOnceForBothFigures(t *testing.T) {
 	now := testNow
 	listed := 0
@@ -149,9 +161,8 @@ func TestPoolListsAndWaitsOnceForBothFigures(t *testing.T) {
 	}, nil)
 	cache.nowFunc = func() time.Time { return now }
 	gate := make(chan struct{})
-	started := make(chan string, len(auths))
+	release := sync.OnceFunc(func() { close(gate) })
 	cache.fetch = func(_ context.Context, auth *coreauth.Auth) (usageReading, error) {
-		started <- auth.ID
 		<-gate
 		if auth.ID == "fable" {
 			reading := withFable(40, testNow.Add(48*time.Hour))
@@ -162,28 +173,42 @@ func TestPoolListsAndWaitsOnceForBothFigures(t *testing.T) {
 	}
 	pool := NewPool(cache)
 	pool.servesFable = func(authID string) bool { return authID == "fable" }
-
-	done := make(chan PoolSummary, 1)
-	go func() { done <- pool.Summary(context.Background(), time.Hour) }()
-	// Both lookups start before the summary waits: a second wait for the other figure
-	// would only start its lookups after the first wait ended.
-	for range auths {
-		select {
-		case <-started:
-		case <-time.After(5 * time.Second):
-			close(gate)
-			t.Fatal("the summary waited before looking up every account")
+	type waitCall struct {
+		pending, open int
+		budget        time.Duration
+	}
+	var waits []waitCall
+	stubLookupWait(t, func(pending []chan struct{}, budget time.Duration) {
+		open := 0
+		for _, done := range pending {
+			select {
+			case <-done:
+			default:
+				open++
+			}
 		}
+		// The budget expires with the lookups still running.
+		waits = append(waits, waitCall{pending: len(pending), open: open, budget: budget})
+	})
+	t.Cleanup(func() {
+		release()
+		settle(cache)
+	})
+
+	summary := pool.Summary(context.Background(), 2*time.Second)
+	if want := (waitCall{pending: 2, open: 2, budget: 2 * time.Second}); listed != 1 || len(waits) != 1 || waits[0] != want {
+		t.Fatalf("listed %d times, waits = %+v, want one listing and one wait of %+v", listed, waits, want)
 	}
-	close(gate)
-	var summary PoolSummary
-	select {
-	case summary = <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the summary did not return once the lookups finished")
+	if summary.FiveHour.Available || !summary.FiveHour.Partial || summary.Fable.Available || !summary.Fable.Partial {
+		t.Fatalf("summary = %+v, want both figures partial while the lookups run", summary)
 	}
-	if listed != 1 {
-		t.Fatalf("listed %d times, want once", listed)
+
+	// Once the lookups finish, the next summary combines both figures without waiting.
+	release()
+	settle(cache)
+	summary = pool.Summary(context.Background(), 2*time.Second)
+	if listed != 2 || len(waits) != 1 {
+		t.Fatalf("listed %d times, waits = %+v, want a second listing and no wait", listed, waits)
 	}
 	if fable := summary.Fable; fable.Partial || fable.RemainingPercent != 60 {
 		t.Fatalf("fable = %+v", fable)
@@ -192,5 +217,46 @@ func TestPoolListsAndWaitsOnceForBothFigures(t *testing.T) {
 	five := summary.FiveHour
 	if five.Partial || five.CapacityProUnits != 21 || five.RemainingProUnits != 15 || five.NextResetAt == nil || !five.NextResetAt.Equal(testNow.Add(time.Hour)) || five.NextResetRestoresProUnits != 1 {
 		t.Fatalf("5h = %+v", five)
+	}
+}
+
+// A reading that ages past maxReadingAge while a summary waits for another account no
+// longer counts in either figure.
+func TestPoolChecksReadingAgeAfterTheWait(t *testing.T) {
+	now := testNow
+	reading := withFable(40, testNow.Add(48*time.Hour))
+	reading.fiveHour = windowReading{ok: true, used: 20, resetAt: testNow.Add(2 * time.Hour)}
+	fetcher := &fakeFetcher{
+		calls:  map[string]int{},
+		result: map[string]usageReading{"old": reading},
+		fail:   map[string]bool{"unread": true},
+	}
+	auths := []*coreauth.Auth{claudeOAuth("old")}
+	cache := NewUsageCache(func() []*coreauth.Auth { return auths }, nil)
+	cache.fetch = fetcher.fetch
+	cache.nowFunc = func() time.Time { return now }
+	pool := NewPool(cache)
+	pool.servesFable = nil
+	pool.weight = func(*coreauth.Auth) float64 { return 1 }
+	pool.sessionWeight = func(*coreauth.Auth) float64 { return 1 }
+	cache.refresh(now)
+	settle(cache)
+
+	// The old account's refreshes now fail, and a new account holds the next summary
+	// for its two-second budget, across the old reading's maxReadingAge.
+	fetcher.mu.Lock()
+	fetcher.fail["old"] = true
+	fetcher.mu.Unlock()
+	auths = append(auths, claudeOAuth("unread"))
+	now = testNow.Add(maxReadingAge - time.Second)
+	waits := 0
+	stubLookupWait(t, func(_ []chan struct{}, budget time.Duration) {
+		waits++
+		now = now.Add(budget)
+	})
+	summary := pool.Summary(context.Background(), 2*time.Second)
+	settle(cache)
+	if waits != 1 || summary.FiveHour.Available || !summary.FiveHour.Partial || summary.Fable.Available || !summary.Fable.Partial {
+		t.Fatalf("summary = %+v after %d waits, want the aged reading not counted", summary, waits)
 	}
 }
