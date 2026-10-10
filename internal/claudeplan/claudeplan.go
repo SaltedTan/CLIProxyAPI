@@ -1,11 +1,13 @@
-// Package claudeplan resolves the plan of a Claude OAuth credential and its weekly
-// allowance relative to Claude Pro, shared by usage reports and quota-aware routing.
+// Package claudeplan resolves the plan of a Claude OAuth credential and its allowances
+// relative to Claude Pro, shared by usage reports and quota-aware routing: ProUnits is
+// a plan's weekly allowance and SessionProUnits its 5-hour (session) limit.
 package claudeplan
 
 import "strings"
 
-// Claude plan identifiers. The allowances are approximate: Max 5x has about five times
-// the weekly usage of Pro, and Max 20x about twice that of Max 5x.
+// Claude plan identifiers. The allowances are approximate. Anthropic sells Max 5x and
+// Max 20x as five and twenty times the usage of Pro per 5-hour session; per week, Max
+// 5x has about five times the usage of Pro, and Max 20x about twice that of Max 5x.
 const (
 	Pro     = "pro"
 	Team    = "team"
@@ -21,6 +23,7 @@ const (
 	SourceOrganizationType = "organization_type"
 )
 
+// proUnits holds each plan's weekly allowance.
 var proUnits = map[string]float64{
 	Pro:    1,
 	Team:   1.25,
@@ -28,9 +31,25 @@ var proUnits = map[string]float64{
 	Max20x: 10,
 }
 
+// sessionProUnits holds each plan's 5-hour limit. Max 20x has twice the weekly
+// allowance of Max 5x but four times its 5-hour limit.
+var sessionProUnits = map[string]float64{
+	Pro:    1,
+	Team:   1.25,
+	Max5x:  5,
+	Max20x: 20,
+}
+
 // ProUnits returns the weekly allowance of a known plan in Claude Pro units.
 func ProUnits(plan string) (float64, bool) {
 	units, ok := proUnits[plan]
+	return units, ok
+}
+
+// SessionProUnits returns the 5-hour (session) limit of a known plan in Claude Pro
+// units: 1 is one Pro plan's 5-hour limit.
+func SessionProUnits(plan string) (float64, bool) {
+	units, ok := sessionProUnits[plan]
 	return units, ok
 }
 

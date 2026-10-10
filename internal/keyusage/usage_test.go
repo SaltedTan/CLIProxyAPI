@@ -160,7 +160,7 @@ func TestUsageCacheQuotaReading(t *testing.T) {
 }
 
 // A window reported fully used without a reset time is used up with its reset unknown,
-// for routing as for the Fable pool, rather than unknown.
+// for routing as for the key usage pool, rather than unknown.
 func TestUsageCacheQuotaReadingUsedUpWithoutReset(t *testing.T) {
 	parsed, errParse := parseUsageReading([]byte(`{
 		"five_hour":{"utilization":30,"resets_at":null},
@@ -171,7 +171,7 @@ func TestUsageCacheQuotaReadingUsedUpWithoutReset(t *testing.T) {
 		t.Fatal(errParse)
 	}
 	if !parsed.weeklyBlocked(testNow) {
-		t.Fatal("the Fable pool must count the account as blocked")
+		t.Fatal("the key usage pool must count the account as blocked")
 	}
 	now := testNow
 	fetcher := &fakeFetcher{calls: map[string]int{}, result: map[string]usageReading{"a": parsed}}
@@ -366,20 +366,20 @@ func TestUsageCacheRefreshForgetsAccountsThatLeave(t *testing.T) {
 	}
 }
 
-// Routing and the Fable pool share the cache, so one lookup serves both.
-func TestUsageCacheServesTheFablePoolAndRouting(t *testing.T) {
+// Routing and the key usage pool share the cache, so one lookup serves both.
+func TestUsageCacheServesThePoolAndRouting(t *testing.T) {
 	now := testNow
 	reading := withFable(25, testNow.Add(48*time.Hour))
 	reading.weekly = windowReading{ok: true, used: 40, resetAt: testNow.Add(72 * time.Hour)}
 	fetcher := &fakeFetcher{calls: map[string]int{}, result: map[string]usageReading{"a": reading}}
 	cache := newTestCache(&now, fetcher, claudeOAuth("a"))
-	pool := NewFablePool(cache)
+	pool := NewPool(cache)
 	pool.servesFable = nil
 	pool.weight = func(*coreauth.Auth) float64 { return 1 }
 
 	cache.refresh(now)
 	settle(cache)
-	if summary := pool.Summary(context.Background(), time.Minute); !summary.Available || summary.Partial || summary.RemainingPercent != 75 {
+	if summary := pool.Summary(context.Background(), time.Minute).Fable; !summary.Available || summary.Partial || summary.RemainingPercent != 75 {
 		t.Fatalf("summary = %+v", summary)
 	}
 	if quota, ok := cache.QuotaReading(claudeOAuth("a")); !ok || quota.Weekly == nil || quota.Weekly.Used != 0.4 {
@@ -483,7 +483,7 @@ func TestUsageCacheRunCancelsLookupsWhenItStops(t *testing.T) {
 	}
 }
 
-// After Run stops, a Fable pool summary (a key usage request served during shutdown)
+// After Run stops, a pool summary (a key usage request served during shutdown)
 // starts no lookup that nothing would cancel, and readers keep the cached readings.
 // Run starts the cache again.
 func TestUsageCacheStartsNoLookupAfterRunStops(t *testing.T) {
@@ -501,7 +501,7 @@ func TestUsageCacheStartsNoLookupAfterRunStops(t *testing.T) {
 		defer func() { looked <- auth.ID }()
 		return fetcher.fetch(ctx, auth)
 	}
-	pool := NewFablePool(cache)
+	pool := NewPool(cache)
 	pool.servesFable = nil
 	pool.weight = func(*coreauth.Auth) float64 { return 1 }
 	run := func(lookups int) {
@@ -531,7 +531,7 @@ func TestUsageCacheStartsNoLookupAfterRunStops(t *testing.T) {
 	// Later the reading is stale and a new account is listed.
 	auths = []*coreauth.Auth{claudeOAuth("read"), claudeOAuth("unread")}
 	now = testNow.Add(refreshAfter + time.Second)
-	summary := pool.Summary(context.Background(), time.Minute)
+	summary := pool.Summary(context.Background(), time.Minute).Fable
 	cache.refresh(now)
 	settle(cache)
 	if fetcher.count("read") != 1 || fetcher.count("unread") != 0 {
@@ -549,7 +549,7 @@ func TestUsageCacheStartsNoLookupAfterRunStops(t *testing.T) {
 	if fetcher.count("read") != 2 || fetcher.count("unread") != 1 {
 		t.Fatalf("calls = %v, want both accounts looked up once Run restarted", fetcher.calls)
 	}
-	if summary := pool.Summary(context.Background(), 0); summary.Partial || summary.RemainingPercent != 75 {
+	if summary := pool.Summary(context.Background(), 0).Fable; summary.Partial || summary.RemainingPercent != 75 {
 		t.Fatalf("summary after restart = %+v", summary)
 	}
 }

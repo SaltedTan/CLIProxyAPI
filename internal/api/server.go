@@ -86,8 +86,9 @@ type Server struct {
 	// management handler
 	mgmt *managementHandlers.Handler
 
-	// fablePool caches the Fable allowance of the Claude accounts for key holders.
-	fablePool *keyusage.FablePool
+	// usagePool combines the 5-hour limit and Fable allowance of the Claude accounts for
+	// key holders.
+	usagePool *keyusage.Pool
 
 	// pluginHost owns dynamic plugin Management API route dispatch.
 	pluginHost *pluginhost.Host
@@ -205,7 +206,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 			return s.handlers.AuthManager.List()
 		}, s.getConfig)
 	}
-	s.fablePool = keyusage.NewFablePool(claudeUsage)
+	s.usagePool = keyusage.NewPool(claudeUsage)
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	s.exampleAPIKeySafeModeActive.Store(s.exampleAPIKeySafeModeRequired(cfg))
 	s.handlers.SetPluginHost(optionState.pluginHost)

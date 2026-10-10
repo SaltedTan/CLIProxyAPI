@@ -54,15 +54,18 @@ func TestKeyUsageReportsTheCallersOwnKey(t *testing.T) {
 	if !report.Claude.Limited || *report.Claude.LimitProUnits != 2.5 || *report.Claude.RemainingProUnits != 2.5 || report.Claude.WindowResetsAt != nil {
 		t.Fatalf("claude = %+v", report.Claude)
 	}
-	if report.Fable.Available {
-		t.Fatalf("fable = %+v, want unavailable without Claude accounts", report.Fable)
+	if report.FiveHour.Available || report.Fable.Available {
+		t.Fatalf("five_hour = %+v, fable = %+v, want unavailable without Claude accounts", report.FiveHour, report.Fable)
+	}
+	if !strings.Contains(body, `"five_hour":{"available":false,"capacity_pro_units":0,"remaining_pro_units":0,"partial":false}`) {
+		t.Fatalf("report %s has no five_hour object", body)
 	}
 
 	text := httptest.NewRecorder()
 	request = httptest.NewRequest(http.MethodGet, "/v1/key/usage?format=text", nil)
 	request.Header.Set("Authorization", "Bearer test-key")
 	server.engine.ServeHTTP(text, request)
-	if !strings.HasPrefix(text.Header().Get("Content-Type"), "text/plain") || !strings.Contains(text.Body.String(), "Claude allowance: 100% left, 0.00 of 2.50 Pro units used") {
+	if !strings.HasPrefix(text.Header().Get("Content-Type"), "text/plain") || !strings.Contains(text.Body.String(), "Claude allowance: 100% left, 0.00 of 2.50 Pro units used") || !strings.Contains(text.Body.String(), "Claude 5-hour limit (shared): usage unavailable right now") {
 		t.Fatalf("text report = %q", text.Body.String())
 	}
 
@@ -70,13 +73,14 @@ func TestKeyUsageReportsTheCallersOwnKey(t *testing.T) {
 	request = httptest.NewRequest(http.MethodGet, "/v1/key/usage?format=line", nil)
 	request.Header.Set("Authorization", "Bearer test-key")
 	server.engine.ServeHTTP(line, request)
-	if got, want := line.Body.String(), "Claude 100% left · 7d window starts on next use │ Fable: n/a\n"; got != want {
+	if got, want := line.Body.String(), "Claude 100% left · 7d window starts on next use │ 5h: n/a │ Fable: n/a\n"; got != want {
 		t.Fatalf("line report = %q, want %q", got, want)
 	}
 }
 
-// The Fable pool reads the usage cache the service shares with quota-aware routing.
-func TestKeyUsageFablePoolUsesTheInjectedClaudeUsage(t *testing.T) {
+// The key usage pool reads the usage cache the service shares with quota-aware routing,
+// listing its accounts once for the 5-hour and Fable figures.
+func TestKeyUsagePoolUsesTheInjectedClaudeUsage(t *testing.T) {
 	listed := 0
 	cache := keyusage.NewUsageCache(func() []*auth.Auth {
 		listed++
@@ -89,7 +93,7 @@ func TestKeyUsageFablePoolUsesTheInjectedClaudeUsage(t *testing.T) {
 	request.Header.Set("X-Api-Key", "test-key")
 	server.engine.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK || listed != 1 {
-		t.Fatalf("status = %d, cache listed %d times, want one Fable summary from the injected cache", recorder.Code, listed)
+		t.Fatalf("status = %d, cache listed %d times, want one pool summary from the injected cache", recorder.Code, listed)
 	}
 }
 

@@ -115,9 +115,9 @@ access:
   # exactly 7 days later, and the next one opens at the key's next Claude request.
   # Keys are full API keys or the key ids from the usage report.
   # 0 or a missing entry means no limit.
-  # A key holder can read their own allowance, and the Fable allowance left
-  # across the Claude accounts, at GET /v1/key/usage (?format=text for a terminal)
-  # with the same key they send to the proxy.
+  # A key holder can read their own allowance, and the Claude 5-hour limit and the
+  # Fable allowance left across the Claude accounts, at GET /v1/key/usage
+  # (?format=text for a terminal) with the same key they send to the proxy.
   # api-key-limits:
   #   "your-api-key-1": 1.5
   #   "3f9a1c2b7d4e5f60": 0.25

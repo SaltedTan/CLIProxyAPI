@@ -105,7 +105,7 @@ type Service struct {
 	sessionAffinityState atomic.Pointer[sessionAffinityStore]
 
 	// claudeUsage caches the Claude OAuth usage endpoint readings shared by quota-aware
-	// routing and the key usage Fable pool.
+	// routing and the key usage pool.
 	claudeUsage *keyusage.UsageCache
 
 	// pluginHost owns dynamic plugin lifecycle and runtime capability adapters.

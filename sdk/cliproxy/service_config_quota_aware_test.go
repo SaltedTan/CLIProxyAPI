@@ -188,7 +188,7 @@ func TestBuilderBindsTheClaudeUsageCacheToTheService(t *testing.T) {
 	if _, errRegister := service.coreManager.Register(coreauth.WithSkipPersist(context.Background()), expired); errRegister != nil {
 		t.Fatalf("Register() error = %v", errRegister)
 	}
-	if summary := keyusage.NewFablePool(service.claudeUsage).Summary(context.Background(), 0); !summary.Partial {
+	if summary := keyusage.NewPool(service.claudeUsage).Summary(context.Background(), 0); !summary.Fable.Partial || !summary.FiveHour.Partial {
 		t.Fatalf("summary = %+v, want the service's unread Claude account counted", summary)
 	}
 

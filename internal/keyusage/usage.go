@@ -22,8 +22,8 @@ import (
 // account's OAuth usage endpoint, including usage made outside the proxy. The usage
 // cache reads that endpoint for the enabled Claude OAuth accounts, at most once per
 // refreshAfter per account and never on the request path: readers get the cached
-// readings. Quota-aware routing reads the 5h, weekly and Fable windows, and the Fable
-// pool the Fable and weekly windows.
+// readings. Quota-aware routing and the key usage pool read the 5h, weekly and Fable
+// windows.
 
 // usageURL is Anthropic's OAuth usage endpoint. It is a variable only so that
 // end-to-end test builds can point it at a local server with -ldflags -X.
@@ -72,13 +72,13 @@ type usageReading struct {
 	fable windowReading
 }
 
-// fableEnded reports whether the reading's Fable window has reset since it was read.
-func (r usageReading) fableEnded(now time.Time) bool {
-	return r.fable.ok && !r.fable.resetAt.IsZero() && !r.fable.resetAt.After(now)
+// ended reports whether the window has reset since it was read.
+func (w windowReading) ended(now time.Time) bool {
+	return w.ok && !w.resetAt.IsZero() && !w.resetAt.After(now)
 }
 
 // weeklyBlocked reports whether the account's overall weekly window is used up,
-// which stops the account serving Fable until that window resets.
+// which stops the account serving requests, Fable included, until that window resets.
 func (r usageReading) weeklyBlocked(now time.Time) bool {
 	return r.weekly.used >= 100 && (r.weekly.resetAt.IsZero() || r.weekly.resetAt.After(now))
 }
@@ -251,7 +251,7 @@ func (c *UsageCache) QuotaReading(auth *coreauth.Auth) (coreauth.QuotaReading, b
 // unknown. A window without a reset has not started if nothing is used: it would
 // reset one window length after its first use, so at the earliest after the reading.
 // A fully used window without a reset is used up with its reset unknown (Used 1 and a
-// zero ResetAt), as the Fable pool counts it (see usageReading.weeklyBlocked).
+// zero ResetAt), as the key usage pool counts it (see usageReading.weeklyBlocked).
 func (w windowReading) quotaWindow(at time.Time, length time.Duration) *coreauth.QuotaWindowReading {
 	if !w.ok {
 		return nil

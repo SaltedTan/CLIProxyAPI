@@ -112,7 +112,7 @@ func fable(used float64, resetIn time.Duration) usageReading {
 }
 
 func TestCombineFableWeighsAccountsByPlan(t *testing.T) {
-	summary := combineFable(testNow, []fableAccount{
+	summary := combineFable(testNow, []poolAccount{
 		{units: 1, reading: fable(100, 30*time.Hour), ok: true},  // Pro, used up
 		{units: 10, reading: fable(20, 50*time.Hour), ok: true},  // Max 20x
 		{units: 5, reading: fable(0, 10*time.Hour), ok: true},    // Max 5x, unused
@@ -133,7 +133,7 @@ func TestCombineFableWeighsAccountsByPlan(t *testing.T) {
 }
 
 func TestCombineFableEdgeCases(t *testing.T) {
-	exhausted := combineFable(testNow, []fableAccount{
+	exhausted := combineFable(testNow, []poolAccount{
 		{units: 1, reading: fable(100, 3*time.Hour), ok: true},
 		{units: 1, reading: fable(104, 3*time.Hour+20*time.Second), ok: true},
 		{units: 1, ok: false},
@@ -143,12 +143,12 @@ func TestCombineFableEdgeCases(t *testing.T) {
 		t.Fatalf("exhausted = %+v", exhausted)
 	}
 
-	rolledOver := combineFable(testNow, []fableAccount{{units: 1, reading: fable(80, -time.Minute), ok: true}})
+	rolledOver := combineFable(testNow, []poolAccount{{units: 1, reading: fable(80, -time.Minute), ok: true}})
 	if rolledOver.RemainingPercent != 100 || rolledOver.NextResetAt != nil {
 		t.Fatalf("a window that reset since it was read is empty: %+v", rolledOver)
 	}
 
-	none := combineFable(testNow, []fableAccount{{units: 1, reading: usageReading{at: testNow}, ok: true}})
+	none := combineFable(testNow, []poolAccount{{units: 1, reading: usageReading{at: testNow}, ok: true}})
 	if none.Available || none.UpdatedAt != nil {
 		t.Fatalf("no Fable account must be unavailable: %+v", none)
 	}
@@ -161,7 +161,7 @@ func weeklyUsedUp(reading usageReading, resetIn time.Duration) usageReading {
 }
 
 func TestCombineFableCountsBlockedAccountsAsEmpty(t *testing.T) {
-	summary := combineFable(testNow, []fableAccount{
+	summary := combineFable(testNow, []poolAccount{
 		// Pro: 80% of its Fable unused but out of weekly allowance for 10 hours.
 		{units: 1, reading: weeklyUsedUp(fable(20, 30*time.Hour), 10*time.Hour), ok: true},
 		// Max 20x: half its Fable left.
@@ -179,7 +179,7 @@ func TestCombineFableCountsBlockedAccountsAsEmpty(t *testing.T) {
 	}
 
 	// A blocked account with no Fable left comes back when its Fable window resets.
-	usedUp := combineFable(testNow, []fableAccount{
+	usedUp := combineFable(testNow, []poolAccount{
 		{units: 1, reading: weeklyUsedUp(fable(100, 30*time.Hour), 10*time.Hour), ok: true},
 	})
 	if usedUp.RemainingPercent != 0 || usedUp.NextResetAt == nil || !usedUp.NextResetAt.Equal(testNow.Add(30*time.Hour)) || usedUp.NextResetRestoresPercent != 100 {
@@ -187,7 +187,7 @@ func TestCombineFableCountsBlockedAccountsAsEmpty(t *testing.T) {
 	}
 
 	// A weekly window that has reset since it was read no longer blocks.
-	reset := combineFable(testNow, []fableAccount{
+	reset := combineFable(testNow, []poolAccount{
 		{units: 1, reading: weeklyUsedUp(fable(40, 48*time.Hour), -time.Minute), ok: true},
 	})
 	if reset.RemainingPercent != 60 {
@@ -239,10 +239,11 @@ func newTestCache(now *time.Time, fetcher *fakeFetcher, auths ...*coreauth.Auth)
 	return cache
 }
 
-func newTestPool(now *time.Time, fetcher *fakeFetcher, auths ...*coreauth.Auth) *FablePool {
-	pool := NewFablePool(newTestCache(now, fetcher, auths...))
+func newTestPool(now *time.Time, fetcher *fakeFetcher, auths ...*coreauth.Auth) *Pool {
+	pool := NewPool(newTestCache(now, fetcher, auths...))
 	pool.servesFable = nil
 	pool.weight = func(*coreauth.Auth) float64 { return 1 }
+	pool.sessionWeight = func(*coreauth.Auth) float64 { return 1 }
 	return pool
 }
 
@@ -259,7 +260,7 @@ func settle(cache *UsageCache) {
 	}
 }
 
-func TestFablePoolCachesLookups(t *testing.T) {
+func TestPoolCachesLookups(t *testing.T) {
 	now := testNow
 	fetcher := &fakeFetcher{
 		calls: map[string]int{},
@@ -274,7 +275,7 @@ func TestFablePoolCachesLookups(t *testing.T) {
 	pool := newTestPool(&now, fetcher, claudeOAuth("a"), claudeOAuth("b"), disabled, apiKey)
 
 	// The first reader waits for accounts never read.
-	first := pool.Summary(context.Background(), time.Minute)
+	first := pool.Summary(context.Background(), time.Minute).Fable
 	if !first.Available || first.Partial || first.RemainingPercent != 75 {
 		t.Fatalf("first summary = %+v", first)
 	}
@@ -295,17 +296,17 @@ func TestFablePoolCachesLookups(t *testing.T) {
 	fetcher.result["a"] = withFable(100, testNow.Add(48*time.Hour))
 	fetcher.gate = gate
 	fetcher.mu.Unlock()
-	if stale := pool.Summary(context.Background(), time.Minute); stale.RemainingPercent != 75 {
+	if stale := pool.Summary(context.Background(), time.Minute).Fable; stale.RemainingPercent != 75 {
 		t.Fatalf("stale summary = %+v, want the cached figure", stale)
 	}
 	close(gate)
 	settle(pool.cache)
-	if fresh := pool.Summary(context.Background(), time.Minute); fresh.RemainingPercent != 50 || fetcher.count("a") != 2 {
+	if fresh := pool.Summary(context.Background(), time.Minute).Fable; fresh.RemainingPercent != 50 || fetcher.count("a") != 2 {
 		t.Fatalf("fresh summary = %+v after %d lookups", fresh, fetcher.count("a"))
 	}
 }
 
-func TestFablePoolBacksOffAndAgesOutFailures(t *testing.T) {
+func TestPoolBacksOffAndAgesOutFailures(t *testing.T) {
 	now := testNow
 	fetcher := &fakeFetcher{
 		calls:  map[string]int{},
@@ -314,7 +315,7 @@ func TestFablePoolBacksOffAndAgesOutFailures(t *testing.T) {
 	}
 	pool := newTestPool(&now, fetcher, claudeOAuth("a"), claudeOAuth("b"))
 
-	summary := pool.Summary(context.Background(), time.Minute)
+	summary := pool.Summary(context.Background(), time.Minute).Fable
 	if !summary.Partial || summary.RemainingPercent != 60 {
 		t.Fatalf("summary = %+v, want a partial figure from account a", summary)
 	}
@@ -334,7 +335,7 @@ func TestFablePoolBacksOffAndAgesOutFailures(t *testing.T) {
 		pool.Summary(context.Background(), 0)
 		settle(pool.cache)
 	}
-	if aged := pool.Summary(context.Background(), 0); aged.Available || !aged.Partial {
+	if aged := pool.Summary(context.Background(), 0); aged.Fable.Available || !aged.Fable.Partial || !aged.FiveHour.Partial {
 		t.Fatalf("aged summary = %+v", aged)
 	}
 	if math.Abs(float64(fetcher.count("a")-fetcher.count("b"))) > 1 {
@@ -359,7 +360,7 @@ func TestIsFableModelFollowsAliases(t *testing.T) {
 	}
 }
 
-func TestFablePoolForgetsAccountsThatLeave(t *testing.T) {
+func TestPoolForgetsAccountsThatLeave(t *testing.T) {
 	now := testNow
 	release := make(chan struct{})
 	var mu sync.Mutex
@@ -385,7 +386,7 @@ func TestFablePoolForgetsAccountsThatLeave(t *testing.T) {
 		}
 		return fable(10, 24*time.Hour), nil
 	}
-	pool := NewFablePool(cache)
+	pool := NewPool(cache)
 	pool.servesFable = nil
 	pool.weight = func(*coreauth.Auth) float64 { return 1 }
 
@@ -414,7 +415,7 @@ func TestFablePoolForgetsAccountsThatLeave(t *testing.T) {
 	}
 }
 
-func TestFablePoolWaitsForAHangingLookupOnlyOnce(t *testing.T) {
+func TestPoolWaitsForAHangingLookupOnlyOnce(t *testing.T) {
 	now := testNow
 	release := make(chan struct{})
 	fetcher := &fakeFetcher{calls: map[string]int{}, result: map[string]usageReading{"good": fable(50, 24*time.Hour)}}
@@ -432,7 +433,7 @@ func TestFablePoolWaitsForAHangingLookupOnlyOnce(t *testing.T) {
 	}()
 
 	// The first reader waits up to wait for the lookups it started.
-	if first := pool.Summary(context.Background(), 20*time.Millisecond); !first.Partial {
+	if first := pool.Summary(context.Background(), 20*time.Millisecond).Fable; !first.Partial {
 		t.Fatalf("first summary = %+v, want a partial figure", first)
 	}
 	pool.cache.mu.Lock()
@@ -445,7 +446,7 @@ func TestFablePoolWaitsForAHangingLookupOnlyOnce(t *testing.T) {
 	// Once wait has passed since the hanging lookup started, readers no longer wait.
 	now = testNow.Add(2 * time.Minute)
 	done := make(chan FableSummary, 1)
-	go func() { done <- pool.Summary(context.Background(), time.Minute) }()
+	go func() { done <- pool.Summary(context.Background(), time.Minute).Fable }()
 	select {
 	case later := <-done:
 		if !later.Partial || later.RemainingPercent != 50 {
@@ -456,38 +457,49 @@ func TestFablePoolWaitsForAHangingLookupOnlyOnce(t *testing.T) {
 	}
 }
 
-// The pool only looks up and combines the accounts that serve Fable, and its summaries
-// keep the cache's readings of the other Claude accounts.
-func TestFablePoolOnlyLooksUpFableAccounts(t *testing.T) {
+// The Fable figure only combines the accounts that serve Fable, while the 5-hour figure
+// combines every Claude account. One lookup of each account serves both figures and
+// routing.
+func TestPoolCountsOnlyFableAccountsInFable(t *testing.T) {
 	now := testNow
-	fetcher := &fakeFetcher{calls: map[string]int{}, result: map[string]usageReading{
-		"fable":  withFable(20, testNow.Add(24*time.Hour)),
-		"sonnet": {weekly: windowReading{ok: true, used: 30, resetAt: testNow.Add(24 * time.Hour)}},
-	}}
-	cache := newTestCache(&now, fetcher, claudeOAuth("fable"), claudeOAuth("sonnet"))
-	pool := NewFablePool(cache)
+	fableReading := withFable(20, testNow.Add(24*time.Hour))
+	fableReading.fiveHour = windowReading{ok: true, used: 50, resetAt: testNow.Add(2 * time.Hour)}
+	fetcher := &fakeFetcher{
+		calls: map[string]int{},
+		result: map[string]usageReading{
+			"fable": fableReading,
+			"sonnet": {
+				fiveHour: windowReading{ok: true, used: 10, resetAt: testNow.Add(3 * time.Hour)},
+				weekly:   windowReading{ok: true, used: 30, resetAt: testNow.Add(24 * time.Hour)},
+			},
+		},
+		fail: map[string]bool{"failing": true},
+	}
+	cache := newTestCache(&now, fetcher, claudeOAuth("fable"), claudeOAuth("sonnet"), claudeOAuth("failing"))
+	pool := NewPool(cache)
 	pool.servesFable = func(authID string) bool { return authID == "fable" }
 	pool.weight = func(*coreauth.Auth) float64 { return 1 }
+	pool.sessionWeight = func(*coreauth.Auth) float64 { return 1 }
 
-	if summary := pool.Summary(context.Background(), time.Minute); summary.Partial || summary.RemainingPercent != 80 {
-		t.Fatalf("summary = %+v", summary)
+	summary := pool.Summary(context.Background(), time.Minute)
+	// The unread account that serves no Fable leaves only the 5-hour figure partial.
+	if summary.Fable.Partial || summary.Fable.RemainingPercent != 80 {
+		t.Fatalf("fable = %+v, want the Fable account only", summary.Fable)
+	}
+	if five := summary.FiveHour; !five.Partial || five.CapacityProUnits != 2 || five.RemainingProUnits != 1.4 {
+		t.Fatalf("5h = %+v, want both read accounts", five)
 	}
 	settle(cache)
-	if fetcher.count("fable") != 1 || fetcher.count("sonnet") != 0 {
-		t.Fatalf("calls = %v, want only the Fable account looked up", fetcher.calls)
-	}
-
 	cache.refresh(now)
 	settle(cache)
-	pool.Summary(context.Background(), time.Minute)
-	if _, ok := cache.QuotaReading(claudeOAuth("sonnet")); !ok || fetcher.count("sonnet") != 1 {
-		t.Fatalf("calls = %v, want routing to read the other account once", fetcher.calls)
+	if _, ok := cache.QuotaReading(claudeOAuth("sonnet")); !ok || fetcher.count("fable") != 1 || fetcher.count("sonnet") != 1 {
+		t.Fatalf("calls = %v, want one lookup of each account for both figures and routing", fetcher.calls)
 	}
 }
 
 // An auth file replaced by another account's under the same auth ID counts as unread
 // until the new account is read: the old account's Fable window says nothing about it.
-func TestFablePoolCountsAReplacedAccountAsUnread(t *testing.T) {
+func TestPoolCountsAReplacedAccountAsUnread(t *testing.T) {
 	now := testNow
 	gate := make(chan struct{})
 	auths := []*coreauth.Auth{claudeAccount("x", "a@example.com", "token-a")}
@@ -500,20 +512,20 @@ func TestFablePoolCountsAReplacedAccountAsUnread(t *testing.T) {
 		}
 		return withFable(20, testNow.Add(24*time.Hour)), nil
 	}
-	pool := NewFablePool(cache)
+	pool := NewPool(cache)
 	pool.servesFable = nil
 	pool.weight = func(*coreauth.Auth) float64 { return 1 }
 
-	if summary := pool.Summary(context.Background(), time.Minute); summary.Partial || summary.RemainingPercent != 80 {
+	if summary := pool.Summary(context.Background(), time.Minute).Fable; summary.Partial || summary.RemainingPercent != 80 {
 		t.Fatalf("summary of A = %+v", summary)
 	}
 	auths = []*coreauth.Auth{claudeAccount("x", "b@example.com", "token-b")}
-	if summary := pool.Summary(context.Background(), 0); summary.Available || !summary.Partial {
+	if summary := pool.Summary(context.Background(), 0); summary.Fable.Available || !summary.Fable.Partial || !summary.FiveHour.Partial {
 		t.Fatalf("summary while B is read = %+v, want A's reading not counted", summary)
 	}
 	close(gate)
 	settle(cache)
-	if summary := pool.Summary(context.Background(), 0); summary.Partial || summary.RemainingPercent != 50 {
+	if summary := pool.Summary(context.Background(), 0).Fable; summary.Partial || summary.RemainingPercent != 50 {
 		t.Fatalf("summary of B = %+v", summary)
 	}
 }
