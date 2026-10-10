@@ -54,18 +54,20 @@ func TestKeyUsageReportsTheCallersOwnKey(t *testing.T) {
 	if !report.Claude.Limited || *report.Claude.LimitProUnits != 2.5 || *report.Claude.RemainingProUnits != 2.5 || report.Claude.WindowResetsAt != nil {
 		t.Fatalf("claude = %+v", report.Claude)
 	}
-	if report.FiveHour.Available || report.Fable.Available {
-		t.Fatalf("five_hour = %+v, fable = %+v, want unavailable without Claude accounts", report.FiveHour, report.Fable)
+	if report.FiveHour.Available || report.Weekly.Available || report.Fable.Available {
+		t.Fatalf("five_hour = %+v, weekly = %+v, fable = %+v, want unavailable without Claude accounts", report.FiveHour, report.Weekly, report.Fable)
 	}
-	if !strings.Contains(body, `"five_hour":{"available":false,"capacity_pro_units":0,"remaining_pro_units":0,"partial":false}`) {
-		t.Fatalf("report %s has no five_hour object", body)
+	for _, object := range []string{"five_hour", "weekly"} {
+		if !strings.Contains(body, `"`+object+`":{"available":false,"capacity_pro_units":0,"remaining_pro_units":0,"partial":false}`) {
+			t.Fatalf("report %s has no %s object", body, object)
+		}
 	}
 
 	text := httptest.NewRecorder()
 	request = httptest.NewRequest(http.MethodGet, "/v1/key/usage?format=text", nil)
 	request.Header.Set("Authorization", "Bearer test-key")
 	server.engine.ServeHTTP(text, request)
-	if !strings.HasPrefix(text.Header().Get("Content-Type"), "text/plain") || !strings.Contains(text.Body.String(), "Claude allowance: 100% left, 0.00 of 2.50 Pro units used") || !strings.Contains(text.Body.String(), "Claude 5-hour limit (shared): usage unavailable right now") {
+	if !strings.HasPrefix(text.Header().Get("Content-Type"), "text/plain") || !strings.Contains(text.Body.String(), "Claude allowance: 100% left, 0.00 of 2.50 Pro units used") || !strings.Contains(text.Body.String(), "Claude 5-hour limit (shared): usage unavailable right now") || !strings.Contains(text.Body.String(), "Claude weekly limit (shared): usage unavailable right now") {
 		t.Fatalf("text report = %q", text.Body.String())
 	}
 
@@ -73,13 +75,13 @@ func TestKeyUsageReportsTheCallersOwnKey(t *testing.T) {
 	request = httptest.NewRequest(http.MethodGet, "/v1/key/usage?format=line", nil)
 	request.Header.Set("Authorization", "Bearer test-key")
 	server.engine.ServeHTTP(line, request)
-	if got, want := line.Body.String(), "Claude 100% left · 7d window starts on next use │ 5h: n/a │ Fable: n/a\n"; got != want {
+	if got, want := line.Body.String(), "Claude 100% left · 7d window starts on next use │ 5h: n/a │ Week: n/a │ Fable: n/a\n"; got != want {
 		t.Fatalf("line report = %q, want %q", got, want)
 	}
 }
 
 // The key usage pool reads the usage cache the service shares with quota-aware routing,
-// listing its accounts once for the 5-hour and Fable figures.
+// listing its accounts once for the 5-hour, weekly and Fable figures.
 func TestKeyUsagePoolUsesTheInjectedClaudeUsage(t *testing.T) {
 	listed := 0
 	cache := keyusage.NewUsageCache(func() []*auth.Auth {

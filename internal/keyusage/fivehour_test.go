@@ -151,7 +151,7 @@ func stubLookupWait(t *testing.T, wait func(pending []chan struct{}, budget time
 
 // One summary lists the accounts once and waits once, under one budget, for the lookups
 // of every account never read, whichever figures it counts in.
-func TestPoolListsAndWaitsOnceForBothFigures(t *testing.T) {
+func TestPoolListsAndWaitsOnceForEveryFigure(t *testing.T) {
 	now := testNow
 	listed := 0
 	auths := []*coreauth.Auth{planAuth("fable", "max_20x"), planAuth("sonnet", "pro")}
@@ -167,9 +167,13 @@ func TestPoolListsAndWaitsOnceForBothFigures(t *testing.T) {
 		if auth.ID == "fable" {
 			reading := withFable(40, testNow.Add(48*time.Hour))
 			reading.fiveHour = windowReading{ok: true, used: 25, resetAt: testNow.Add(4 * time.Hour)}
+			reading.weekly = windowReading{ok: true, used: 30, resetAt: testNow.Add(72 * time.Hour)}
 			return reading, nil
 		}
-		return usageReading{fiveHour: windowReading{ok: true, used: 100, resetAt: testNow.Add(time.Hour)}}, nil
+		return usageReading{
+			fiveHour: windowReading{ok: true, used: 100, resetAt: testNow.Add(time.Hour)},
+			weekly:   windowReading{ok: true, used: 40, resetAt: testNow.Add(48 * time.Hour)},
+		}, nil
 	}
 	pool := NewPool(cache)
 	pool.servesFable = func(authID string) bool { return authID == "fable" }
@@ -199,11 +203,17 @@ func TestPoolListsAndWaitsOnceForBothFigures(t *testing.T) {
 	if want := (waitCall{pending: 2, open: 2, budget: 2 * time.Second}); listed != 1 || len(waits) != 1 || waits[0] != want {
 		t.Fatalf("listed %d times, waits = %+v, want one listing and one wait of %+v", listed, waits, want)
 	}
-	if summary.FiveHour.Available || !summary.FiveHour.Partial || summary.Fable.Available || !summary.Fable.Partial {
-		t.Fatalf("summary = %+v, want both figures partial while the lookups run", summary)
+	for _, figure := range []struct{ available, partial bool }{
+		{summary.FiveHour.Available, summary.FiveHour.Partial},
+		{summary.Weekly.Available, summary.Weekly.Partial},
+		{summary.Fable.Available, summary.Fable.Partial},
+	} {
+		if figure.available || !figure.partial {
+			t.Fatalf("summary = %+v, want every figure partial while the lookups run", summary)
+		}
 	}
 
-	// Once the lookups finish, the next summary combines both figures without waiting.
+	// Once the lookups finish, the next summary combines every figure without waiting.
 	release()
 	settle(cache)
 	summary = pool.Summary(context.Background(), 2*time.Second)
@@ -218,14 +228,21 @@ func TestPoolListsAndWaitsOnceForBothFigures(t *testing.T) {
 	if five.Partial || five.CapacityProUnits != 21 || five.RemainingProUnits != 15 || five.NextResetAt == nil || !five.NextResetAt.Equal(testNow.Add(time.Hour)) || five.NextResetRestoresProUnits != 1 {
 		t.Fatalf("5h = %+v", five)
 	}
+	// Per week Max 20x weighs 10 Pro units: 11 in all, 7.6 left; the Pro account resets
+	// first.
+	week := summary.Weekly
+	if week.Partial || week.CapacityProUnits != 11 || week.RemainingProUnits != 7.6 || week.NextResetAt == nil || !week.NextResetAt.Equal(testNow.Add(48*time.Hour)) || week.NextResetRestoresProUnits != 0.4 {
+		t.Fatalf("weekly = %+v", week)
+	}
 }
 
 // A reading that ages past maxReadingAge while a summary waits for another account no
-// longer counts in either figure.
+// longer counts in any figure.
 func TestPoolChecksReadingAgeAfterTheWait(t *testing.T) {
 	now := testNow
 	reading := withFable(40, testNow.Add(48*time.Hour))
 	reading.fiveHour = windowReading{ok: true, used: 20, resetAt: testNow.Add(2 * time.Hour)}
+	reading.weekly = windowReading{ok: true, used: 10, resetAt: testNow.Add(72 * time.Hour)}
 	fetcher := &fakeFetcher{
 		calls:  map[string]int{},
 		result: map[string]usageReading{"old": reading},
@@ -256,7 +273,7 @@ func TestPoolChecksReadingAgeAfterTheWait(t *testing.T) {
 	})
 	summary := pool.Summary(context.Background(), 2*time.Second)
 	settle(cache)
-	if waits != 1 || summary.FiveHour.Available || !summary.FiveHour.Partial || summary.Fable.Available || !summary.Fable.Partial {
+	if waits != 1 || summary.FiveHour.Available || !summary.FiveHour.Partial || summary.Weekly.Available || !summary.Weekly.Partial || summary.Fable.Available || !summary.Fable.Partial {
 		t.Fatalf("summary = %+v after %d waits, want the aged reading not counted", summary, waits)
 	}
 }

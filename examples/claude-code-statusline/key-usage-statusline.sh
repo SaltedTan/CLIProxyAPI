@@ -1,9 +1,9 @@
 #!/bin/sh
 # Claude Code status line showing what is left of this client key's Claude
-# allowance, and of the Claude 5-hour limit and the Fable allowance shared by all
-# keys, from CLIProxyAPI's GET /v1/key/usage. The 5-hour limit counts every enabled
-# Claude subscription, in percent of one Claude Pro plan's limit (Max 5x 500%,
-# Max 20x 2000%).
+# allowance, and of the Claude 5-hour and weekly limits and the Fable allowance
+# shared by all keys, from CLIProxyAPI's GET /v1/key/usage. The 5-hour and weekly
+# limits count every enabled Claude subscription, in percent of one Claude Pro
+# plan's limit (Max 5x 500% for both, Max 20x 2000% per 5 hours and 1000% per week).
 #
 # Reads the proxy from CPA_BASE_URL, else ANTHROPIC_BASE_URL, and the client key
 # from CPA_API_KEY, else ANTHROPIC_AUTH_TOKEN, else ANTHROPIC_API_KEY. The line is

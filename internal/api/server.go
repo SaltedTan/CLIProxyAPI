@@ -86,8 +86,8 @@ type Server struct {
 	// management handler
 	mgmt *managementHandlers.Handler
 
-	// usagePool combines the 5-hour limit and Fable allowance of the Claude accounts for
-	// key holders.
+	// usagePool combines the 5-hour and weekly limits and Fable allowance of the Claude
+	// accounts for key holders.
 	usagePool *keyusage.Pool
 
 	// pluginHost owns dynamic plugin Management API route dispatch.

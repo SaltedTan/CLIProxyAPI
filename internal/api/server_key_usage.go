@@ -11,16 +11,16 @@ import (
 )
 
 // keyUsageAccountWait is how long after their lookup started a key usage report waits
-// for Claude accounts that have never been read. The 5-hour and Fable figures share
-// one wait, which stays under the 3 seconds the example status line script allows a
-// request. The lookups continue in the background either way.
+// for Claude accounts that have never been read. The 5-hour, weekly and Fable figures
+// share one wait, which stays under the 3 seconds the example status line script
+// allows a request. The lookups continue in the background either way.
 const keyUsageAccountWait = 2 * time.Second
 
 // keyUsage serves GET /v1/key/usage to the holder of a client API key: the key's own
-// Claude allowance, the Claude 5-hour limit left across all the Claude accounts and
-// the Fable allowance left across the accounts that serve Fable, as JSON, as plain
-// text with ?format=text, or as one status bar line with ?format=line (&color=1 for
-// ANSI colors).
+// Claude allowance, the Claude 5-hour and weekly limits left across all the Claude
+// accounts and the Fable allowance left across the accounts that serve Fable, as JSON,
+// as plain text with ?format=text, or as one status bar line with ?format=line
+// (&color=1 for ANSI colors).
 func (s *Server) keyUsage(c *gin.Context) {
 	cfg := s.getConfig()
 	if cfg != nil && cfg.Home.Enabled {

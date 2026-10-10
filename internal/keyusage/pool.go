@@ -11,9 +11,9 @@ import (
 
 // The pool reads the windows of every enabled Claude OAuth account from the usage
 // cache: readers get the cached figures, and a stale figure triggers a background
-// refresh. It combines them into two figures that name no account: the 5-hour limit
-// left across all the accounts (FiveHourSummary) and the Fable allowance left across
-// the accounts that serve Fable (FableSummary).
+// refresh. It combines them into three figures that name no account: the 5-hour and
+// weekly limits left across all the accounts (LimitSummary) and the Fable allowance
+// left across the accounts that serve Fable (FableSummary).
 //
 // Accounts are combined in Claude Pro units. Each account's percentage is of its own
 // plan's limit, so percentages are weighted by the plan's size in Pro units: a
@@ -27,16 +27,18 @@ const resetGroup = time.Minute
 
 // PoolSummary is the pool's figures, combined from one reading of the accounts.
 type PoolSummary struct {
-	FiveHour FiveHourSummary
+	FiveHour LimitSummary
+	Weekly   LimitSummary
 	Fable    FableSummary
 }
 
-// Pool combines the 5-hour and Fable windows of the Claude accounts. The zero value is
-// not usable; create pools with NewPool.
+// Pool combines the 5-hour, weekly and Fable windows of the Claude accounts. The zero
+// value is not usable; create pools with NewPool.
 type Pool struct {
 	cache       *UsageCache
 	servesFable func(authID string) bool
-	// weight is an account's weekly allowance in Pro units, which weighs its Fable window.
+	// weight is an account's weekly allowance in Pro units, which weighs its weekly and
+	// Fable windows.
 	weight func(auth *coreauth.Auth) float64
 	// sessionWeight is an account's 5-hour limit in Pro units.
 	sessionWeight func(auth *coreauth.Auth) float64
@@ -54,7 +56,7 @@ func NewPool(cache *UsageCache) *Pool {
 	}
 }
 
-// Summary combines the cached readings into both figures, listing the accounts once.
+// Summary combines the cached readings into every figure, listing the accounts once.
 // Accounts whose reading is stale are refreshed in the background, unless the cache's
 // Run has stopped. Summary waits once (until ctx ends at the latest) for accounts that
 // have never been read, but only until wait has passed since their lookup started, so a
@@ -102,18 +104,25 @@ func (p *Pool) Summary(ctx context.Context, wait time.Duration) PoolSummary {
 
 	c.mu.Lock()
 	fiveHour := make([]poolAccount, 0, len(accounts))
+	weekly := make([]poolAccount, 0, len(accounts))
 	fable := make([]poolAccount, 0, len(accounts))
 	for i, auth := range accounts {
 		reading, ok := c.readings[auth.ID]
 		// A reading of another account that had the same auth ID counts as missing.
 		ok = ok && coreauth.SameQuotaAccount(reading.auth, auth) && now.Sub(reading.at) <= maxReadingAge
 		fiveHour = append(fiveHour, poolAccount{units: p.sessionWeight(auth), reading: reading, ok: ok})
+		weeklyAccount := poolAccount{units: p.weight(auth), reading: reading, ok: ok}
+		weekly = append(weekly, weeklyAccount)
 		if servesFable[i] {
-			fable = append(fable, poolAccount{units: p.weight(auth), reading: reading, ok: ok})
+			fable = append(fable, weeklyAccount)
 		}
 	}
 	c.mu.Unlock()
-	return PoolSummary{FiveHour: combineFiveHour(now, fiveHour), Fable: combineFable(now, fable)}
+	return PoolSummary{
+		FiveHour: combineFiveHour(now, fiveHour),
+		Weekly:   combineWeekly(now, weekly),
+		Fable:    combineFable(now, fable),
+	}
 }
 
 // waitForLookups is how Summary waits for lookups. It is a variable only so that tests

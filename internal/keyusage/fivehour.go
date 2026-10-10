@@ -15,17 +15,16 @@ import (
 // Pro 1, Team 1.25, Max 5x 5, Max 20x 20). An account of a plan without a known limit
 // weighs what it weighs in the weekly figures, its credential weight.
 
-// FiveHourSummary is the 5-hour (session) allowance left across the enabled Claude
-// accounts, in Claude Pro units: 1 is one Pro plan's 5-hour limit, so a Max 5x
-// account adds 5 and a Max 20x account 20. It names no account.
-type FiveHourSummary struct {
-	// Available is set when at least one account reported its 5-hour window.
+// LimitSummary is a Claude limit left across the enabled Claude accounts, in Claude Pro
+// units: 1 is one Pro plan's limit, so a Max 5x account adds 5. It names no account.
+type LimitSummary struct {
+	// Available is set when at least one account reported the limit's window.
 	Available         bool    `json:"available"`
 	CapacityProUnits  float64 `json:"capacity_pro_units"`
 	RemainingProUnits float64 `json:"remaining_pro_units"`
 	// NextResetAt is the next time the pool grows, by NextResetRestoresProUnits: the
-	// earliest reset of an account's used 5-hour window, or of the weekly window of an
-	// account that used it up.
+	// earliest reset of an account's used window, or of the weekly window of an account
+	// that used it up.
 	NextResetAt               *time.Time `json:"next_reset_at,omitempty"`
 	NextResetRestoresProUnits float64    `json:"next_reset_restores_pro_units,omitempty"`
 	// UpdatedAt is when the oldest reading in the figure was taken.
@@ -35,9 +34,15 @@ type FiveHourSummary struct {
 }
 
 // combineFiveHour weighs each account's 5-hour window by its plan's 5-hour limit.
-func combineFiveHour(now time.Time, accounts []poolAccount) FiveHourSummary {
-	pooled := combineWindow(now, accounts, func(reading usageReading) windowReading { return reading.fiveHour })
-	summary := FiveHourSummary{Partial: pooled.partial}
+func combineFiveHour(now time.Time, accounts []poolAccount) LimitSummary {
+	return combineLimit(now, accounts, func(reading usageReading) windowReading { return reading.fiveHour })
+}
+
+// combineLimit weighs the window that window picks from each account's reading by the
+// account's units, as a summary in Pro units.
+func combineLimit(now time.Time, accounts []poolAccount, window func(usageReading) windowReading) LimitSummary {
+	pooled := combineWindow(now, accounts, window)
+	summary := LimitSummary{Partial: pooled.partial}
 	if pooled.capacity <= 0 {
 		return summary
 	}
