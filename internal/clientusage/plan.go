@@ -35,8 +35,7 @@ type CredentialInfo struct {
 	// (Pro 1, Team 1.25, Max 5x 5, Max 20x 10).
 	PlanProUnits float64 `json:"plan_pro_units"`
 	// PlanSource names where the allowance came from. Plans without a known
-	// allowance fall back to the credential weight, which also expresses relative
-	// plan size for quota-aware routing.
+	// allowance fall back to the credential weight.
 	PlanSource string `json:"plan_source"`
 	// Identity identifies the credential's upstream account (see
 	// coreauth.QuotaAccountIdentity). It is never reported or saved with Info.

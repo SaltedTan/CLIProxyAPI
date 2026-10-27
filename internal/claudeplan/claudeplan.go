@@ -1,6 +1,6 @@
 // Package claudeplan resolves the plan of a Claude OAuth credential and its allowances
-// relative to Claude Pro, shared by usage reports and quota-aware routing: ProUnits is
-// a plan's weekly allowance and SessionProUnits its 5-hour (session) limit.
+// relative to Claude Pro, used by the usage reports: ProUnits is a plan's weekly
+// allowance and SessionProUnits its 5-hour (session) limit.
 package claudeplan
 
 import "strings"

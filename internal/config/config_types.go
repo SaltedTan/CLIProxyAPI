@@ -523,8 +523,7 @@ type ClaudeKey struct {
 	// Higher values are preferred; defaults to 0.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
 
-	// Weight controls proportional selection under weighted-round-robin and the relative
-	// plan size under quota-aware.
+	// Weight controls proportional selection under weighted-round-robin.
 	// An omitted value defaults to 1; non-positive values exclude this credential under
 	// weighted-round-robin and make it a last resort under quota-aware; maximum 1,000,000.
 	Weight *int `yaml:"weight,omitempty" json:"weight,omitempty"`
@@ -640,8 +639,7 @@ type CodexKey struct {
 	// Higher values are preferred; defaults to 0.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
 
-	// Weight controls proportional selection under weighted-round-robin and the relative
-	// plan size under quota-aware.
+	// Weight controls proportional selection under weighted-round-robin.
 	// An omitted value defaults to 1; non-positive values exclude this credential under
 	// weighted-round-robin and make it a last resort under quota-aware; maximum 1,000,000.
 	Weight *int `yaml:"weight,omitempty" json:"weight,omitempty"`
@@ -760,8 +758,7 @@ type GeminiKey struct {
 	// Higher values are preferred; defaults to 0.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
 
-	// Weight controls proportional selection under weighted-round-robin and the relative
-	// plan size under quota-aware.
+	// Weight controls proportional selection under weighted-round-robin.
 	// An omitted value defaults to 1; non-positive values exclude this credential under
 	// weighted-round-robin and make it a last resort under quota-aware; maximum 1,000,000.
 	Weight *int `yaml:"weight,omitempty" json:"weight,omitempty"`
@@ -888,8 +885,7 @@ type OpenAICompatibilityAPIKey struct {
 	// APIKey is the authentication key for accessing the external API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
 
-	// Weight controls proportional selection under weighted-round-robin and the relative
-	// plan size under quota-aware.
+	// Weight controls proportional selection under weighted-round-robin.
 	// An omitted value defaults to 1; non-positive values exclude this credential under
 	// weighted-round-robin and make it a last resort under quota-aware; maximum 1,000,000.
 	Weight *int `yaml:"weight,omitempty" json:"weight,omitempty"`
